@@ -1,0 +1,8 @@
+torch
+transformers
+lxml
+sentencepiece
+rich
+tonga-config
+# flash-attn must be installed separately after torch:
+#   pip install flash-attn --no-build-isolation
