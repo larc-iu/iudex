@@ -79,6 +79,21 @@ def _process_dict(d: Dict[str, Any]) -> Tuple[List[RstPpNode], List[RstPpEdge]]:
         for e in d["secondary_edges"]
     ]
     edges = terminal_edges + nonterminal_edges + secondary_edges
+
+    # Older `to_rs4_string` always wrote `type="span"` for the root. Re-type any
+    # such node back to "multinuc" when its primary children all share the same
+    # non-"span" relname — the structural signature of a multinuc node.
+    primary_by_source: Dict[str, List[RstPpEdge]] = {}
+    for e in edges:
+        if not e.secondary:
+            primary_by_source.setdefault(e.source, []).append(e)
+    for n in nodes:
+        if n.type != "span":
+            continue
+        children = primary_by_source.get(n.id, [])
+        if len(children) >= 2 and all(c.relation == children[0].relation for c in children) and children[0].relation != "span":
+            n.type = "multinuc"
+
     return nodes, edges
 
 

@@ -1,19 +1,3 @@
-"""Top-down RST parser with biaffine scoring (after Kobayashi et al., 2022).
-
-Architecture:
-  - Striding transformer encoder over per-EDU subtoken concatenation.
-  - EDU representation: mean of first and last subtoken embeddings.
-  - For a span [b, e) split at candidate k:
-      left_rep_k  = (first_subtoken_of_span + last_subtoken_of_EDU_{k-1}) / 2
-      right_rep_k = (first_subtoken_of_EDU_k + last_subtoken_of_span) / 2
-    `split_biaffine(left_rep, right_rep) -> scalar score per k`
-    `label_biaffine(left_rep, right_rep) -> num_labels logits per k`
-
-Whole-tree training: forward(tree) walks the gold parse top-down and sums
-per-decision losses. Assumes gold EDU segmentation.
-"""
-from typing import Dict, List, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +9,8 @@ from iudex.rst.parsers.topdown_biaffine.configuration_topdown_biaffine import To
 
 
 class _FeedForward(nn.Sequential):
+    """Two-layer GELU feed-forward block with dropout between the layers."""
+
     def __init__(self, input_dim, hidden_dim, output_dim, dropout_p):
         super().__init__(
             nn.Linear(input_dim, hidden_dim),
@@ -35,6 +21,19 @@ class _FeedForward(nn.Sequential):
 
 
 class _DeepBiAffine(nn.Module):
+    """Deep biaffine scorer used for both split and label decisions.
+
+    Each side is projected with its own FFN, then combined as a bilinear term
+    plus per-side linear terms (a.k.a. the deep biaffine of Dozat & Manning).
+
+    Args:
+        h_left:  [num_candidates, input_dim]
+        h_right: [num_candidates, input_dim]
+
+    Returns:
+        scores: [num_candidates, output_dim]
+    """
+
     def __init__(self, input_dim, hidden_dim, output_dim, dropout_p):
         super().__init__()
         self.W_left = _FeedForward(input_dim, hidden_dim, hidden_dim, dropout_p)
@@ -50,11 +49,24 @@ class _DeepBiAffine(nn.Module):
 
 
 class TopdownBiaffineParser(nn.Module):
+    """Top-down RST parser with biaffine split and label scoring.
+
+    Pipeline per document (gold EDU segmentation assumed):
+        subtokens --(striding transformer)--> subtoken embeddings
+        for each span [b, e), for each candidate split k:
+            left_rep  = (first_subtoken_of_span + last_subtoken_of_edu_{k-1}) / 2
+            right_rep = (first_subtoken_of_edu_k + last_subtoken_of_span) / 2
+        split_biaffine(left_rep, right_rep) -> scalar score per k
+        label_biaffine(left_rep, right_rep) -> num_labels logits per k
+
+    Training (`forward`) is teacher-forced: walk the gold parse top-down and
+    sum the per-decision split and label losses.
+    """
+
     def __init__(self, config: TopdownBiaffineConfig):
         super().__init__()
         self.config = config
-        self._relation_types = tuple(config.relation_types)
-        self.label_index = determine_label_index(self._relation_types)
+        self.label_index = determine_label_index(config.relation_types)
         self.stride = config.stride
 
         encoder_kwargs = {}
@@ -73,20 +85,23 @@ class TopdownBiaffineParser(nn.Module):
         )
 
         self.split_biaffine = _DeepBiAffine(self.hidden_size, config.ffn_hidden_size, 1, config.dropout)
-        self.label_biaffine = _DeepBiAffine(self.hidden_size, config.ffn_hidden_size, len(self.label_index), config.dropout)
-
-    @property
-    def relation_types(self):
-        return self._relation_types
+        self.label_biaffine = _DeepBiAffine(
+            self.hidden_size, config.ffn_hidden_size, len(self.label_index), config.dropout
+        )
 
     @property
     def device(self):
         return next(self.parameters()).device
 
-    def _encode_tree(self, tree: RstPpTree) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Tokenize the document EDU-by-EDU and encode. Returns (embeddings, edu_boundaries)."""
-        all_ids: List[int] = []
-        boundaries: List[Tuple[int, int]] = []
+    def _encode_tree(self, tree: RstPpTree) -> tuple[torch.Tensor, torch.Tensor]:
+        """Tokenize the document EDU-by-EDU and run the striding encoder.
+
+        Returns:
+            embeddings:     [num_subtokens, hidden_size]
+            edu_boundaries: [num_edus, 2]  rows of (start_subtoken, end_subtoken_exclusive)
+        """
+        all_ids: list[int] = []
+        boundaries: list[tuple[int, int]] = []
         for edu_text in tree.edu_strings:
             ids = self.tokenizer.encode(edu_text, add_special_tokens=False)
             start = len(all_ids)
@@ -99,11 +114,17 @@ class TopdownBiaffineParser(nn.Module):
         return embeddings, edu_boundaries
 
     def _encode_subtokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Encode `input_ids` with overlapping windows when it exceeds the LM's
-        max length. `self.stride` is the number of tokens of overlap between
-        adjacent windows; overlapped tokens keep the embedding from the *earlier*
-        window (where they have more left context).
-        Returns [num_subtokens, hidden_size], 1:1 with input positions.
+        """Encode a flat subtoken sequence with overlapping sliding windows.
+
+        Long documents exceed the LM's positional budget, so we tile the input
+        with windows that overlap by `self.stride` tokens; overlapped positions
+        keep the embedding from the *earlier* window (more left context).
+
+        Args:
+            input_ids: [num_subtokens]
+
+        Returns:
+            embeddings: [num_subtokens, hidden_size]  (1:1 with input positions)
         """
         max_content = self.max_length - 2  # leave room for [CLS] ... [SEP] per chunk
         cls_id = self.tokenizer.cls_token_id
@@ -115,58 +136,78 @@ class TopdownBiaffineParser(nn.Module):
         pos = 0
         while pos < content_len:
             end = min(pos + max_content, content_len)
-            chunk = torch.cat([
-                torch.tensor([cls_id], device=device),
-                input_ids[pos:end],
-                torch.tensor([sep_id], device=device),
-            ])
+            chunk = torch.cat(
+                [
+                    torch.tensor([cls_id], device=device),
+                    input_ids[pos:end],
+                    torch.tensor([sep_id], device=device),
+                ]
+            )
             chunks.append(chunk)
             chunk_lens.append(chunk.shape[0])
             if end >= content_len:
                 break
             pos = end - self.stride  # next window starts `stride` tokens before this one ended
 
-        # Pad chunks to uniform length and run them through the encoder in one batch.
         max_chunk_len = max(chunk_lens)
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         batch_ids = torch.full((len(chunks), max_chunk_len), pad_id, device=device, dtype=torch.long)
         batch_mask = torch.zeros(len(chunks), max_chunk_len, device=device, dtype=torch.long)
         for i, cids in enumerate(chunks):
-            batch_ids[i, :cids.shape[0]] = cids
-            batch_mask[i, :cids.shape[0]] = 1
+            batch_ids[i, : cids.shape[0]] = cids
+            batch_mask[i, : cids.shape[0]] = 1
 
         hidden = self.encoder(input_ids=batch_ids, attention_mask=batch_mask).last_hidden_state
+        # hidden: [num_chunks, max_chunk_len, hidden_size]
 
         # Strip CLS/SEP; for chunks i > 0, also drop the first `stride` tokens
         # (which are duplicates of the previous chunk's tail).
         pieces = []
         for i, clen in enumerate(chunk_lens):
-            emb = hidden[i, 1:clen - 1]
-            pieces.append(emb if i == 0 else emb[self.stride:])
+            emb = hidden[i, 1 : clen - 1]
+            pieces.append(emb if i == 0 else emb[self.stride :])
         return torch.cat(pieces, dim=0)[:content_len]
 
-    def _packed_lr(self, embeddings, edu_boundaries, b, e):
-        """Build the left/right span-edge representations for every candidate
-        split k in (b, e), implementing the formula in the module docstring.
+    def _packed_lr(
+        self,
+        embeddings: torch.Tensor,
+        edu_boundaries: torch.Tensor,
+        b: int,
+        e: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build left/right span-edge representations for every candidate split.
 
-        Returns (packed_l, packed_r), each `[num_splits=e-b-1, hidden_size]`.
-        embeddings: `[num_subtokens, H]`; edu_boundaries: `[num_edus, 2]` rows
-        of `(start_subtoken, end_subtoken_exclusive)`.
+        For the span of EDUs [b, e) there are `num_splits = e - b - 1` candidate
+        split points k ∈ [b+1, e). The representation pairs implement the
+        formula in the class docstring.
+
+        Args:
+            embeddings:     [num_subtokens, hidden_size]
+            edu_boundaries: [num_edus, 2]  rows of (start_subtoken, end_subtoken_exclusive)
+            b, e:           EDU range of the span, exclusive at `e`
+
+        Returns:
+            packed_l: [num_splits, hidden_size]
+            packed_r: [num_splits, hidden_size]
         """
-        leftmost_h = embeddings[edu_boundaries[b, 0]]            # first subtoken of span [b, e)
-        rightmost_h = embeddings[edu_boundaries[e - 1, 1] - 1]   # last subtoken of span [b, e)
+        leftmost_h = embeddings[edu_boundaries[b, 0]]  # first subtoken of span
+        rightmost_h = embeddings[edu_boundaries[e - 1, 1] - 1]  # last subtoken of span
         num_splits = e - b - 1
-        # For each candidate split k: last subtoken of EDU k-1, first of EDU k.
         left_idx = torch.stack([edu_boundaries[k - 1, 1] - 1 for k in range(b + 1, e)])
         right_idx = torch.stack([edu_boundaries[k, 0] for k in range(b + 1, e)])
         packed_l = (leftmost_h.unsqueeze(0).expand(num_splits, -1) + embeddings[left_idx]) / 2
         packed_r = (embeddings[right_idx] + rightmost_h.unsqueeze(0).expand(num_splits, -1)) / 2
         return packed_l, packed_r
 
-    def forward(self, tree: RstPpTree) -> Dict[str, torch.Tensor]:
-        """Teacher-forced DFS over the gold tree. At each non-leaf span [b, e)
-        we score every candidate split (split_loss) AND the (nuclearity, relation)
-        at the *gold* split (label_loss), then recurse into the gold sub-spans.
+    def forward(self, tree: RstPpTree) -> dict[str, torch.Tensor]:
+        """Teacher-forced loss for one gold tree.
+
+        At each non-leaf span [b, e) we score every candidate split (split loss)
+        and the (nuclearity, relation) label at the *gold* split (label loss),
+        then recurse into the gold sub-spans.
+
+        Returns:
+            {"loss": scalar tensor} — mean of (split_loss + label_loss) / 2
         """
         num_edus = len(tree.edus)
         if num_edus < 2:
@@ -175,7 +216,7 @@ class TopdownBiaffineParser(nn.Module):
         embeddings, edu_boundaries = self._encode_tree(tree)
 
         # Index every gold non-leaf span by its EDU range.
-        gold: Dict[Tuple[int, int], Tuple[int, str]] = {}
+        gold: dict[tuple[int, int], tuple[int, str]] = {}
         for (left_range, right_range), nuc, rel in tree.spans_with_ranges():
             gold[(left_range[0], right_range[1])] = (right_range[0], f"{nuc}_{rel}")
 
@@ -187,12 +228,12 @@ class TopdownBiaffineParser(nn.Module):
                 continue
 
             packed_l, packed_r = self._packed_lr(embeddings, edu_boundaries, b, e)
-            split_logits = self.split_biaffine(packed_l, packed_r).squeeze(-1)  # [e-b-1]
-            label_logits = self.label_biaffine(packed_l, packed_r)              # [e-b-1, num_labels]
+            split_logits = self.split_biaffine(packed_l, packed_r).squeeze(-1)  # [num_splits]
+            label_logits = self.label_biaffine(packed_l, packed_r)  # [num_splits, num_labels]
 
             gold_split, gold_label_str = gold[(b, e)]
             # Absolute EDU index → candidate-split index: gold_split ∈ [b+1, e)
-            # maps to [0, e-b-2].
+            # maps to [0, num_splits - 1].
             gold_split_idx = gold_split - b - 1
             gold_label_idx = self.label_index.index(gold_label_str)
 
@@ -209,19 +250,22 @@ class TopdownBiaffineParser(nn.Module):
             stack.append((b, gold_split))
 
         split_loss = (
-            sum(split_losses) / len(split_losses)
-            if split_losses
-            else torch.zeros((), device=self.device)
+            sum(split_losses) / len(split_losses) if split_losses else torch.zeros((), device=self.device)
         )
         label_loss = sum(label_losses) / len(label_losses)
         return {"loss": (split_loss + label_loss) / 2}
 
     @torch.no_grad()
     def predict(self, tree: RstPpTree) -> RstPpTree:
+        """Greedy top-down decode using gold EDU segmentation from `tree.edus`.
+
+        At each span [b, e), pick the argmax split and argmax label; recurse
+        into both sub-spans. Returns a new tree built from the parsing actions.
+        """
         self.eval()
         num_edus = len(tree.edus)
         if num_edus < 2:
-            return RstPpTree.from_parsing_actions([], tree.edus, relation_types=self._relation_types)
+            return RstPpTree.from_parsing_actions([], tree.edus, relation_types=self.config.relation_types)
 
         embeddings, edu_boundaries = self._encode_tree(tree)
 
@@ -246,4 +290,4 @@ class TopdownBiaffineParser(nn.Module):
             queue.append((b, split_point))
             queue.append((split_point, e))
 
-        return RstPpTree.from_parsing_actions(actions, tree.edus, relation_types=self._relation_types)
+        return RstPpTree.from_parsing_actions(actions, tree.edus, relation_types=self.config.relation_types)

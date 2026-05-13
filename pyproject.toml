@@ -16,5 +16,34 @@ dependencies = [
     "rich",
 ]
 
+[project.optional-dependencies]
+dev = ["ruff"]
+
 [tool.setuptools.packages.find]
 include = ["iudex*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["data", "checkpoints"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # import sorting
+    "W",   # pycodestyle warnings
+    "UP",  # pyupgrade
+    "B",   # bugbear
+]
+ignore = [
+    "E501",  # line too long — formatter handles long lines; rare leftovers (URLs, strings) are OK
+    "B008",  # function calls in default arguments — fine for our config dataclasses
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # re-exports
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

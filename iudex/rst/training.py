@@ -8,12 +8,14 @@ the goal is that one file per parser tells the full training story top-to-bottom
 Each utility takes its inputs explicitly. We avoid assuming anything about
 model or cfg structure beyond standard `nn.Module` interfaces.
 """
+
 import hashlib
 import json
 import logging
 import os
 import random
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -55,22 +57,22 @@ def set_seeds(seed: int) -> None:
     random.seed(seed)
 
 
-def gpu_mem_gb(device: torch.device) -> Optional[Tuple[float, float]]:
+def gpu_mem_gb(device: torch.device) -> tuple[float, float] | None:
     """Return (allocated_gb, reserved_gb) for CUDA devices, else None."""
     if device.type != "cuda":
         return None
     return (
-        torch.cuda.memory_allocated(device) / 1024 ** 3,
-        torch.cuda.memory_reserved(device) / 1024 ** 3,
+        torch.cuda.memory_allocated(device) / 1024**3,
+        torch.cuda.memory_reserved(device) / 1024**3,
     )
 
 
 def derive_run_id(
     config_dict: dict,
-    run_name: Optional[str] = None,
+    run_name: str | None = None,
     *,
-    hash_exclude: Tuple[str, ...] = ("run_name",),
-) -> Tuple[str, str]:
+    hash_exclude: tuple[str, ...] = ("run_name",),
+) -> tuple[str, str]:
     """Pure: compute the run id ("{run_name}-{hash}" or just "{hash}") and hash.
 
     Display-only fields named in `hash_exclude` are stripped before hashing so
@@ -87,10 +89,10 @@ def derive_run_id(
 def prepare_run_dir(
     config_dict: dict,
     checkpoint_dir: str,
-    run_name: Optional[str] = None,
+    run_name: str | None = None,
     *,
-    hash_exclude: Tuple[str, ...] = ("run_name",),
-) -> Tuple[str, str]:
+    hash_exclude: tuple[str, ...] = ("run_name",),
+) -> tuple[str, str]:
     """Derive `{checkpoint_dir}/{run_name}-{hash}` (or just `/{hash}`), `mkdir -p`
     it, and write `config.json` for audit. Returns (run_dir, cfg_hash).
     """
@@ -109,7 +111,7 @@ def resume_or_init(
     optimizer,
     scheduler,
     expected_hash: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Try to resume `{run_dir}/last.pt`. If it exists with matching hash, restore
     model/optimizer/scheduler state and return the saved training state. Otherwise
     return fresh state.
@@ -135,10 +137,10 @@ def final_evaluation(
     model: nn.Module,
     run_dir: str,
     predict_fn: Callable[["RstPpTree"], "RstPpTree"],
-    dev_pairs: List[Tuple[str, "RstPpTree"]],
+    dev_pairs: list[tuple[str, "RstPpTree"]],
     val_metric_name: str,
     best_val: float,
-    test_pairs: Optional[List[Tuple[str, "RstPpTree"]]] = None,
+    test_pairs: list[tuple[str, "RstPpTree"]] | None = None,
 ) -> None:
     """Reload `{run_dir}/best_model.pt` if present, re-evaluate, and print results.
     Always reports dev; reports test too when `test_pairs` is given. Falls back to
@@ -152,13 +154,15 @@ def final_evaluation(
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     dev_metrics = evaluate(
-        predict_fn, dev_pairs,
+        predict_fn,
+        dev_pairs,
         output_dir=os.path.join(run_dir, "dev_predictions", "final"),
     )
     console.print(metrics_table(dev_metrics, title="Final Dev Results"))
     if test_pairs is not None:
         test_metrics = evaluate(
-            predict_fn, test_pairs,
+            predict_fn,
+            test_pairs,
             output_dir=os.path.join(run_dir, "test_predictions", "final"),
         )
         console.print(metrics_table(test_metrics, title="Final Test Results"))
@@ -169,7 +173,7 @@ def build_optimizer(
     lr: float,
     weight_decay: float,
     *,
-    submodule_lrs: Sequence[Tuple[nn.Module, float]] = (),
+    submodule_lrs: Sequence[tuple[nn.Module, float]] = (),
 ) -> AdamW:
     """Build AdamW with no-decay on biases and norm weights, and per-submodule LRs.
 
@@ -178,49 +182,57 @@ def build_optimizer(
     listed wins. With an empty `submodule_lrs`, every param uses `lr` (two groups,
     decay vs no-decay).
     """
+
     def _is_no_decay(name: str) -> bool:
         if name.endswith(".bias"):
             return True
         parts = name.split(".")
         return len(parts) >= 2 and "norm" in parts[-2].lower() and parts[-1] == "weight"
 
-    id_to_lr: Dict[int, float] = {}
+    id_to_lr: dict[int, float] = {}
     for submod, sub_lr in submodule_lrs:
         for p in submod.parameters():
             id_to_lr.setdefault(id(p), sub_lr)
 
-    buckets: Dict[Tuple[float, bool], List[nn.Parameter]] = {}
+    buckets: dict[tuple[float, bool], list[nn.Parameter]] = {}
     for name, p in model.named_parameters():
         bucket_lr = id_to_lr.get(id(p), lr)
         nd = _is_no_decay(name)
         buckets.setdefault((bucket_lr, nd), []).append(p)
 
-    return AdamW([
-        {"params": params, "lr": bucket_lr, "weight_decay": 0.0 if nd else weight_decay}
-        for (bucket_lr, nd), params in buckets.items()
-    ])
+    return AdamW(
+        [
+            {"params": params, "lr": bucket_lr, "weight_decay": 0.0 if nd else weight_decay}
+            for (bucket_lr, nd), params in buckets.items()
+        ]
+    )
 
 
 def make_scheduler(optimizer, warmup_steps: int, total_steps: int):
     """Linear warmup, then linear decay to zero."""
+
     def lr_lambda(step):
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
         return max(0.0, float(total_steps - step) / float(max(1, total_steps - warmup_steps)))
+
     return LambdaLR(optimizer, lr_lambda)
 
 
 def save_checkpoint(path: str, model: nn.Module, optimizer, scheduler, **extra) -> None:
     """Save model + training state. Caller passes any other state (config, step, etc.) via **extra."""
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        **extra,
-    }, path)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            **extra,
+        },
+        path,
+    )
 
 
-def try_resume(checkpoint_path: str, *, expected_hash: str) -> Optional[Dict[str, Any]]:
+def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | None:
     """Return the checkpoint dict iff it exists and its config_hash matches; otherwise None."""
     if not os.path.exists(checkpoint_path):
         return None
@@ -235,7 +247,7 @@ def try_resume(checkpoint_path: str, *, expected_hash: str) -> Optional[Dict[str
     return ckpt
 
 
-def metrics_table(metrics: Dict[str, float], title: str) -> Table:
+def metrics_table(metrics: dict[str, float], title: str) -> Table:
     table = Table(title=title, show_header=True, header_style="bold cyan", padding=(0, 1))
     table.add_column("Metric", style="dim")
     table.add_column("F1", justify="right", style="bold green")
@@ -247,9 +259,9 @@ def metrics_table(metrics: Dict[str, float], title: str) -> Table:
 @torch.no_grad()
 def evaluate(
     predict_fn: Callable[[RstPpTree], RstPpTree],
-    dev_pairs: List[Tuple[str, RstPpTree]],
-    output_dir: Optional[str] = None,
-) -> Dict[str, float]:
+    dev_pairs: list[tuple[str, RstPpTree]],
+    output_dir: str | None = None,
+) -> dict[str, float]:
     """Run `predict_fn` over each (path, gold_tree) pair and report Parseval F1s.
 
     Caller is responsible for setting the underlying model to eval mode if applicable.
@@ -312,7 +324,8 @@ def config_panel(cfg_dict: dict) -> Panel:
 
 def device_panel(device: torch.device, *, seed: int, checkpoint_dir: str) -> Panel:
     info = Table(show_header=False, padding=(0, 2), box=None)
-    info.add_column(style="bold cyan"); info.add_column()
+    info.add_column(style="bold cyan")
+    info.add_column()
     info.add_row("Device", f"[bold]{device}[/bold]")
     if device.type == "cuda":
         info.add_row(
@@ -329,7 +342,8 @@ def model_panel(model: nn.Module, *, num_train_trees: int, grad_accum: int) -> P
     n_params = sum(p.numel() for p in model.parameters())
     n_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     dt = Table(show_header=False, padding=(0, 2), box=None)
-    dt.add_column(style="bold cyan"); dt.add_column()
+    dt.add_column(style="bold cyan")
+    dt.add_column()
     dt.add_row("Parameters", f"[bold]{n_params:,}[/bold] total, [bold]{n_train_params:,}[/bold] trainable")
     dt.add_row("Training trees", f"[bold]{num_train_trees:,}[/bold]")
     dt.add_row("Grad accum", str(grad_accum))
@@ -342,10 +356,11 @@ def schedule_panel(
     total_steps: int,
     warmup_steps: int,
     lr: float,
-    encoder_lr: Optional[float] = None,
+    encoder_lr: float | None = None,
 ) -> Panel:
     sched = Table(show_header=False, padding=(0, 2), box=None)
-    sched.add_column(style="bold cyan"); sched.add_column()
+    sched.add_column(style="bold cyan")
+    sched.add_column()
     sched.add_row("Steps/epoch", f"{steps_per_epoch:,}")
     sched.add_row("Total steps", f"{total_steps:,}")
     sched.add_row("Warmup steps", f"{warmup_steps:,}")

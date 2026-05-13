@@ -1,18 +1,4 @@
-"""Dev evaluation for the dmrst parser.
-
-Always computes gold-EDU Parseval (the four span/nuc/rel/full F1s). When the
-model has a trained `_Segmenter`, additionally computes:
-  - Segmentation F1: position-level intersection over predicted vs gold EDU
-    end subtoken indices.
-  - End-to-end Parseval: span F1 with predicted EDUs, where spans are matched
-    by inclusive subtoken-range tuples (so gold and pred can have different
-    EDU sets).
-
-Avoids two encoder passes per dev tree by routing through `DMRSTParser.predict_both`
-when the segmenter is present.
-"""
 import os
-from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from rich.table import Table
@@ -37,19 +23,23 @@ def _write_rs4(tree: RstPpTree, output_dir: str, basename: str) -> None:
 @torch.no_grad()
 def evaluate_dmrst(
     model: DMRSTParser,
-    dev_pairs: List[Tuple[str, RstPpTree]],
-    output_dir: Optional[str] = None,
-) -> Dict[str, float]:
-    """Single dev pass. When the model has a segmenter, returns gold-EDU
-    Parseval + segmentation F1 + end-to-end Parseval (subtoken-range matching).
-    Otherwise returns only the gold-EDU Parseval F1s (matches the generic
-    `iudex.rst.training.evaluate`).
+    dev_pairs: list[tuple[str, RstPpTree]],
+    output_dir: str | None = None,
+) -> dict[str, float]:
+    """Run one dev pass and return aggregated metrics.
+
+    Always computes gold-EDU Parseval (span/nuc/rel/full F1). When the model
+    has a trained segmenter, additionally computes segmentation F1 and
+    end-to-end Parseval (predicted-EDU spans matched against gold by inclusive
+    subtoken ranges so the two parses can have different EDU sets). The single
+    encoder pass is shared via `DMRSTParser.predict_both` when the segmenter
+    is present.
 
     When `output_dir` is given:
       - segmenter present: writes gold-EDU predictions to `{output_dir}/gold/`
         and e2e predictions to `{output_dir}/e2e/`.
       - segmenter absent: writes predictions directly to `{output_dir}` (no
-        subdir split — matches the generic evaluator's existing layout).
+        subdir split — matches the generic evaluator's layout).
     """
     use_seg = model.segmenter is not None
 
@@ -58,11 +48,7 @@ def evaluate_dmrst(
 
     totals_seg = {"seg_correct": 0, "seg_pred_count": 0, "seg_gold_count": 0}
 
-    totals_e2e = {
-        f"e2e_{m}_{x}_count": 0
-        for m in ("span", "nuc", "rel", "full")
-        for x in ("p", "r")
-    }
+    totals_e2e = {f"e2e_{m}_{x}_count": 0 for m in ("span", "nuc", "rel", "full") for x in ("p", "r")}
     totals_e2e["e2e_num_pred_spans"] = 0
     totals_e2e["e2e_num_gold_spans"] = 0
 
@@ -110,12 +96,15 @@ def evaluate_dmrst(
                 _write_rs4(e2e_pred, os.path.join(output_dir, "e2e"), basename)
 
     # Aggregate gold-EDU Parseval (micro-average).
-    n = totals_parseval["num_spans"]
-    if n == 0:
-        out: Dict[str, float] = {f"{m}_f1": 0.0 for m in ("span", "nuc", "rel", "full")}
+    num_spans = totals_parseval["num_spans"]
+    if num_spans == 0:
+        out: dict[str, float] = {f"{m}_f1": 0.0 for m in ("span", "nuc", "rel", "full")}
     else:
         out = {
-            f"{m}_f1": f1(totals_parseval[f"{m}_p_count"] / n, totals_parseval[f"{m}_r_count"] / n)
+            f"{m}_f1": f1(
+                totals_parseval[f"{m}_p_count"] / num_spans,
+                totals_parseval[f"{m}_r_count"] / num_spans,
+            )
             for m in ("span", "nuc", "rel", "full")
         }
 
@@ -130,21 +119,23 @@ def evaluate_dmrst(
     out["seg_r"] = seg_correct / max(seg_gold, 1) if seg_gold > 0 else 0.0
     out["seg_f1"] = (2 * seg_correct) / max(seg_pred + seg_gold, 1) if (seg_pred + seg_gold) > 0 else 0.0
 
-    # End-to-end Parseval aggregates: P denominator = total pred spans, R denominator = total gold spans.
-    np_ = totals_e2e["e2e_num_pred_spans"]
-    ng = totals_e2e["e2e_num_gold_spans"]
+    # End-to-end Parseval aggregates: P denominator is total pred spans, R is total gold spans.
+    num_pred = totals_e2e["e2e_num_pred_spans"]
+    num_gold = totals_e2e["e2e_num_gold_spans"]
     for m in ("span", "nuc", "rel", "full"):
-        p = totals_e2e[f"e2e_{m}_p_count"] / np_ if np_ > 0 else 0.0
-        r = totals_e2e[f"e2e_{m}_r_count"] / ng if ng > 0 else 0.0
+        p = totals_e2e[f"e2e_{m}_p_count"] / num_pred if num_pred > 0 else 0.0
+        r = totals_e2e[f"e2e_{m}_r_count"] / num_gold if num_gold > 0 else 0.0
         out[f"e2e_{m}_p"] = p
         out[f"e2e_{m}_r"] = r
         out[f"e2e_{m}_f1"] = f1(p, r) or 0.0
     return out
 
 
-def dmrst_metrics_table(metrics: Dict[str, float], title: str) -> Table:
-    """Three sections — Gold-EDU Parseval / Segmentation / End-to-End Parseval.
-    Latter two are omitted when their keys aren't in `metrics` (segmenter off).
+def dmrst_metrics_table(metrics: dict[str, float], title: str) -> Table:
+    """Build a Rich table with up to three sections.
+
+    Always shows Gold-EDU Parseval; adds Segmentation and End-to-End Parseval
+    sections when their keys are present (segmenter enabled).
     """
     table = Table(title=title, show_header=True, header_style="bold cyan", padding=(0, 1))
     table.add_column("Metric", style="dim")
@@ -169,9 +160,11 @@ def dmrst_metrics_table(metrics: Dict[str, float], title: str) -> Table:
     return table
 
 
-def legal_val_metric_names(joint_segmentation: bool) -> List[str]:
-    """The set of keys `evaluate_dmrst` will produce for a given config —
-    used by the trainer to validate `cfg.val_metric_name` at startup."""
+def legal_val_metric_names(joint_segmentation: bool) -> list[str]:
+    """Return the set of metric keys `evaluate_dmrst` will produce for a given config.
+
+    Used by the trainer to validate `cfg.val_metric_name` at startup.
+    """
     names = ["span_f1", "nuc_f1", "rel_f1", "full_f1"]
     if joint_segmentation:
         names += ["seg_p", "seg_r", "seg_f1"]

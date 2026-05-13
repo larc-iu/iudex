@@ -10,7 +10,12 @@ def f1(x, y):
 
 
 def _spans_to_ranges(tree: RstPpTree, coarse: bool = False):
-    """Convert sibling-pair spans to individual constituent ranges for standard RST Parseval."""
+    """Parent-keyed enumeration: one entry per binary action, keyed on the
+    parent's (first_edu, last_edu). Yields `n-1` entries for a binary tree
+    with `n` EDUs — only the parser's actual split decisions are scored, and
+    leaf-EDU spans are not. This is the Morey/Muller/Asher (2017) "standard"
+    Parseval that excludes trivially-correct leaf matches.
+    """
     result = set()
     for (left, right), nuc, rel in tree.spans():
         range_key = (left[0], right[-1])
@@ -19,14 +24,58 @@ def _spans_to_ranges(tree: RstPpTree, coarse: bool = False):
     return result
 
 
-def compute_parseval_metrics(gold: RstPpTree, pred: RstPpTree, coarse: bool = False) -> Dict[str, Any]:
+def _spans_to_sibling_ranges(tree: RstPpTree, coarse: bool = False):
+    """Sibling-keyed enumeration: two entries per binary action — one per
+    child — keyed on the child's (first_edu, last_edu). Yields `2*(n-1)`
+    entries for a binary tree with `n` EDUs, including every leaf-EDU span.
+    Matches DMRST's `getEvalData` (their default, `use_org_Parseval=False`)
+    and the original Marcu (2000) Parseval. When gold and predicted trees
+    share the same EDU set, the `n` leaf spans match trivially, inflating
+    span F1 by roughly 10-15 points relative to the parent-keyed form.
+
+    Per-child labels follow the DMRST convention: the nucleus child carries
+    ("N", "span") as a placeholder; the satellite child carries ("S", rel);
+    multinuclear children both carry ("N", rel).
     """
-    Compute standard RST Parseval metrics for two trees.
-    Each internal node is identified by its constituent range (first_edu, last_edu),
-    matching the standard formulation where individual constituents are compared.
+    result = set()
+    for (left, right), nuc, rel in tree.spans():
+        if coarse:
+            rel = rel.split("-")[0]
+        left_range = (left[0], left[-1])
+        right_range = (right[0], right[-1])
+        if nuc == "NS":
+            result.add((left_range, "N", "span"))
+            result.add((right_range, "S", rel))
+        elif nuc == "SN":
+            result.add((left_range, "S", rel))
+            result.add((right_range, "N", "span"))
+        elif nuc == "NN":
+            result.add((left_range, "N", rel))
+            result.add((right_range, "N", rel))
+        else:
+            raise ValueError(f"Unknown nuclearity: {nuc}")
+    return result
+
+
+def compute_parseval_metrics(
+    gold: RstPpTree,
+    pred: RstPpTree,
+    coarse: bool = False,
+    original_parseval: bool = False,
+) -> Dict[str, Any]:
+    """Compute RST Parseval metrics for two trees over the same EDU set.
+
+    Defaults to the Morey/Muller/Asher "standard" form (parent-keyed: one
+    entry per action). Set `original_parseval=True` to switch to the
+    sibling-keyed form used by DMRST and the original Marcu (2000) Parseval,
+    which counts each non-root constituent (including every leaf-EDU span)
+    separately — kept for direct comparison to numbers reported in papers
+    using that convention. The two scales are not interchangeable: original
+    Parseval typically reports ~10-15 points higher than standard.
     """
-    gold_spans = _spans_to_ranges(gold, coarse)
-    pred_spans = _spans_to_ranges(pred, coarse)
+    enumerate_spans = _spans_to_sibling_ranges if original_parseval else _spans_to_ranges
+    gold_spans = enumerate_spans(gold, coarse)
+    pred_spans = enumerate_spans(pred, coarse)
 
     if len(gold_spans) != len(pred_spans):
         raise ValueError("Mismatched span lengths! Are these trees really equivalent?")

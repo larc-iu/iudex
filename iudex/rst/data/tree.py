@@ -269,7 +269,9 @@ class RstPpTree:
                     )
                 )
             else:
-                body_children.append(E("group", id=node.id, type="span"))
+                body_children.append(
+                    E("group", id=node.id, type=("multinuc" if node.type == "multinuc" else "span"))
+                )
         body = E("body", *body_children)
         root = E("rst", *[header, body])
         return ET.tostring(root, encoding="utf-8", pretty_print=True).decode("utf-8")

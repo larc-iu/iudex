@@ -1,16 +1,3 @@
-"""Inference for the topdown_biaffine parser.
-
-Two ways to identify the model:
-
-    # From a config: looks up the run dir's best_model.pt
-    python -m iudex.rst.parsers.topdown_biaffine.predict_topdown_biaffine \\
-        --config configs/topdown_biaffine.jsonnet --input X --output-dir Y
-
-    # From an explicit checkpoint: useful for shared .pt files, or to pick a
-    # specific intermediate checkpoint (e.g. last.pt instead of best_model.pt)
-    python -m iudex.rst.parsers.topdown_biaffine.predict_topdown_biaffine \\
-        --checkpoint checkpoints/<run_id>/best_model.pt --input X --output-dir Y
-"""
 import argparse
 import dataclasses
 import logging
@@ -20,7 +7,14 @@ from glob import glob
 from pathlib import Path
 
 import torch
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from tonga import Params
 
 from iudex.common.log import console, setup_logging
@@ -34,7 +28,13 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_checkpoint(config_path: str, checkpoint_path: str) -> str:
-    """Return the .pt path to load. Exactly one of the two args is non-None."""
+    """Return the .pt path to load.
+
+    Exactly one of the two args is non-None. With `--config`, derive the run dir
+    from the resolved config and look up `best_model.pt`; with `--checkpoint`,
+    use the path as-is. Both branches exit non-zero with a helpful message if
+    the file is missing.
+    """
     if checkpoint_path:
         if not os.path.exists(checkpoint_path):
             console.print(f"[bold red]Checkpoint not found:[/bold red] [path]{checkpoint_path}[/path]")
@@ -57,6 +57,8 @@ def _resolve_checkpoint(config_path: str, checkpoint_path: str) -> str:
 
 
 def load_model(checkpoint_path: str, device: torch.device) -> TopdownBiaffineParser:
+    """Rehydrate a parser from a checkpoint: rebuild the config, init the model,
+    load weights, move to `device`, and put it in eval mode."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = TopdownBiaffineConfig.from_dict(ckpt["config"])
     model = TopdownBiaffineParser(cfg)
@@ -100,8 +102,8 @@ def main():
             progress.update(task, current_file=f"[dim]{Path(filepath).name}[/dim]")
             tree = read_rst_file(
                 filepath,
-                relation_types=model.relation_types,
-                relation_map=getattr(model.config, "relation_map", None),
+                relation_types=model.config.relation_types,
+                relation_map=model.config.relation_map,
             )
             pred = model.predict(tree)
             out = os.path.join(args.output_dir, Path(filepath).stem + ".rs4")
@@ -109,7 +111,9 @@ def main():
                 f.write(pred.to_rs4_string())
             progress.advance(task)
 
-    console.print(f"[bold green]Done![/bold green] Wrote {len(paths)} predictions to [path]{args.output_dir}[/path]")
+    console.print(
+        f"[bold green]Done![/bold green] Wrote {len(paths)} predictions to [path]{args.output_dir}[/path]"
+    )
 
 
 if __name__ == "__main__":

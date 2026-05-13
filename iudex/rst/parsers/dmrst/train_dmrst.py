@@ -1,13 +1,3 @@
-"""Training entrypoint for the dmrst parser.
-
-Owns its own training loop top-to-bottom. Shared utilities are imported from
-`iudex.rst.training`. Adds dynamic loss weighting (paper §3.2): the trainer
-combines the model's split_loss and label_loss with weights that adapt to the
-recent rate of decrease in each component, recomputed at every optimizer step.
-
-Usage:
-    python -m iudex.rst.parsers.dmrst.train_dmrst configs/dmrst.jsonnet
-"""
 import argparse
 import dataclasses
 import logging
@@ -49,17 +39,23 @@ logger = logging.getLogger(__name__)
 
 
 def train(cfg: DMRSTConfig) -> None:
-    """Train. `cfg` is the single source of truth; we serialize it via
-    `dataclasses.asdict` for hashing, checkpoint storage, and `config.json` audit.
-    Multiple runs with different configs coexist under `cfg.checkpoint_dir/`.
+    """Run the full training loop, including dynamic loss weighting (paper §3.2).
+
+    The trainer combines the model's `split_loss`, `label_loss` and (when joint
+    segmentation is on) `seg_loss` with weights that adapt to the recent rate
+    of decrease in each component, recomputed at every optimizer step.
+
+    `cfg` is the single source of truth: it is serialized via `dataclasses.asdict`
+    for run-id hashing, checkpoint storage, and the on-disk `config.json` audit.
+    Multiple runs with different configs coexist under `cfg.checkpoint_dir/`,
+    each in its own `{run_id}/` subdirectory; a matching `last.pt` is resumed
+    automatically (DLW state is restored from the checkpoint when present).
     """
     set_seeds(cfg.seed)
     if cfg.relation_map is not None:
         dim(f"Applying `relation_map` ({len(cfg.relation_map)} entries) to all read trees.")
     if cfg.relation_types is None:
-        cfg.relation_types = infer_relation_types(
-            [cfg.train_dir, cfg.dev_dir], relation_map=cfg.relation_map
-        )
+        cfg.relation_types = infer_relation_types([cfg.train_dir, cfg.dev_dir], relation_map=cfg.relation_map)
         dim(
             f"Inferred {len(cfg.relation_types)} (relation, kind) pairs from "
             f"{cfg.train_dir} + {cfg.dev_dir}"
@@ -89,7 +85,10 @@ def train(cfg: DMRSTConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DMRSTParser(cfg).to(device)
     train_trees = [
-        t for _, t in read_rst_dir(cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
+        t
+        for _, t in read_rst_dir(
+            cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map
+        )
     ]
     dev_pairs = read_rst_dir(cfg.dev_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
     test_pairs = (
@@ -105,13 +104,20 @@ def train(cfg: DMRSTConfig) -> None:
     console.print(config_panel(cfg_dict))
     console.print(device_panel(device, seed=cfg.seed, checkpoint_dir=run_dir))
     console.print(model_panel(model, num_train_trees=len(train_trees), grad_accum=cfg.grad_accum))
-    console.print(schedule_panel(
-        steps_per_epoch=steps_per_epoch, total_steps=total_steps, warmup_steps=warmup,
-        lr=cfg.lr, encoder_lr=cfg.encoder_lr,
-    ))
+    console.print(
+        schedule_panel(
+            steps_per_epoch=steps_per_epoch,
+            total_steps=total_steps,
+            warmup_steps=warmup,
+            lr=cfg.lr,
+            encoder_lr=cfg.encoder_lr,
+        )
+    )
 
     optimizer = build_optimizer(
-        model, cfg.lr, cfg.weight_decay,
+        model,
+        cfg.lr,
+        cfg.weight_decay,
         submodule_lrs=[(model.encoder, cfg.encoder_lr)] if cfg.encoder_lr is not None else [],
     )
     scheduler = make_scheduler(optimizer, warmup, total_steps)
@@ -151,10 +157,18 @@ def train(cfg: DMRSTConfig) -> None:
 
     def _save(path: str, epoch: int) -> None:
         save_checkpoint(
-            path, model, optimizer, scheduler,
-            config=cfg_dict, config_hash=cfg_hash,
-            global_step=global_step, epoch=epoch, best_val=best_val, stale_validations=stale,
-            dlw_loss_history=loss_history, dlw_weights=dict(weights),
+            path,
+            model,
+            optimizer,
+            scheduler,
+            config=cfg_dict,
+            config_hash=cfg_hash,
+            global_step=global_step,
+            epoch=epoch,
+            best_val=best_val,
+            stale_validations=stale,
+            dlw_loss_history=loss_history,
+            dlw_weights=dict(weights),
         )
 
     def _validate(epoch: int) -> None:
@@ -174,12 +188,20 @@ def train(cfg: DMRSTConfig) -> None:
             dim(f"  No improvement ({stale}/{cfg.patience})")
         model.train()
 
+    training_complete = start_epoch >= cfg.max_epochs or stale >= cfg.patience
+    if training_complete:
+        reason = "max_epochs reached" if start_epoch >= cfg.max_epochs else "patience exhausted"
+        dim(f"Skipping training: {reason} on prior run; jumping to final evaluation.")
+
     recent_losses = deque(maxlen=200)
     rng = random.Random(cfg.seed)
-    rule("Training")
+    if not training_complete:
+        rule("Training")
     training_start = time.monotonic()
 
     for epoch in range(start_epoch, cfg.max_epochs):
+        if stale >= cfg.patience:
+            break
         trees = list(train_trees)
         rng.shuffle(trees)
         epoch_start = time.monotonic()
@@ -190,9 +212,13 @@ def train(cfg: DMRSTConfig) -> None:
 
         with make_progress_bar() as progress:
             task = progress.add_task(
-                "training", total=steps_per_epoch,
-                epoch=f"{epoch+1}/{cfg.max_epochs}",
-                loss_str="loss=-.----", lr_str="", mem_str="", total_elapsed="0:00:00",
+                "training",
+                total=steps_per_epoch,
+                epoch=f"{epoch + 1}/{cfg.max_epochs}",
+                loss_str="loss=-.----",
+                lr_str="",
+                mem_str="",
+                total_elapsed="0:00:00",
             )
 
             for tree_idx, tree in enumerate(trees):
@@ -230,16 +256,14 @@ def train(cfg: DMRSTConfig) -> None:
                         if len(loss_history[k]) > 3:
                             loss_history[k] = loss_history[k][-3:]
                     if len(loss_history[components[0]]) > 2:
-                        T = cfg.dlw_temperature
-                        K = len(components)
+                        temperature = cfg.dlw_temperature
+                        num_components = len(components)
                         expw = {
-                            k: math.exp(
-                                (loss_history[k][-1] / max(loss_history[k][-2], 1e-8)) / T
-                            )
+                            k: math.exp((loss_history[k][-1] / max(loss_history[k][-2], 1e-8)) / temperature)
                             for k in components
                         }
-                        Z = sum(expw.values())
-                        weights = {k: K * expw[k] / Z for k in components}
+                        norm = sum(expw.values())
+                        weights = {k: num_components * expw[k] / norm for k in components}
                 curr_sums = {k: 0.0 for k in components}
 
                 avg = sum(recent_losses) / len(recent_losses)
@@ -248,18 +272,20 @@ def train(cfg: DMRSTConfig) -> None:
                 mem_str = f"[gpu]max_mem={mem[1]:.1f}GB[/gpu]" if mem else ""
                 secs = int(time.monotonic() - training_start)
                 progress.update(
-                    task, advance=1,
+                    task,
+                    advance=1,
                     loss_str=f"loss=[bold orange1]{avg:.4f}[/bold orange1]",
                     lr_str=f"lr=[dim]{lr_str_inner}[/dim]",
                     mem_str=mem_str,
-                    total_elapsed=f"{secs//3600}:{(secs%3600)//60:02d}:{secs%60:02d}",
+                    total_elapsed=f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}",
                 )
 
                 if epoch_step % cfg.log_every == 0:
                     mem_log = f"  mem=[dim]{mem[0]:.1f}/{mem[1]:.1f}GB[/dim]" if mem else ""
                     w_log = (
                         "  w=[dim]" + "/".join(f"{weights[k]:.2f}" for k in components) + "[/dim]"
-                        if cfg.dlw_enabled else ""
+                        if cfg.dlw_enabled
+                        else ""
                     )
                     progress.console.print(
                         f"  [step]step {epoch_step}/{steps_per_epoch}[/step]  "
@@ -278,7 +304,7 @@ def train(cfg: DMRSTConfig) -> None:
 
         if num_trees > 0 and stale < cfg.patience:
             console.print(
-                f"  [epoch]Epoch {epoch+1}/{cfg.max_epochs}[/epoch] "
+                f"  [epoch]Epoch {epoch + 1}/{cfg.max_epochs}[/epoch] "
                 f"[dim]({time.monotonic() - epoch_start:.1f}s)[/dim]  "
                 f"loss=[loss]{total_loss / num_trees:.4f}[/loss]"
             )
@@ -299,13 +325,15 @@ def train(cfg: DMRSTConfig) -> None:
         model.load_state_dict(ckpt["model_state_dict"])
         model.eval()
         dev_m = evaluate_dmrst(
-            model, dev_pairs,
+            model,
+            dev_pairs,
             output_dir=os.path.join(run_dir, "dev_predictions", "final"),
         )
         console.print(dmrst_metrics_table(dev_m, title="Final Dev Results"))
         if test_pairs is not None:
             test_m = evaluate_dmrst(
-                model, test_pairs,
+                model,
+                test_pairs,
                 output_dir=os.path.join(run_dir, "test_predictions", "final"),
             )
             console.print(dmrst_metrics_table(test_m, title="Final Test Results"))

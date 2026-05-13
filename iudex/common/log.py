@@ -1,4 +1,5 @@
 """Sexy logging for iudex, powered by Rich."""
+
 import logging
 
 from rich.console import Console
@@ -6,19 +7,21 @@ from rich.logging import RichHandler
 from rich.theme import Theme
 
 # Project-wide console with a custom theme
-theme = Theme({
-    "info": "cyan",
-    "warning": "yellow",
-    "error": "bold red",
-    "metric": "bold green",
-    "metric.name": "dim",
-    "epoch": "bold magenta",
-    "step": "dim cyan",
-    "lr": "dim yellow",
-    "loss": "bold orange1",
-    "gpu": "bold green",
-    "path": "underline blue",
-})
+theme = Theme(
+    {
+        "info": "cyan",
+        "warning": "yellow",
+        "error": "bold red",
+        "metric": "bold green",
+        "metric.name": "dim",
+        "epoch": "bold magenta",
+        "step": "dim cyan",
+        "lr": "dim yellow",
+        "loss": "bold orange1",
+        "gpu": "bold green",
+        "path": "underline blue",
+    }
+)
 
 console = Console(theme=theme)
 
