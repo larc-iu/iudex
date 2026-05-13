@@ -54,6 +54,7 @@ class RstPpTree:
         edges: List[RstPpEdge],
         binarize: bool = True,
         relation_types: Tuple[Tuple[str, str], ...] = None,
+        relation_map: Optional[dict] = None,
     ):
         if len(set(n.id for n in nodes)) != len(nodes):
             raise ValueError("Nodes must have unique IDs")
@@ -77,6 +78,10 @@ class RstPpTree:
         self._build_adj_maps()
 
         self._relation_types = relation_types
+        # Applied at output boundary (parsing_actions, relation_of, etc.) so
+        # that binarization / multinuc-vs-satellite disambiguation — which key
+        # off relation-name distinctness — see the raw labels.
+        self._relation_map = relation_map
 
         has_parent = set()
         for e in edges:
@@ -101,11 +106,25 @@ class RstPpTree:
                     return potential_parent
         return None
 
+    def _resolve_rel(self, rel: str) -> str:
+        """Apply `relation_map` to a relation name leaving the tree. The
+        structural marker `"span"` passes through; any other label not in the
+        map raises (silent passthrough would hide annotation drift).
+        """
+        if self._relation_map is None or rel == "span":
+            return rel
+        if rel not in self._relation_map:
+            raise KeyError(
+                f"Relation {rel!r} is not in this tree's `relation_map`. "
+                f"Add it to the map or pass `relation_map=None` to disable mapping."
+            )
+        return self._relation_map[rel]
+
     def relation_of(self, node_id):
         for potential_parent, children in self._primary_adj_map.items():
             for child in children:
                 if child == node_id:
-                    return self._primary_adj_map[potential_parent][node_id].relation
+                    return self._resolve_rel(self._primary_adj_map[potential_parent][node_id].relation)
         return None
 
     def parsing_actions(self, dfs: bool = True) -> List[Tuple[int, str, str]]:
@@ -145,7 +164,7 @@ class RstPpTree:
                 (
                     satellite_edu_yield[-1] + 1 if satellite_is_left else satellite_edu_yield[0],
                     "SN" if satellite_is_left else "NS",
-                    edge.relation,
+                    self._resolve_rel(edge.relation),
                 )
             )
 
@@ -159,8 +178,25 @@ class RstPpTree:
             if current.type == "span":
                 if len(current_edges) == 1:
                     continue
-                else:
-                    edge = [e for e in current_edges if e.relation != "span"][0]
+                # 1 nucleus (relname='span') + N satellites with distinct relations
+                # is valid RST. This is not done in GUM, but there are instances of
+                # it in RST-DT.
+                # Emit one satellite per action, outermost-first, so the `spans()`
+                # `bounds` accumulator narrows each successive emit's enclosing range
+                # and the model sees a distinct gold split for each.
+                satellite_edges = [e for e in current_edges if e.relation != "span"]
+                if len(satellite_edges) > 1:
+                    nucleus_edge = next(e for e in current_edges if e.relation == "span")
+                    nucleus_yield = edu_yields[nucleus_edge.target]
+                    def dist_to_nucleus(edge):
+                        y = edu_yields[edge.target]
+                        if y[-1] < nucleus_yield[0]:
+                            return nucleus_yield[0] - y[-1]
+                        if y[0] > nucleus_yield[-1]:
+                            return y[0] - nucleus_yield[-1]
+                        return 0
+                    satellite_edges = sorted(satellite_edges, key=dist_to_nucleus, reverse=True)
+                for edge in satellite_edges:
                     handle_satellite(sequence, edge, edu_yield)
             elif current.type == "terminal":
                 if len(current_edges) == 0:
@@ -177,7 +213,11 @@ class RstPpTree:
                 edge_yields = [edu_yields[e.target] for e in multinuc_edges]
                 first_is_left = all(edge_yields[0][0] < x for x in edge_yields[1])
                 sequence.append(
-                    (edge_yields[1][0] if first_is_left else edge_yields[0][0], "NN", multinuc_edges[0].relation)
+                    (
+                        edge_yields[1][0] if first_is_left else edge_yields[0][0],
+                        "NN",
+                        self._resolve_rel(multinuc_edges[0].relation),
+                    )
                 )
         return sequence
 

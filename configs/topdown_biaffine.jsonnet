@@ -1,4 +1,4 @@
-local relations = import 'lib/relations.libsonnet';
+local relations = import 'lib/relations_gum9.libsonnet';
 
 local model_name = "SpanBERT/spanbert-base-cased";
 //local model_name = "bert-base-cased";

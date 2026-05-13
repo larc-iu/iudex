@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
+from iudex.rst.data.reader import determine_label_index
 from iudex.rst.data.tree import RstPpTree
 from iudex.rst.parsers.topdown_biaffine.configuration_topdown_biaffine import TopdownBiaffineConfig
 
@@ -53,7 +54,7 @@ class TopdownBiaffineParser(nn.Module):
         super().__init__()
         self.config = config
         self._relation_types = tuple(config.relation_types)
-        self.label_index = self._determine_labels(self._relation_types)
+        self.label_index = determine_label_index(self._relation_types)
         self.stride = config.stride
 
         encoder_kwargs = {}
@@ -73,27 +74,6 @@ class TopdownBiaffineParser(nn.Module):
 
         self.split_biaffine = _DeepBiAffine(self.hidden_size, config.ffn_hidden_size, 1, config.dropout)
         self.label_biaffine = _DeepBiAffine(self.hidden_size, config.ffn_hidden_size, len(self.label_index), config.dropout)
-
-    @staticmethod
-    def _determine_labels(relation_types: Tuple[Tuple[str, str], ...]) -> List[str]:
-        """Expand (relation, kind) pairs into joint nuclearity+relation labels.
-
-        The label classifier predicts a single portmanteau label like "NS_elaboration"
-        that encodes both the relation and which child is the nucleus:
-          - "multinuc" relations get one label "NN_<relation>"
-          - "rst" (mononuclear) relations get two labels, "NS_<relation>" (nucleus
-            left) and "SN_<relation>" (nucleus right).
-        """
-        out = []
-        for relation, kind in relation_types:
-            if kind == "multinuc":
-                out.append(f"NN_{relation}")
-            elif kind == "rst":
-                out.append(f"NS_{relation}")
-                out.append(f"SN_{relation}")
-            else:
-                raise ValueError(f"Unknown relation kind: {kind}")
-        return out
 
     @property
     def relation_types(self):

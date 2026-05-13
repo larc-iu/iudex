@@ -86,25 +86,80 @@ def read_rst_file(
     filepath: str,
     binarize: bool = True,
     relation_types: Tuple[Tuple[str, str], ...] = None,
+    relation_map: Optional[Dict[str, str]] = None,
 ) -> RstPpTree:
-    """Read an RS3 or RS4 file and return an RstPpTree."""
+    """Read an RS3 or RS4 file and return an RstPpTree. If `relation_map` is
+    set, the tree applies it at its output boundary (e.g. `parsing_actions`,
+    `spans`, `relation_of`) — edges retain raw labels so that structure-
+    inference logic that distinguishes multinuc-siblings from satellites by
+    relation-name distinctness is not broken by fine→coarse collapses.
+    """
     logger.info(f"Reading {filepath}")
     d = _read_rs4_into_dict(filepath)
     _validate_dict(filepath, d)
     nodes, edges = _process_dict(d)
-    return RstPpTree(nodes, edges, binarize=binarize, relation_types=relation_types)
+    return RstPpTree(
+        nodes, edges, binarize=binarize, relation_types=relation_types, relation_map=relation_map
+    )
 
 
 def read_rst_dir(
     directory: str,
     binarize: bool = True,
     relation_types: Tuple[Tuple[str, str], ...] = None,
+    relation_map: Optional[Dict[str, str]] = None,
 ) -> List[Tuple[str, RstPpTree]]:
-    """Read all RS3/RS4 files from a directory, returning (filepath, tree) pairs."""
+    """Read all RS3/RS4 files from a directory, returning (filepath, tree) pairs.
+    `relation_map` is forwarded to `RstPpTree` for output-boundary remapping.
+    """
     paths = sorted(glob(str(Path(directory) / "*.rs3")))
     paths += sorted(glob(str(Path(directory) / "*.rs4")))
     results = []
     for p in paths:
-        tree = read_rst_file(p, binarize=binarize, relation_types=relation_types)
+        tree = read_rst_file(
+            p, binarize=binarize, relation_types=relation_types, relation_map=relation_map
+        )
         results.append((p, tree))
     return results
+
+
+def infer_relation_types(
+    directories: List[str],
+    relation_map: Optional[Dict[str, str]] = None,
+) -> List[Tuple[str, str]]:
+    """Scan RS3/RS4 files in `directories` and return the union of
+    (relation, kind) pairs observed in their parsing actions. A given relation
+    may appear with both kinds — RST-DT, for example, has relations that are
+    mononuclear in some contexts and multinuclear in others.
+
+    When `relation_map` is set, observed relations are reported in the mapped
+    (typically coarse-grained) space. Sorted for deterministic config hashing.
+    """
+    seen = set()
+    for directory in directories:
+        for _, tree in read_rst_dir(directory, relation_map=relation_map):
+            for _, nuc, rel in tree.parsing_actions():
+                kind = "multinuc" if nuc == "NN" else "rst"
+                seen.add((rel, kind))
+    return sorted(seen)
+
+
+def determine_label_index(relation_types: Tuple[Tuple[str, str], ...]) -> List[str]:
+    """Expand (relation, kind) pairs into joint nuclearity+relation labels.
+
+    Parser label classifiers predict a single portmanteau label like
+    "NS_elaboration" that encodes both the relation and which child is nucleus:
+      - "multinuc" relations get one label "NN_<relation>"
+      - "rst" (mononuclear) relations get two labels, "NS_<relation>" (nucleus
+        left) and "SN_<relation>" (nucleus right).
+    """
+    out = []
+    for relation, kind in relation_types:
+        if kind == "multinuc":
+            out.append(f"NN_{relation}")
+        elif kind == "rst":
+            out.append(f"NS_{relation}")
+            out.append(f"SN_{relation}")
+        else:
+            raise ValueError(f"Unknown relation kind: {kind}")
+    return out

@@ -138,22 +138,30 @@ def final_evaluation(
     dev_pairs: List[Tuple[str, "RstPpTree"]],
     val_metric_name: str,
     best_val: float,
+    test_pairs: Optional[List[Tuple[str, "RstPpTree"]]] = None,
 ) -> None:
     """Reload `{run_dir}/best_model.pt` if present, re-evaluate, and print results.
-    Falls back to printing the recorded best metric if no best checkpoint exists."""
+    Always reports dev; reports test too when `test_pairs` is given. Falls back to
+    printing the recorded best metric if no best checkpoint exists."""
     rule("Final Evaluation")
     best_path = os.path.join(run_dir, "best_model.pt")
-    if os.path.exists(best_path):
-        ckpt = torch.load(best_path, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
-        model.eval()
-        metrics = evaluate(
-            predict_fn, dev_pairs,
-            output_dir=os.path.join(run_dir, "dev_predictions", "final"),
-        )
-        console.print(metrics_table(metrics, title="Final Results"))
-    else:
+    if not os.path.exists(best_path):
         success(f"Training complete. Best {val_metric_name}: {best_val:.4f}")
+        return
+    ckpt = torch.load(best_path, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    dev_metrics = evaluate(
+        predict_fn, dev_pairs,
+        output_dir=os.path.join(run_dir, "dev_predictions", "final"),
+    )
+    console.print(metrics_table(dev_metrics, title="Final Dev Results"))
+    if test_pairs is not None:
+        test_metrics = evaluate(
+            predict_fn, test_pairs,
+            output_dir=os.path.join(run_dir, "test_predictions", "final"),
+        )
+        console.print(metrics_table(test_metrics, title="Final Test Results"))
 
 
 def build_optimizer(

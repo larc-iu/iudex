@@ -19,6 +19,7 @@ import sys
 # {parser_name: importable package containing this parser's command scripts}
 PARSERS = {
     "topdown_biaffine": "iudex.rst.parsers.topdown_biaffine",
+    "dmrst": "iudex.rst.parsers.dmrst",
 }
 
 
