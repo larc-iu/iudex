@@ -36,7 +36,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from iudex.common.log import console, rule, success
 from iudex.rst.data.metrics import compute_parseval_metrics
-from iudex.rst.data.tree import RstPpTree
+from iudex.rst.data.tree import RstTree
 
 logger = logging.getLogger(__name__)
 
@@ -136,11 +136,11 @@ def final_evaluation(
     *,
     model: nn.Module,
     run_dir: str,
-    predict_fn: Callable[["RstPpTree"], "RstPpTree"],
-    dev_pairs: list[tuple[str, "RstPpTree"]],
+    predict_fn: Callable[["RstTree"], "RstTree"],
+    dev_pairs: list[tuple[str, "RstTree"]],
     val_metric_name: str,
     best_val: float,
-    test_pairs: list[tuple[str, "RstPpTree"]] | None = None,
+    test_pairs: list[tuple[str, "RstTree"]] | None = None,
 ) -> None:
     """Reload `{run_dir}/best_model.pt` if present, re-evaluate, and print results.
     Always reports dev; reports test too when `test_pairs` is given. Falls back to
@@ -258,8 +258,8 @@ def metrics_table(metrics: dict[str, float], title: str) -> Table:
 
 @torch.no_grad()
 def evaluate(
-    predict_fn: Callable[[RstPpTree], RstPpTree],
-    dev_pairs: list[tuple[str, RstPpTree]],
+    predict_fn: Callable[[RstTree], RstTree],
+    dev_pairs: list[tuple[str, RstTree]],
     output_dir: str | None = None,
 ) -> dict[str, float]:
     """Run `predict_fn` over each (path, gold_tree) pair and report Parseval F1s.

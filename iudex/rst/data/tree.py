@@ -14,7 +14,7 @@ def _ddict2dict(d):
 
 
 @dataclass
-class RstPpNode:
+class RstNode:
     id: str
     type: str
     text: Optional[str] = None
@@ -28,7 +28,7 @@ class RstPpNode:
 
 
 @dataclass
-class RstPpEdge:
+class RstEdge:
     source: str
     target: str
     relation: str
@@ -47,11 +47,11 @@ class RstPpEdge:
         )
 
 
-class RstPpTree:
+class RstTree:
     def __init__(
         self,
-        nodes: List[RstPpNode],
-        edges: List[RstPpEdge],
+        nodes: List[RstNode],
+        edges: List[RstEdge],
         binarize: bool = True,
         relation_types: Tuple[Tuple[str, str], ...] = None,
         relation_map: Optional[dict] = None,
@@ -277,7 +277,7 @@ class RstPpTree:
         return ET.tostring(root, encoding="utf-8", pretty_print=True).decode("utf-8")
 
     @property
-    def edus(self) -> List[RstPpNode]:
+    def edus(self) -> List[RstNode]:
         return [n for n in self._node_map.values() if n.is_edu]
 
     @property
@@ -285,7 +285,7 @@ class RstPpTree:
         return [edu.text for edu in self.edus]
 
     @property
-    def nonterminals(self) -> List[RstPpNode]:
+    def nonterminals(self) -> List[RstNode]:
         return [n for n in self._node_map.values() if not n.is_edu]
 
     @property
@@ -299,12 +299,12 @@ class RstPpTree:
     def from_parsing_actions(
         cls,
         actions: List[Tuple[int, str, str]],
-        edus: Union[List[str], List[RstPpNode]],
+        edus: Union[List[str], List[RstNode]],
         return_tree=True,
         relation_types: Tuple[Tuple[str, str], ...] = None,
-    ) -> Union["RstPpTree", Tuple[List[RstPpNode], List[RstPpEdge]]]:
+    ) -> Union["RstTree", Tuple[List[RstNode], List[RstEdge]]]:
         edus = [
-            RstPpNode(str(i + 1), "terminal", edu if isinstance(edu, str) else edu.text) for i, edu in enumerate(edus)
+            RstNode(str(i + 1), "terminal", edu if isinstance(edu, str) else edu.text) for i, edu in enumerate(edus)
         ]
 
         nodes, edges = [], []
@@ -318,15 +318,15 @@ class RstPpTree:
             if nuclearity in ["NS", "SN"]:
                 satellite_node = left_node if nuclearity == "SN" else right_node
                 nucleus_node = right_node if nuclearity == "SN" else left_node
-                top_node = RstPpNode(f"{len(nodes) + 1}", type="span")
+                top_node = RstNode(f"{len(nodes) + 1}", type="span")
                 nodes.append(top_node)
-                edges.append(RstPpEdge(top_node.id, nucleus_node.id, "span"))
-                edges.append(RstPpEdge(nucleus_node.id, satellite_node.id, relation))
+                edges.append(RstEdge(top_node.id, nucleus_node.id, "span"))
+                edges.append(RstEdge(nucleus_node.id, satellite_node.id, relation))
             elif nuclearity == "NN":
-                top_node = RstPpNode(f"{len(nodes) + 1}", type="multinuc")
+                top_node = RstNode(f"{len(nodes) + 1}", type="multinuc")
                 nodes.append(top_node)
-                edges.append(RstPpEdge(top_node.id, left_node.id, relation))
-                edges.append(RstPpEdge(top_node.id, right_node.id, relation))
+                edges.append(RstEdge(top_node.id, left_node.id, relation))
+                edges.append(RstEdge(top_node.id, right_node.id, relation))
             else:
                 raise ValueError(f"Unknown nuclearity: {nuclearity}")
 
@@ -336,7 +336,7 @@ class RstPpTree:
             for edu_index in combined_edu_indexes:
                 coverage_index[edu_index] = top_node
         if return_tree:
-            return RstPpTree(nodes, edges, relation_types=relation_types)
+            return RstTree(nodes, edges, relation_types=relation_types)
         else:
             return nodes, edges
 
@@ -374,14 +374,14 @@ def binarize_tree(nodes, edges):
         nonlocal new_node_count, edges, nodes
         new_nodes = []
         for i in range(len(multinuc_edges) - 2):
-            new_nodes.append(RstPpNode(id=f"binarized_{new_node_count}", type="multinuc"))
+            new_nodes.append(RstNode(id=f"binarized_{new_node_count}", type="multinuc"))
             new_node_count += 1
         nodes.extend(new_nodes)
 
         latest_parent_id = node_id
         for i in range(1, len(multinuc_edges) - 1):
             next_parent_id = new_nodes[i - 1].id
-            edges.append(RstPpEdge(latest_parent_id, next_parent_id, relation))
+            edges.append(RstEdge(latest_parent_id, next_parent_id, relation))
             multinuc_edges[i].source = next_parent_id
             latest_parent_id = next_parent_id
         multinuc_edges[-1].source = latest_parent_id

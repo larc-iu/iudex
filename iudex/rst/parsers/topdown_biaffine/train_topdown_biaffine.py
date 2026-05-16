@@ -126,9 +126,9 @@ def train(cfg: TopdownBiaffineConfig) -> None:
         nonlocal best_val, stale
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         model.eval()
-        m = evaluate(model.predict, dev_pairs, output_dir=pred_dir)
-        console.print(metrics_table(m, title=f"Dev @ step {global_step}"))
-        score = m[cfg.val_metric_name]
+        metrics = evaluate(model.predict, dev_pairs, output_dir=pred_dir)
+        console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
+        score = metrics[cfg.val_metric_name]
         if score > best_val:
             best_val = score
             stale = 0
@@ -193,16 +193,16 @@ def train(cfg: TopdownBiaffineConfig) -> None:
                 global_step += 1
                 epoch_step += 1
 
-                avg = sum(recent_losses) / len(recent_losses)
-                lr_str_inner = "/".join(f"{lr:.1e}" for lr in sorted(set(scheduler.get_last_lr())))
+                avg_loss = sum(recent_losses) / len(recent_losses)
+                lr_display = "/".join(f"{lr:.1e}" for lr in sorted(set(scheduler.get_last_lr())))
                 mem = gpu_mem_gb(device)
                 mem_str = f"[gpu]max_mem={mem[1]:.1f}GB[/gpu]" if mem else ""
                 secs = int(time.monotonic() - training_start)
                 progress.update(
                     task,
                     advance=1,
-                    loss_str=f"loss=[bold orange1]{avg:.4f}[/bold orange1]",
-                    lr_str=f"lr=[dim]{lr_str_inner}[/dim]",
+                    loss_str=f"loss=[bold orange1]{avg_loss:.4f}[/bold orange1]",
+                    lr_str=f"lr=[dim]{lr_display}[/dim]",
                     mem_str=mem_str,
                     total_elapsed=f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}",
                 )
@@ -211,9 +211,9 @@ def train(cfg: TopdownBiaffineConfig) -> None:
                     mem_log = f"  mem=[dim]{mem[0]:.1f}/{mem[1]:.1f}GB[/dim]" if mem else ""
                     progress.console.print(
                         f"  [step]step {epoch_step}/{steps_per_epoch}[/step]  "
-                        f"loss=[loss]{avg:.4f}[/loss]  "
+                        f"loss=[loss]{avg_loss:.4f}[/loss]  "
                         f"grad=[dim]{grad_norm:.4f}[/dim]  "
-                        f"lr=[dim]{lr_str_inner}[/dim]{mem_log}"
+                        f"lr=[dim]{lr_display}[/dim]{mem_log}"
                     )
 
                 if cfg.validate_every and global_step % cfg.validate_every == 0:

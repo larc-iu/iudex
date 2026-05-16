@@ -44,42 +44,42 @@ def _resolve_checkpoint(config_path: str, checkpoint_path: str) -> str:
     cfg = TopdownBiaffineConfig.from_dict(Params.from_file(config_path).as_dict(quiet=True))
     run_id, _ = derive_run_id(dataclasses.asdict(cfg), cfg.run_name)
     run_dir = os.path.join(cfg.checkpoint_dir, run_id)
-    ckpt = os.path.join(run_dir, "best_model.pt")
-    if not os.path.exists(ckpt):
+    checkpoint_path = os.path.join(run_dir, "best_model.pt")
+    if not os.path.exists(checkpoint_path):
         console.print(
             f"[bold red]No trained model found for this config.[/bold red]\n"
-            f"  Expected: [path]{ckpt}[/path]\n"
+            f"  Expected: [path]{checkpoint_path}[/path]\n"
             f"  Train first with:\n"
             f"    python -m iudex.rst.parsers.topdown_biaffine.train_topdown_biaffine {config_path}"
         )
         sys.exit(1)
-    return ckpt
+    return checkpoint_path
 
 
 def load_model(checkpoint_path: str, device: torch.device) -> TopdownBiaffineParser:
     """Rehydrate a parser from a checkpoint: rebuild the config, init the model,
     load weights, move to `device`, and put it in eval mode."""
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = TopdownBiaffineConfig.from_dict(ckpt["config"])
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    cfg = TopdownBiaffineConfig.from_dict(checkpoint["config"])
     model = TopdownBiaffineParser(cfg)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(checkpoint["model_state_dict"])
     return model.to(device).eval()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Predict RST trees")
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--config", help="Jsonnet config; load best_model.pt from the derived run dir")
-    src.add_argument("--checkpoint", help="Direct path to a .pt checkpoint")
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--config", help="Jsonnet config; load best_model.pt from the derived run dir")
+    source_group.add_argument("--checkpoint", help="Direct path to a .pt checkpoint")
     parser.add_argument("--input", required=True, help="RS3/RS4 file or directory")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    ckpt_path = _resolve_checkpoint(args.config, args.checkpoint)
+    checkpoint_path = _resolve_checkpoint(args.config, args.checkpoint)
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = load_model(ckpt_path, device)
-    console.print(f"[dim]Loaded model from[/dim] [path]{ckpt_path}[/path]")
+    model = load_model(checkpoint_path, device)
+    console.print(f"[dim]Loaded model from[/dim] [path]{checkpoint_path}[/path]")
 
     os.makedirs(args.output_dir, exist_ok=True)
     if os.path.isdir(args.input):

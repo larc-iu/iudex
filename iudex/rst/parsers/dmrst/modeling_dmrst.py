@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
 from iudex.rst.data.reader import determine_label_index
-from iudex.rst.data.tree import RstPpTree
+from iudex.rst.data.tree import RstTree
 from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
 
 
@@ -107,7 +107,7 @@ class _LabelClassifier(nn.Module):
 
 
 class _Segmenter(nn.Module):
-    """Per-subtoken EDU-boundary classifier.
+    """Per-token EDU-boundary classifier.
 
     Trains as a binary token-tagger that fires at EDU END positions; the class
     weight on the positive label is typically large (~10) since end-of-EDU
@@ -127,21 +127,21 @@ class _Segmenter(nn.Module):
         """Compute the segmentation loss against gold EDU ends.
 
         Args:
-            embeddings:        [num_subtokens, hidden_size]
-            edu_end_positions: subtoken indices of EDU ends (inclusive)
+            embeddings:        [num_tokens, hidden_size]
+            edu_end_positions: token indices of EDU ends (inclusive)
 
         Returns:
             scalar loss
         """
-        num_subtokens = embeddings.size(0)
+        num_tokens = embeddings.size(0)
         device = embeddings.device
-        end_target = torch.zeros(num_subtokens, dtype=torch.long, device=device)
+        end_target = torch.zeros(num_tokens, dtype=torch.long, device=device)
         end_target[edu_end_positions] = 1
         logits = self.linear(self.dropout(embeddings))
         loss = F.cross_entropy(logits, end_target, weight=self.class_weight)
 
         if self.start_linear is not None:
-            start_target = torch.zeros(num_subtokens, dtype=torch.long, device=device)
+            start_target = torch.zeros(num_tokens, dtype=torch.long, device=device)
             start_target[0] = 1
             # Every EDU end except the last document end is followed by an EDU start.
             for end in edu_end_positions[:-1]:
@@ -152,13 +152,13 @@ class _Segmenter(nn.Module):
 
     @torch.no_grad()
     def predict_breaks(self, embeddings: torch.Tensor) -> list[int]:
-        """Predict EDU end subtoken indices from `embeddings`.
+        """Predict EDU end token indices from `embeddings`.
 
         Args:
-            embeddings: [num_subtokens, hidden_size]
+            embeddings: [num_tokens, hidden_size]
 
         Returns:
-            Sorted, deduped list of inclusive end indices. The last subtoken is
+            Sorted, deduped list of inclusive end indices. The last token is
             always forced to be a break so the final EDU is closed. We dedupe
             because argmax can fire on `last` independently of the force-append,
             and a duplicate would yield an empty (prev, end+1) interval downstream
@@ -177,15 +177,15 @@ class DMRSTParser(nn.Module):
     """DMRST parser (Liu, Shi & Chen, CODI 2021).
 
     Pipeline per document:
-        subtokens --(striding transformer)--> subtoken embeddings
+        tokens --(striding transformer)--> token embeddings
         per-EDU mean --(2-layer BiGRU)--> contextual EDU vectors
-        edu_repr = reduce_dim([bigru_out, first_subtoken, last_subtoken])
+        edu_repr = reduce_dim([bigru_out, first_token, last_token])
         decode top-down with a unidirectional GRU decoder whose hidden state
         is carried across decisions (DFS, left-first); at each non-leaf span,
         a pointer attention picks the split position and a bilinear classifier
         picks the joint nuclearity+relation label.
 
-    With `joint_segmentation=True`, a per-subtoken EDU-boundary head trains
+    With `joint_segmentation=True`, a per-token EDU-boundary head trains
     alongside the parser and enables raw-text inference via `predict_from_text`.
 
     Training (`forward`) is teacher-forced and returns the split, label, and
@@ -199,12 +199,9 @@ class DMRSTParser(nn.Module):
         self.label_index = determine_label_index(config.relation_types)
         self.stride = config.stride
 
-        encoder_kwargs = {}
-        if config.attn_implementation is not None:
-            encoder_kwargs["attn_implementation"] = config.attn_implementation
         # transformers >=5 honors the checkpoint's saved dtype; many HF checkpoints
         # are fp16, which makes AdamW updates NaN immediately. Force fp32.
-        self.encoder = AutoModel.from_pretrained(config.model_name, **encoder_kwargs).float()
+        self.encoder = AutoModel.from_pretrained(config.model_name).float()
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         self.hidden_size = self.encoder.config.hidden_size
 
@@ -261,12 +258,12 @@ class DMRSTParser(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def _tokenize_tree(self, tree: RstPpTree) -> tuple[torch.Tensor, list[tuple[int, int]]]:
+    def _tokenize_tree(self, tree: RstTree) -> tuple[torch.Tensor, list[tuple[int, int]]]:
         """Tokenize the document EDU-by-EDU.
 
         Returns:
-            input_ids:   [num_subtokens]
-            edu_mapping: list of (start_subtoken, end_subtoken_exclusive) per EDU
+            input_ids:   [num_tokens]
+            edu_mapping: list of (start_token, end_token_exclusive) per EDU
         """
         all_ids: list[int] = []
         boundaries: list[tuple[int, int]] = []
@@ -278,18 +275,18 @@ class DMRSTParser(nn.Module):
         input_ids = torch.tensor(all_ids, dtype=torch.long, device=self.device)
         return input_ids, boundaries
 
-    def _encode_subtokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Encode a flat subtoken sequence with overlapping sliding windows.
+    def _encode_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Encode a flat token sequence with overlapping sliding windows.
 
         Long documents exceed the LM's positional budget, so we tile the input
         with windows that overlap by `self.stride` tokens; overlapped positions
         keep the embedding from the *earlier* window (more left context).
 
         Args:
-            input_ids: [num_subtokens]
+            input_ids: [num_tokens]
 
         Returns:
-            embeddings: [num_subtokens, hidden_size]  (1:1 with input positions)
+            embeddings: [num_tokens, hidden_size]  (1:1 with input positions)
         """
         max_content = self.max_length - 2  # leave room for [CLS] ... [SEP] per chunk
         cls_id = self.tokenizer.cls_token_id
@@ -333,7 +330,7 @@ class DMRSTParser(nn.Module):
             pieces.append(emb if i == 0 else emb[self.stride :])
         return torch.cat(pieces, dim=0)[:content_len]
 
-    def _encode(self, tree: RstPpTree) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _encode(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full encoder pass using gold EDU segmentation.
 
         Computes the segmentation loss as a side-effect when joint segmentation
@@ -345,10 +342,10 @@ class DMRSTParser(nn.Module):
             seg_loss:     scalar tensor (zero when joint segmentation is disabled)
         """
         input_ids, edu_mapping = self._tokenize_tree(tree)
-        normed = self.layer_norm(self._encode_subtokens(input_ids).float())  # [num_subtokens, hidden_size]
+        normed = self.layer_norm(self._encode_tokens(input_ids).float())  # [num_tokens, hidden_size]
 
         if self.segmenter is not None and self.training:
-            # End subtoken (inclusive) of each gold EDU; segmenter operates on the
+            # End token (inclusive) of each gold EDU; segmenter operates on the
             # layer-normed embeddings BEFORE dropout (matches upstream).
             edu_ends = [end - 1 for _, end in edu_mapping]
             seg_loss = self.segmenter.loss(normed, edu_ends)
@@ -364,15 +361,15 @@ class DMRSTParser(nn.Module):
         embeddings: torch.Tensor,
         edu_mapping: list[tuple[int, int]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build per-EDU representations from subtoken embeddings.
+        """Build per-EDU representations from token embeddings.
 
-        Shared back half of the encoder (after subtoken encoding + LayerNorm
-        + dropout): per-EDU subtoken mean -> BiGRU -> concat(gru_out, first,
+        Shared back half of the encoder (after token encoding + LayerNorm
+        + dropout): per-EDU token mean -> BiGRU -> concat(gru_out, first,
         last) -> reduce. Used by both the gold-EDU and predicted-EDU paths.
 
         Args:
-            embeddings:  [num_subtokens, hidden_size]
-            edu_mapping: list of (start_subtoken, end_subtoken_exclusive) per EDU
+            embeddings:  [num_tokens, hidden_size]
+            edu_mapping: list of (start_token, end_token_exclusive) per EDU
 
         Returns:
             edu_reprs:    [num_edus, hidden_size]
@@ -419,7 +416,7 @@ class DMRSTParser(nn.Module):
             return edu_reprs[split_point - 1].unsqueeze(0), edu_reprs[e - 1].unsqueeze(0)
         return edu_reprs[b:split_point].mean(0, keepdim=True), edu_reprs[split_point:e].mean(0, keepdim=True)
 
-    def forward(self, tree: RstPpTree) -> dict[str, torch.Tensor]:
+    def forward(self, tree: RstTree) -> dict[str, torch.Tensor]:
         """Teacher-forced loss for one gold tree.
 
         Walks the gold parse top-down (DFS, left-first) carrying decoder state
@@ -540,19 +537,19 @@ class DMRSTParser(nn.Module):
         return actions
 
     @torch.no_grad()
-    def predict(self, tree: RstPpTree) -> RstPpTree:
+    def predict(self, tree: RstTree) -> RstTree:
         """Greedy top-down decode using the gold EDU segmentation in `tree.edus`."""
         self.eval()
         num_edus = len(tree.edus)
         if num_edus < 2:
-            return RstPpTree.from_parsing_actions([], tree.edus, relation_types=self.config.relation_types)
+            return RstTree.from_parsing_actions([], tree.edus, relation_types=self.config.relation_types)
 
         edu_reprs, decoder_hidden, _ = self._encode(tree)
         actions = self._decode_actions(edu_reprs, decoder_hidden)
-        return RstPpTree.from_parsing_actions(actions, tree.edus, relation_types=self.config.relation_types)
+        return RstTree.from_parsing_actions(actions, tree.edus, relation_types=self.config.relation_types)
 
     @torch.no_grad()
-    def predict_from_text(self, text: str) -> RstPpTree:
+    def predict_from_text(self, text: str) -> RstTree:
         """End-to-end inference from raw document text.
 
         Requires `joint_segmentation=True` in the config so the model has a
@@ -564,12 +561,12 @@ class DMRSTParser(nn.Module):
 
         ids = self.tokenizer.encode(text, add_special_tokens=False)
         if len(ids) == 0:
-            return RstPpTree.from_parsing_actions([], [], relation_types=self.config.relation_types)
+            return RstTree.from_parsing_actions([], [], relation_types=self.config.relation_types)
         input_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
-        normed = self.layer_norm(self._encode_subtokens(input_ids).float())
+        normed = self.layer_norm(self._encode_tokens(input_ids).float())
 
         breaks = self.segmenter.predict_breaks(normed)
-        # `breaks` are inclusive end subtoken indices. Convert to (start, end_exclusive).
+        # `breaks` are inclusive end token indices. Convert to (start, end_exclusive).
         edu_mapping: list[tuple[int, int]] = []
         prev = 0
         for end_inclusive in breaks:
@@ -583,15 +580,15 @@ class DMRSTParser(nn.Module):
         ]
 
         if len(edu_mapping) < 2:
-            return RstPpTree.from_parsing_actions([], edu_texts, relation_types=self.config.relation_types)
+            return RstTree.from_parsing_actions([], edu_texts, relation_types=self.config.relation_types)
 
         embeddings = self.encoder_dropout(normed)  # eval mode → dropout is identity
         edu_reprs, decoder_hidden = self._build_edu_reprs(embeddings, edu_mapping)
         actions = self._decode_actions(edu_reprs, decoder_hidden)
-        return RstPpTree.from_parsing_actions(actions, edu_texts, relation_types=self.config.relation_types)
+        return RstTree.from_parsing_actions(actions, edu_texts, relation_types=self.config.relation_types)
 
     @torch.no_grad()
-    def predict_both(self, tree: RstPpTree) -> dict[str, Any]:
+    def predict_both(self, tree: RstTree) -> dict[str, Any]:
         """Single encoder pass yielding both the gold-EDU and end-to-end predictions.
 
         Used by dev evaluation when joint segmentation is enabled, to avoid two
@@ -600,29 +597,29 @@ class DMRSTParser(nn.Module):
 
         Returns:
             {
-                "gold_pred":        RstPpTree (parse over gold EDUs),
-                "gold_edu_mapping": list[(start_subtoken, end_subtoken_exclusive)],
-                "gold_edu_ends":    list[int]  (inclusive end subtoken indices),
-                "e2e_pred":         RstPpTree or None,
+                "gold_pred":        RstTree (parse over gold EDUs),
+                "gold_edu_mapping": list[(start_token, end_token_exclusive)],
+                "gold_edu_ends":    list[int]  (inclusive end token indices),
+                "e2e_pred":         RstTree or None,
                 "pred_edu_mapping": list[(start, end)] or None,
                 "pred_edu_ends":    list[int] or None,
             }
         """
         self.eval()
         input_ids, gold_edu_mapping = self._tokenize_tree(tree)
-        normed = self.layer_norm(self._encode_subtokens(input_ids).float())
+        normed = self.layer_norm(self._encode_tokens(input_ids).float())
         embeddings = self.encoder_dropout(normed)  # eval mode → identity
 
         # Gold-EDU path.
-        gold_pred: RstPpTree
+        gold_pred: RstTree
         if len(gold_edu_mapping) < 2:
-            gold_pred = RstPpTree.from_parsing_actions(
+            gold_pred = RstTree.from_parsing_actions(
                 [], tree.edus, relation_types=self.config.relation_types
             )
         else:
             edu_reprs, decoder_hidden = self._build_edu_reprs(embeddings, gold_edu_mapping)
             actions = self._decode_actions(edu_reprs, decoder_hidden)
-            gold_pred = RstPpTree.from_parsing_actions(
+            gold_pred = RstTree.from_parsing_actions(
                 actions, tree.edus, relation_types=self.config.relation_types
             )
         gold_edu_ends = [end - 1 for _, end in gold_edu_mapping]
@@ -654,15 +651,15 @@ class DMRSTParser(nn.Module):
             for b, e in pred_edu_mapping
         ]
 
-        e2e_pred: RstPpTree
+        e2e_pred: RstTree
         if len(pred_edu_mapping) < 2:
-            e2e_pred = RstPpTree.from_parsing_actions(
+            e2e_pred = RstTree.from_parsing_actions(
                 [], pred_edu_texts, relation_types=self.config.relation_types
             )
         else:
             edu_reprs, decoder_hidden = self._build_edu_reprs(embeddings, pred_edu_mapping)
             actions = self._decode_actions(edu_reprs, decoder_hidden)
-            e2e_pred = RstPpTree.from_parsing_actions(
+            e2e_pred = RstTree.from_parsing_actions(
                 actions, pred_edu_texts, relation_types=self.config.relation_types
             )
 

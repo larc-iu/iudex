@@ -22,7 +22,6 @@ class DMRSTConfig:
 
     # Model
     model_name: str = "xlm-roberta-base"
-    attn_implementation: str | None = None
     stride: int = 100
     attention_type: str = "biaffine"  # or "dot_product"
     classifier_use_bias: bool = True
@@ -36,7 +35,7 @@ class DMRSTConfig:
     # Upstream DMRST_Parser freezes layers 0–2 + embeddings.
     freeze_encoder_layers: int = 3
 
-    # Joint EDU segmentation (paper §3.1.1). When True, training adds a per-subtoken
+    # Joint EDU segmentation (paper §3.1.1). When True, training adds a per-token
     # binary-classification loss over EDU end positions, and `predict_from_text` is
     # available for raw-text → tree inference.
     joint_segmentation: bool = False

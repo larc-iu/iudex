@@ -11,7 +11,6 @@
 
     // Model
     model_name: "xlm-roberta-base",
-    attn_implementation: "eager",
     stride: 100,
     attention_type: "biaffine",
     classifier_use_bias: true,

@@ -13,7 +13,6 @@ local model_name = "SpanBERT/spanbert-base-cased";
     ffn_hidden_size: 512,
     dropout: 0.2,
     stride: 100,
-    attn_implementation: "eager",
 
     // Data
     train_dir: "data/gum9/train",

@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Set, Tuple
 
-from iudex.rst.data.tree import RstPpTree
+from iudex.rst.data.tree import RstTree
 
 
 def f1(x, y):
@@ -9,7 +9,7 @@ def f1(x, y):
     return (2 * x * y) / (x + y) if (x + y) > 0 else 0.0
 
 
-def _spans_to_ranges(tree: RstPpTree, coarse: bool = False):
+def _spans_to_ranges(tree: RstTree, coarse: bool = False):
     """Parent-keyed enumeration: one entry per binary action, keyed on the
     parent's (first_edu, last_edu). Yields `n-1` entries for a binary tree
     with `n` EDUs — only the parser's actual split decisions are scored, and
@@ -24,7 +24,7 @@ def _spans_to_ranges(tree: RstPpTree, coarse: bool = False):
     return result
 
 
-def _spans_to_sibling_ranges(tree: RstPpTree, coarse: bool = False):
+def _spans_to_sibling_ranges(tree: RstTree, coarse: bool = False):
     """Sibling-keyed enumeration: two entries per binary action — one per
     child — keyed on the child's (first_edu, last_edu). Yields `2*(n-1)`
     entries for a binary tree with `n` EDUs, including every leaf-EDU span.
@@ -58,8 +58,8 @@ def _spans_to_sibling_ranges(tree: RstPpTree, coarse: bool = False):
 
 
 def compute_parseval_metrics(
-    gold: RstPpTree,
-    pred: RstPpTree,
+    gold: RstTree,
+    pred: RstTree,
     coarse: bool = False,
     original_parseval: bool = False,
 ) -> Dict[str, Any]:
@@ -143,34 +143,34 @@ def compute_parseval_metrics(
     return output
 
 
-def spans_to_subtoken_ranges(
-    tree: RstPpTree,
+def spans_to_token_ranges(
+    tree: RstTree,
     edu_mapping: List[Tuple[int, int]],
     coarse: bool = False,
 ) -> Set[Tuple[Tuple[int, int], str, str]]:
     """Mirror `_spans_to_ranges` but map each constituent's `(first_edu, last_edu)`
-    range through `edu_mapping` to inclusive-subtoken coordinates. Used for
+    range through `edu_mapping` to inclusive-token coordinates. Used for
     end-to-end Parseval where gold and predicted trees can have different EDU
-    sets — matching by subtoken range sidesteps the EDU-index alignment problem.
+    sets — matching by token range sidesteps the EDU-index alignment problem.
 
-    `edu_mapping` is `[(subtoken_start, subtoken_end_exclusive), ...]` per EDU.
+    `edu_mapping` is `[(token_start, token_end_exclusive), ...]` per EDU.
     Returned key is `(edu_mapping[left[0]][0], edu_mapping[right[-1]][1] - 1)`.
     """
     result: Set[Tuple[Tuple[int, int], str, str]] = set()
     for (left, right), nuc, rel in tree.spans():
-        first_subtok = edu_mapping[left[0]][0]
-        last_subtok = edu_mapping[right[-1]][1] - 1
+        first_tok = edu_mapping[left[0]][0]
+        last_tok = edu_mapping[right[-1]][1] - 1
         rel = rel.split("-")[0] if coarse else rel
-        result.add(((first_subtok, last_subtok), nuc, rel))
+        result.add(((first_tok, last_tok), nuc, rel))
     return result
 
 
 def compute_seg_metrics(gold_ends: List[int], pred_ends: List[int]) -> Dict[str, int]:
     """Position-level segmentation counts (Carlson/Marcu convention).
 
-    `gold_ends` and `pred_ends` are inclusive subtoken end indices, including
+    `gold_ends` and `pred_ends` are inclusive token end indices, including
     the forced terminal break — matches upstream `Metric.py:getSegMeasure`.
-    The terminal subtoken is always a gold end and always a predicted end,
+    The terminal token is always a gold end and always a predicted end,
     so it contributes a guaranteed +1 to `seg_correct` per document.
     """
     gold_set = set(gold_ends)
@@ -183,10 +183,10 @@ def compute_seg_metrics(gold_ends: List[int], pred_ends: List[int]) -> Dict[str,
 
 
 def compute_e2e_parseval(
-    gold_subtok_spans: Set[Tuple[Tuple[int, int], str, str]],
-    pred_subtok_spans: Set[Tuple[Tuple[int, int], str, str]],
+    gold_tok_spans: Set[Tuple[Tuple[int, int], str, str]],
+    pred_tok_spans: Set[Tuple[Tuple[int, int], str, str]],
 ) -> Dict[str, int]:
-    """End-to-end Parseval counts using subtoken-range keys (gold and pred can
+    """End-to-end Parseval counts using token-range keys (gold and pred can
     have different EDU sets). Mirrors `compute_parseval_metrics`'s matching
     logic exactly; only the key type changed.
 
@@ -194,19 +194,19 @@ def compute_e2e_parseval(
     can differ now, so per-tree P/R use different denominators; computing F1
     here would invite inconsistent aggregation.
     """
-    gold_index = {s[0]: s[1:] for s in gold_subtok_spans}
-    pred_index = {s[0]: s[1:] for s in pred_subtok_spans}
+    gold_index = {s[0]: s[1:] for s in gold_tok_spans}
+    pred_index = {s[0]: s[1:] for s in pred_tok_spans}
 
     span_p = nuc_p = rel_p = full_p = 0
     span_r = nuc_r = rel_r = full_r = 0
-    for pred_span, pred_nuc, pred_rel in pred_subtok_spans:
+    for pred_span, pred_nuc, pred_rel in pred_tok_spans:
         if pred_span in gold_index:
             gold_nuc, gold_rel = gold_index[pred_span]
             span_p += 1
             nuc_p += 1 if pred_nuc == gold_nuc else 0
             rel_p += 1 if pred_rel == gold_rel else 0
             full_p += 1 if pred_nuc == gold_nuc and pred_rel == gold_rel else 0
-    for gold_span, gold_nuc, gold_rel in gold_subtok_spans:
+    for gold_span, gold_nuc, gold_rel in gold_tok_spans:
         if gold_span in pred_index:
             pred_nuc, pred_rel = pred_index[gold_span]
             span_r += 1
@@ -223,6 +223,6 @@ def compute_e2e_parseval(
         "e2e_rel_r_count": rel_r,
         "e2e_full_p_count": full_p,
         "e2e_full_r_count": full_r,
-        "e2e_num_pred_spans": len(pred_subtok_spans),
-        "e2e_num_gold_spans": len(gold_subtok_spans),
+        "e2e_num_pred_spans": len(pred_tok_spans),
+        "e2e_num_gold_spans": len(gold_tok_spans),
     }

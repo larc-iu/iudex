@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from lxml import etree
 
-from iudex.rst.data.tree import RstPpEdge, RstPpNode, RstPpTree
+from iudex.rst.data.tree import RstEdge, RstNode, RstTree
 
 logger = getLogger(__name__)
 
@@ -59,23 +59,23 @@ def _validate_dict(filepath: str, d: Dict[str, Any]) -> None:
         raise ValueError(f"Document {filepath} does not have exactly one root")
 
 
-def _process_dict(d: Dict[str, Any]) -> Tuple[List[RstPpNode], List[RstPpEdge]]:
-    terminals = [RstPpNode(**_drop_keys(n, ["parent", "relname"])) for n in d["terminals"]]
-    nonterminals = [RstPpNode(**_drop_keys(n, ["parent", "relname"])) for n in d["nonterminals"]]
+def _process_dict(d: Dict[str, Any]) -> Tuple[List[RstNode], List[RstEdge]]:
+    terminals = [RstNode(**_drop_keys(n, ["parent", "relname"])) for n in d["terminals"]]
+    nonterminals = [RstNode(**_drop_keys(n, ["parent", "relname"])) for n in d["nonterminals"]]
     nodes = terminals + nonterminals
 
     terminal_edges = [
-        RstPpEdge(source=n["parent"], target=n["id"], relation=n["relname"])
+        RstEdge(source=n["parent"], target=n["id"], relation=n["relname"])
         for n in d["terminals"]
         if "parent" in n
     ]
     nonterminal_edges = [
-        RstPpEdge(source=n["parent"], target=n["id"], relation=n["relname"])
+        RstEdge(source=n["parent"], target=n["id"], relation=n["relname"])
         for n in d["nonterminals"]
         if "parent" in n
     ]
     secondary_edges = [
-        RstPpEdge(source=e["source"], target=e["target"], relation=e["relname"], secondary=True)
+        RstEdge(source=e["source"], target=e["target"], relation=e["relname"], secondary=True)
         for e in d["secondary_edges"]
     ]
     edges = terminal_edges + nonterminal_edges + secondary_edges
@@ -83,7 +83,7 @@ def _process_dict(d: Dict[str, Any]) -> Tuple[List[RstPpNode], List[RstPpEdge]]:
     # Older `to_rs4_string` always wrote `type="span"` for the root. Re-type any
     # such node back to "multinuc" when its primary children all share the same
     # non-"span" relname — the structural signature of a multinuc node.
-    primary_by_source: Dict[str, List[RstPpEdge]] = {}
+    primary_by_source: Dict[str, List[RstEdge]] = {}
     for e in edges:
         if not e.secondary:
             primary_by_source.setdefault(e.source, []).append(e)
@@ -102,8 +102,8 @@ def read_rst_file(
     binarize: bool = True,
     relation_types: Tuple[Tuple[str, str], ...] = None,
     relation_map: Optional[Dict[str, str]] = None,
-) -> RstPpTree:
-    """Read an RS3 or RS4 file and return an RstPpTree. If `relation_map` is
+) -> RstTree:
+    """Read an RS3 or RS4 file and return an RstTree. If `relation_map` is
     set, the tree applies it at its output boundary (e.g. `parsing_actions`,
     `spans`, `relation_of`) — edges retain raw labels so that structure-
     inference logic that distinguishes multinuc-siblings from satellites by
@@ -113,7 +113,7 @@ def read_rst_file(
     d = _read_rs4_into_dict(filepath)
     _validate_dict(filepath, d)
     nodes, edges = _process_dict(d)
-    return RstPpTree(
+    return RstTree(
         nodes, edges, binarize=binarize, relation_types=relation_types, relation_map=relation_map
     )
 
@@ -123,9 +123,9 @@ def read_rst_dir(
     binarize: bool = True,
     relation_types: Tuple[Tuple[str, str], ...] = None,
     relation_map: Optional[Dict[str, str]] = None,
-) -> List[Tuple[str, RstPpTree]]:
+) -> List[Tuple[str, RstTree]]:
     """Read all RS3/RS4 files from a directory, returning (filepath, tree) pairs.
-    `relation_map` is forwarded to `RstPpTree` for output-boundary remapping.
+    `relation_map` is forwarded to `RstTree` for output-boundary remapping.
     """
     paths = sorted(glob(str(Path(directory) / "*.rs3")))
     paths += sorted(glob(str(Path(directory) / "*.rs4")))

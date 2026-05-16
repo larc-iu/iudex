@@ -8,13 +8,13 @@ from iudex.rst.data.metrics import (
     compute_parseval_metrics,
     compute_seg_metrics,
     f1,
-    spans_to_subtoken_ranges,
+    spans_to_token_ranges,
 )
-from iudex.rst.data.tree import RstPpTree
+from iudex.rst.data.tree import RstTree
 from iudex.rst.parsers.dmrst.modeling_dmrst import DMRSTParser
 
 
-def _write_rs4(tree: RstPpTree, output_dir: str, basename: str) -> None:
+def _write_rs4(tree: RstTree, output_dir: str, basename: str) -> None:
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, basename), "w", encoding="utf-8") as f:
         f.write(tree.to_rs4_string())
@@ -23,7 +23,7 @@ def _write_rs4(tree: RstPpTree, output_dir: str, basename: str) -> None:
 @torch.no_grad()
 def evaluate_dmrst(
     model: DMRSTParser,
-    dev_pairs: list[tuple[str, RstPpTree]],
+    dev_pairs: list[tuple[str, RstTree]],
     output_dir: str | None = None,
 ) -> dict[str, float]:
     """Run one dev pass and return aggregated metrics.
@@ -31,7 +31,7 @@ def evaluate_dmrst(
     Always computes gold-EDU Parseval (span/nuc/rel/full F1). When the model
     has a trained segmenter, additionally computes segmentation F1 and
     end-to-end Parseval (predicted-EDU spans matched against gold by inclusive
-    subtoken ranges so the two parses can have different EDU sets). The single
+    token ranges so the two parses can have different EDU sets). The single
     encoder pass is shared via `DMRSTParser.predict_both` when the segmenter
     is present.
 
@@ -80,13 +80,13 @@ def evaluate_dmrst(
         for k in totals_seg:
             totals_seg[k] += m_seg[k]
 
-        # End-to-end Parseval (subtoken-range matching).
-        gold_subtok_spans = spans_to_subtoken_ranges(gold, gold_edu_mapping)
+        # End-to-end Parseval (token-range matching).
+        gold_tok_spans = spans_to_token_ranges(gold, gold_edu_mapping)
         if e2e_pred is not None and len(e2e_pred.edus) >= 2:
-            pred_subtok_spans = spans_to_subtoken_ranges(e2e_pred, pred_edu_mapping)
+            pred_tok_spans = spans_to_token_ranges(e2e_pred, pred_edu_mapping)
         else:
-            pred_subtok_spans = set()
-        m_e2e = compute_e2e_parseval(gold_subtok_spans, pred_subtok_spans)
+            pred_tok_spans = set()
+        m_e2e = compute_e2e_parseval(gold_tok_spans, pred_tok_spans)
         for k in totals_e2e:
             totals_e2e[k] += m_e2e[k]
 

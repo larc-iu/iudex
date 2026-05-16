@@ -25,7 +25,6 @@ class TopdownBiaffineConfig:
     ffn_hidden_size: int = 512
     dropout: float = 0.2
     stride: int = 100
-    attn_implementation: str | None = None
 
     # Training
     lr: float = 2e-4
