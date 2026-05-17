@@ -1,5 +1,6 @@
-import dataclasses
 from dataclasses import dataclass
+
+from iudex.rst.parsers.common.config import parse_config_dict
 
 
 @dataclass
@@ -35,9 +36,9 @@ class DMRSTConfig:
     # Upstream DMRST_Parser freezes layers 0–2 + embeddings.
     freeze_encoder_layers: int = 3
 
-    # Joint EDU segmentation (paper §3.1.1). When True, training adds a per-token
-    # binary-classification loss over EDU end positions, and `predict_from_text` is
-    # available for raw-text → tree inference.
+    # Joint EDU segmentation (cf. section 3.1.1 of paper). When True, training adds
+    # a per-token binary-classification loss over EDU end positions, and
+    # `predict_from_text` is available for raw-text → tree inference.
     joint_segmentation: bool = False
     seg_pos_weight: float = 10.0  # class weight on the positive (EDU-end) label
     seg_start_loss: bool = False  # add a second binary head for EDU starts
@@ -65,20 +66,4 @@ class DMRSTConfig:
 
     @classmethod
     def from_dict(cls, d: dict) -> "DMRSTConfig":
-        """Validate `d` against this dataclass's fields and instantiate.
-
-        Args:
-            d: usually a dict produced by `tonga.Params.from_file(...).as_dict()`.
-
-        Raises:
-            ValueError: if `d` contains keys that are not fields of this dataclass.
-            TypeError: from `__init__` if a required field is missing.
-        """
-        known = {f.name for f in dataclasses.fields(cls)}
-        unknown = set(d) - known
-        if unknown:
-            raise ValueError(f"Unknown config field(s): {sorted(unknown)}. Valid fields: {sorted(known)}")
-        d = dict(d)
-        if d.get("relation_types") is not None:
-            d["relation_types"] = [tuple(r) for r in d["relation_types"]]
-        return cls(**d)
+        return parse_config_dict(cls, d)

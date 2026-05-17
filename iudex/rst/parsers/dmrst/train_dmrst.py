@@ -134,19 +134,19 @@ def train(cfg: DMRSTConfig) -> None:
     curr_sums = {k: 0.0 for k in components}
     weights = {k: 1.0 for k in components}
 
-    ckpt = try_resume(os.path.join(run_dir, "last.pt"), expected_hash=cfg_hash)
-    if ckpt is None:
+    checkpoint = try_resume(os.path.join(run_dir, "last.pt"), expected_hash=cfg_hash)
+    if checkpoint is None:
         global_step, start_epoch, best_val, stale = 0, 0, -1.0, 0
     else:
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        global_step = ckpt["global_step"]
-        start_epoch = ckpt["epoch"]
-        best_val = ckpt.get("best_val", -1.0)
-        stale = ckpt.get("stale_validations", 0)
-        loaded_history = ckpt.get("dlw_loss_history")
-        loaded_weights = ckpt.get("dlw_weights")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        global_step = checkpoint["global_step"]
+        start_epoch = checkpoint["epoch"]
+        best_val = checkpoint.get("best_val", -1.0)
+        stale = checkpoint.get("stale_validations", 0)
+        loaded_history = checkpoint.get("dlw_loss_history")
+        loaded_weights = checkpoint.get("dlw_weights")
         if loaded_history is not None:
             # Drop components that aren't active in this config; init missing ones empty.
             loss_history = {k: list(loaded_history.get(k, [])) for k in components}
@@ -175,9 +175,9 @@ def train(cfg: DMRSTConfig) -> None:
         nonlocal best_val, stale
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         model.eval()
-        m = evaluate_dmrst(model, dev_pairs, output_dir=pred_dir)
-        console.print(dmrst_metrics_table(m, title=f"Dev @ step {global_step}"))
-        score = m[cfg.val_metric_name]
+        metrics = evaluate_dmrst(model, dev_pairs, output_dir=pred_dir)
+        console.print(dmrst_metrics_table(metrics, title=f"Dev @ step {global_step}"))
+        score = metrics[cfg.val_metric_name]
         if score > best_val:
             best_val = score
             stale = 0
@@ -266,16 +266,16 @@ def train(cfg: DMRSTConfig) -> None:
                         weights = {k: num_components * expw[k] / norm for k in components}
                 curr_sums = {k: 0.0 for k in components}
 
-                avg = sum(recent_losses) / len(recent_losses)
-                lr_str_inner = "/".join(f"{lr:.1e}" for lr in sorted(set(scheduler.get_last_lr())))
+                avg_loss = sum(recent_losses) / len(recent_losses)
+                lr_display = "/".join(f"{lr:.1e}" for lr in sorted(set(scheduler.get_last_lr())))
                 mem = gpu_mem_gb(device)
                 mem_str = f"[gpu]max_mem={mem[1]:.1f}GB[/gpu]" if mem else ""
                 secs = int(time.monotonic() - training_start)
                 progress.update(
                     task,
                     advance=1,
-                    loss_str=f"loss=[bold orange1]{avg:.4f}[/bold orange1]",
-                    lr_str=f"lr=[dim]{lr_str_inner}[/dim]",
+                    loss_str=f"loss=[bold orange1]{avg_loss:.4f}[/bold orange1]",
+                    lr_str=f"lr=[dim]{lr_display}[/dim]",
                     mem_str=mem_str,
                     total_elapsed=f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}",
                 )
@@ -289,9 +289,9 @@ def train(cfg: DMRSTConfig) -> None:
                     )
                     progress.console.print(
                         f"  [step]step {epoch_step}/{steps_per_epoch}[/step]  "
-                        f"loss=[loss]{avg:.4f}[/loss]  "
+                        f"loss=[loss]{avg_loss:.4f}[/loss]  "
                         f"grad=[dim]{grad_norm:.4f}[/dim]  "
-                        f"lr=[dim]{lr_str_inner}[/dim]{w_log}{mem_log}"
+                        f"lr=[dim]{lr_display}[/dim]{w_log}{mem_log}"
                     )
 
                 if cfg.validate_every and global_step % cfg.validate_every == 0:
@@ -321,8 +321,8 @@ def train(cfg: DMRSTConfig) -> None:
     rule("Final Evaluation")
     best_path = os.path.join(run_dir, "best_model.pt")
     if os.path.exists(best_path):
-        ckpt = torch.load(best_path, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        checkpoint = torch.load(best_path, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
         dev_m = evaluate_dmrst(
             model,

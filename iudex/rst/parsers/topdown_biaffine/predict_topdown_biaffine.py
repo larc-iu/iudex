@@ -1,8 +1,6 @@
 import argparse
-import dataclasses
 import logging
 import os
-import sys
 from glob import glob
 from pathlib import Path
 
@@ -15,55 +13,15 @@ from rich.progress import (
     TextColumn,
     TimeRemainingColumn,
 )
-from tonga import Params
 
 from iudex.common.log import console, setup_logging
 from iudex.rst.data.reader import read_rst_file
+from iudex.rst.parsers.common.inference import load_parser_from_checkpoint, resolve_checkpoint
 from iudex.rst.parsers.topdown_biaffine.configuration_topdown_biaffine import TopdownBiaffineConfig
 from iudex.rst.parsers.topdown_biaffine.modeling_topdown_biaffine import TopdownBiaffineParser
-from iudex.rst.training import derive_run_id
 
 setup_logging()
 logger = logging.getLogger(__name__)
-
-
-def _resolve_checkpoint(config_path: str, checkpoint_path: str) -> str:
-    """Return the .pt path to load.
-
-    Exactly one of the two args is non-None. With `--config`, derive the run dir
-    from the resolved config and look up `best_model.pt`; with `--checkpoint`,
-    use the path as-is. Both branches exit non-zero with a helpful message if
-    the file is missing.
-    """
-    if checkpoint_path:
-        if not os.path.exists(checkpoint_path):
-            console.print(f"[bold red]Checkpoint not found:[/bold red] [path]{checkpoint_path}[/path]")
-            sys.exit(1)
-        return checkpoint_path
-
-    cfg = TopdownBiaffineConfig.from_dict(Params.from_file(config_path).as_dict(quiet=True))
-    run_id, _ = derive_run_id(dataclasses.asdict(cfg), cfg.run_name)
-    run_dir = os.path.join(cfg.checkpoint_dir, run_id)
-    checkpoint_path = os.path.join(run_dir, "best_model.pt")
-    if not os.path.exists(checkpoint_path):
-        console.print(
-            f"[bold red]No trained model found for this config.[/bold red]\n"
-            f"  Expected: [path]{checkpoint_path}[/path]\n"
-            f"  Train first with:\n"
-            f"    python -m iudex.rst.parsers.topdown_biaffine.train_topdown_biaffine {config_path}"
-        )
-        sys.exit(1)
-    return checkpoint_path
-
-
-def load_model(checkpoint_path: str, device: torch.device) -> TopdownBiaffineParser:
-    """Rehydrate a parser from a checkpoint: rebuild the config, init the model,
-    load weights, move to `device`, and put it in eval mode."""
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg = TopdownBiaffineConfig.from_dict(checkpoint["config"])
-    model = TopdownBiaffineParser(cfg)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    return model.to(device).eval()
 
 
 def main():
@@ -76,9 +34,14 @@ def main():
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    checkpoint_path = _resolve_checkpoint(args.config, args.checkpoint)
+    checkpoint_path = resolve_checkpoint(
+        args.config,
+        args.checkpoint,
+        TopdownBiaffineConfig,
+        "iudex.rst.parsers.topdown_biaffine.train_topdown_biaffine",
+    )
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = load_model(checkpoint_path, device)
+    model = load_parser_from_checkpoint(checkpoint_path, device, TopdownBiaffineConfig, TopdownBiaffineParser)
     console.print(f"[dim]Loaded model from[/dim] [path]{checkpoint_path}[/path]")
 
     os.makedirs(args.output_dir, exist_ok=True)

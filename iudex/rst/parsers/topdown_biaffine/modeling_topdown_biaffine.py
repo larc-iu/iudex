@@ -1,10 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
 
 from iudex.rst.data.reader import determine_label_index
 from iudex.rst.data.tree import RstTree
+from iudex.rst.parsers.common.encoding import (
+    encode_tokens_strided,
+    load_encoder_and_tokenizer,
+    tokenize_edus,
+)
 from iudex.rst.parsers.topdown_biaffine.configuration_topdown_biaffine import TopdownBiaffineConfig
 
 
@@ -57,20 +61,8 @@ class TopdownBiaffineParser(nn.Module):
         self.label_index = determine_label_index(config.relation_types)
         self.stride = config.stride
 
-        # Load the pretrained BERT-like encoder and tokenizer.
-        # transformers >=5 honors the checkpoint's saved dtype; many HF checkpoints
-        # (e.g. SpanBERT) are fp16, which makes AdamW updates NaN immediately. Force fp32.
-        self.encoder = AutoModel.from_pretrained(config.model_name).float()
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        if self.tokenizer.cls_token_id is None or self.tokenizer.sep_token_id is None:
-            raise ValueError(
-                f"Tokenizer for {config.model_name!r} lacks cls_token and/or sep_token; "
-                f"this parser only supports BERT-style encoders."
-            )
-
-        # Note pretrained model's hidden representation size and maximum supported length.
+        self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(config.model_name)
         self.hidden_size = self.encoder.config.hidden_size
-        self.max_length = self.encoder.config.max_position_embeddings
 
         self.split_biaffine = _DeepBiAffine(self.hidden_size, config.ffn_hidden_size, 1, config.dropout)
         self.label_biaffine = _DeepBiAffine(
@@ -82,98 +74,18 @@ class TopdownBiaffineParser(nn.Module):
         return next(self.parameters()).device
 
     def _encode_tree(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor]:
-        """Take the text of the tree and return a sequence of all tokens' embeddings.
-        Note that if the length of the document exceeds the model's maximum length,
-        we will use striding to
+        """Tokenize the tree's EDUs and return their token-level embeddings.
 
         Returns:
             embeddings:     shape [num_tokens, hidden_size]
             edu_boundaries: shape [num_edus, 2], each a pair of (start_token, end_token_exclusive)
         """
-
-        # Tokenize each EDU independently. Keep track of the token IDs for the entire document
-        # in `all_ids` and also record the boundaries of each EDU in terms of slices into `all_ids`.
-        all_ids: list[int] = []
-        boundaries: list[tuple[int, int]] = []
-        for edu_text in tree.edu_strings:
-            ids = self.tokenizer.encode(edu_text, add_special_tokens=False)
-            start = len(all_ids)
-            all_ids.extend(ids)
-            boundaries.append((start, len(all_ids)))
-
-        # Use the pretrained encoder to get token representations.
-        input_ids = torch.tensor(all_ids, dtype=torch.long, device=self.device)
-        embeddings = self._encode_tokens(input_ids).float()
+        input_ids, boundaries = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
+        embeddings = encode_tokens_strided(
+            self.encoder, self.tokenizer, input_ids, self.max_length, self.stride
+        ).float()
         edu_boundaries = torch.tensor(boundaries, dtype=torch.long, device=self.device)
-
-        # Return final embeddings and EDU slice indices into the embedding sequence.
         return embeddings, edu_boundaries
-
-    def _encode_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Encode a flat token sequence with overlapping sliding windows.
-
-        Long documents exceed the LM's positional budget, so we tile the input
-        with windows that overlap by `self.stride` tokens; overlapped positions
-        keep the embedding from the *earlier* window (more left context).
-
-        Args:
-            input_ids: [num_tokens]
-
-        Returns:
-            embeddings: [num_tokens, hidden_size]  (1:1 with input positions)
-        """
-        max_content = self.max_length - 2  # leave room for [CLS] ... [SEP] per chunk
-        cls_id = self.tokenizer.cls_token_id
-        sep_id = self.tokenizer.sep_token_id
-        device = input_ids.device
-
-        total_len = input_ids.shape[0]
-        chunks, chunk_lens = [], []
-        i = 0
-        while True:
-            # Grab the next max_content tokens starting from `i`, bounded by the length of the doc
-            end = min(i + max_content, total_len)
-            chunk = torch.cat(
-                [
-                    torch.tensor([cls_id], device=device),
-                    input_ids[i:end],
-                    torch.tensor([sep_id], device=device),
-                ]
-            )
-            chunks.append(chunk)
-            chunk_lens.append(chunk.shape[0])
-
-            # Break if we've reached the end of the doc
-            if end >= total_len:
-                break
-            else:
-                # Otherwise, "rewind" `i` by the stride length so that the upcoming chunk will have
-                # some of the content from the end of the chunk we just created.
-                i = end - self.stride
-
-        # Prepare input tensor for the encoder
-        max_chunk_len = max(chunk_lens)
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        batch_ids = torch.full((len(chunks), max_chunk_len), pad_id, device=device, dtype=torch.long)
-        batch_mask = torch.zeros(len(chunks), max_chunk_len, device=device, dtype=torch.long)
-        for i, cids in enumerate(chunks):
-            batch_ids[i, : cids.shape[0]] = cids
-            batch_mask[i, : cids.shape[0]] = 1
-
-        # Get the encoder's representations
-        # batch_ids: [num_chunks, max_chunk_len]
-        # hidden: [num_chunks, max_chunk_len, hidden_size]
-        hidden = self.encoder(input_ids=batch_ids, attention_mask=batch_mask).last_hidden_state
-
-        # Strip CLS/SEP; for chunks i > 0, also drop the first `stride` tokens
-        # (which are duplicates of the previous chunk's tail).
-        pieces = []
-        for i, clen in enumerate(chunk_lens):
-            emb = hidden[i, 1 : clen - 1]
-            pieces.append(emb if i == 0 else emb[self.stride :])
-
-        # Our final output: [num_tokens, hidden_size]
-        return torch.cat(pieces, dim=0)[:total_len]
 
     def _subspan_reprs_per_split(
         self,

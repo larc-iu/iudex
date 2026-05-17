@@ -3,10 +3,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
 
 from iudex.rst.data.reader import determine_label_index
 from iudex.rst.data.tree import RstTree
+from iudex.rst.parsers.common.encoding import (
+    encode_tokens_strided,
+    load_encoder_and_tokenizer,
+    tokenize_edus,
+)
 from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
 
 
@@ -199,10 +203,7 @@ class DMRSTParser(nn.Module):
         self.label_index = determine_label_index(config.relation_types)
         self.stride = config.stride
 
-        # transformers >=5 honors the checkpoint's saved dtype; many HF checkpoints
-        # are fp16, which makes AdamW updates NaN immediately. Force fp32.
-        self.encoder = AutoModel.from_pretrained(config.model_name).float()
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(config.model_name)
         self.hidden_size = self.encoder.config.hidden_size
 
         # Freeze early encoder layers (BERT/RoBERTa/XLM-R submodule layout).
@@ -212,12 +213,6 @@ class DMRSTParser(nn.Module):
             for layer in self.encoder.encoder.layer[: config.freeze_encoder_layers]:
                 for p in layer.parameters():
                     p.requires_grad = False
-        # HF tokenizers can report a sentinel `model_max_length` of ~1e30 when
-        # unset; fall back to the encoder's actual positional-embedding budget.
-        self.max_length = min(
-            getattr(self.encoder.config, "max_position_embeddings", self.tokenizer.model_max_length),
-            self.tokenizer.model_max_length,
-        )
 
         hidden_size = self.hidden_size
         self.layer_norm = nn.LayerNorm(hidden_size, elementwise_affine=True)
@@ -258,78 +253,6 @@ class DMRSTParser(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def _tokenize_tree(self, tree: RstTree) -> tuple[torch.Tensor, list[tuple[int, int]]]:
-        """Tokenize the document EDU-by-EDU.
-
-        Returns:
-            input_ids:   [num_tokens]
-            edu_mapping: list of (start_token, end_token_exclusive) per EDU
-        """
-        all_ids: list[int] = []
-        boundaries: list[tuple[int, int]] = []
-        for edu_text in tree.edu_strings:
-            ids = self.tokenizer.encode(edu_text, add_special_tokens=False)
-            start = len(all_ids)
-            all_ids.extend(ids)
-            boundaries.append((start, len(all_ids)))
-        input_ids = torch.tensor(all_ids, dtype=torch.long, device=self.device)
-        return input_ids, boundaries
-
-    def _encode_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Encode a flat token sequence with overlapping sliding windows.
-
-        Long documents exceed the LM's positional budget, so we tile the input
-        with windows that overlap by `self.stride` tokens; overlapped positions
-        keep the embedding from the *earlier* window (more left context).
-
-        Args:
-            input_ids: [num_tokens]
-
-        Returns:
-            embeddings: [num_tokens, hidden_size]  (1:1 with input positions)
-        """
-        max_content = self.max_length - 2  # leave room for [CLS] ... [SEP] per chunk
-        cls_id = self.tokenizer.cls_token_id
-        sep_id = self.tokenizer.sep_token_id
-        device = input_ids.device
-
-        content_len = input_ids.shape[0]
-        chunks, chunk_lens = [], []
-        pos = 0
-        while pos < content_len:
-            end = min(pos + max_content, content_len)
-            chunk = torch.cat(
-                [
-                    torch.tensor([cls_id], device=device),
-                    input_ids[pos:end],
-                    torch.tensor([sep_id], device=device),
-                ]
-            )
-            chunks.append(chunk)
-            chunk_lens.append(chunk.shape[0])
-            if end >= content_len:
-                break
-            pos = end - self.stride  # next window starts `stride` tokens before this one ended
-
-        max_chunk_len = max(chunk_lens)
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        batch_ids = torch.full((len(chunks), max_chunk_len), pad_id, device=device, dtype=torch.long)
-        batch_mask = torch.zeros(len(chunks), max_chunk_len, device=device, dtype=torch.long)
-        for i, cids in enumerate(chunks):
-            batch_ids[i, : cids.shape[0]] = cids
-            batch_mask[i, : cids.shape[0]] = 1
-
-        hidden = self.encoder(input_ids=batch_ids, attention_mask=batch_mask).last_hidden_state
-        # hidden: [num_chunks, max_chunk_len, hidden_size]
-
-        # Strip CLS/SEP; for chunks i > 0, also drop the first `stride` tokens
-        # (which are duplicates of the previous chunk's tail).
-        pieces = []
-        for i, clen in enumerate(chunk_lens):
-            emb = hidden[i, 1 : clen - 1]
-            pieces.append(emb if i == 0 else emb[self.stride :])
-        return torch.cat(pieces, dim=0)[:content_len]
-
     def _encode(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full encoder pass using gold EDU segmentation.
 
@@ -341,8 +264,11 @@ class DMRSTParser(nn.Module):
             decoder_init: [1, 1, hidden_size]
             seg_loss:     scalar tensor (zero when joint segmentation is disabled)
         """
-        input_ids, edu_mapping = self._tokenize_tree(tree)
-        normed = self.layer_norm(self._encode_tokens(input_ids).float())  # [num_tokens, hidden_size]
+        input_ids, edu_mapping = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
+        embeddings = encode_tokens_strided(
+            self.encoder, self.tokenizer, input_ids, self.max_length, self.stride
+        )
+        normed = self.layer_norm(embeddings.float())  # [num_tokens, hidden_size]
 
         if self.segmenter is not None and self.training:
             # End token (inclusive) of each gold EDU; segmenter operates on the
@@ -439,10 +365,10 @@ class DMRSTParser(nn.Module):
 
         edu_reprs, decoder_hidden, seg_loss = self._encode(tree)
 
-        # Index every gold non-leaf span by its EDU range.
-        gold: dict[tuple[int, int], tuple[int, str]] = {}
+        # Build a lookup: gold span (b, e) → (gold split point, gold label).
+        gold_decisions: dict[tuple[int, int], tuple[int, str]] = {}
         for (left_range, right_range), nuc, rel in tree.spans_with_ranges():
-            gold[(left_range[0], right_range[1])] = (right_range[0], f"{nuc}_{rel}")
+            gold_decisions[(left_range[0], right_range[1])] = (right_range[0], f"{nuc}_{rel}")
 
         split_losses, label_losses = [], []
         stack = [(0, num_edus)]
@@ -454,7 +380,7 @@ class DMRSTParser(nn.Module):
             decoder_input = edu_reprs[b:e].mean(0, keepdim=True).unsqueeze(0)
             decoder_output, decoder_hidden = self.decoder(decoder_input, last_hidden=decoder_hidden)
 
-            gold_split, gold_label_str = gold[(b, e)]
+            gold_split, gold_label_str = gold_decisions[(b, e)]
             gold_label_idx = self.label_index.index(gold_label_str)
 
             if e - b == 2:
@@ -464,8 +390,8 @@ class DMRSTParser(nn.Module):
             else:
                 # Pointer attends over candidate splits (EDU indices b..e-2 inclusive).
                 split_logits = self.pointer(edu_reprs[b : e - 1], decoder_output.squeeze(0).squeeze(0))
-                gold_ptr_idx = torch.tensor([gold_split - b - 1], device=self.device)
-                split_losses.append(F.cross_entropy(split_logits, gold_ptr_idx))
+                gold_pointer_idx = torch.tensor([gold_split - b - 1], device=self.device)
+                split_losses.append(F.cross_entropy(split_logits, gold_pointer_idx))
 
                 input_left, input_right = self._label_inputs(edu_reprs, b, e, gold_split)
 
@@ -477,8 +403,8 @@ class DMRSTParser(nn.Module):
                     stack.append((b, gold_split))
 
             _, log_probs = self.label_classifier(input_left, input_right)
-            tgt = torch.tensor([gold_label_idx], device=self.device)
-            label_losses.append(F.nll_loss(log_probs, tgt))
+            label_target = torch.tensor([gold_label_idx], device=self.device)
+            label_losses.append(F.nll_loss(log_probs, label_target))
 
         split_loss = (
             sum(split_losses) / len(split_losses) if split_losses else torch.zeros((), device=self.device)
@@ -563,7 +489,10 @@ class DMRSTParser(nn.Module):
         if len(ids) == 0:
             return RstTree.from_parsing_actions([], [], relation_types=self.config.relation_types)
         input_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
-        normed = self.layer_norm(self._encode_tokens(input_ids).float())
+        embeddings = encode_tokens_strided(
+            self.encoder, self.tokenizer, input_ids, self.max_length, self.stride
+        )
+        normed = self.layer_norm(embeddings.float())
 
         breaks = self.segmenter.predict_breaks(normed)
         # `breaks` are inclusive end token indices. Convert to (start, end_exclusive).
@@ -606,8 +535,11 @@ class DMRSTParser(nn.Module):
             }
         """
         self.eval()
-        input_ids, gold_edu_mapping = self._tokenize_tree(tree)
-        normed = self.layer_norm(self._encode_tokens(input_ids).float())
+        input_ids, gold_edu_mapping = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
+        token_embeddings = encode_tokens_strided(
+            self.encoder, self.tokenizer, input_ids, self.max_length, self.stride
+        )
+        normed = self.layer_norm(token_embeddings.float())
         embeddings = self.encoder_dropout(normed)  # eval mode → identity
 
         # Gold-EDU path.

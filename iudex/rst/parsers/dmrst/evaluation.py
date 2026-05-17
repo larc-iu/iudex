@@ -30,7 +30,7 @@ def evaluate_dmrst(
 
     Always computes gold-EDU Parseval (span/nuc/rel/full F1). When the model
     has a trained segmenter, additionally computes segmentation F1 and
-    end-to-end Parseval (predicted-EDU spans matched against gold by inclusive
+    end-to-end Parseval (predicted EDU spans matched against gold by inclusive
     token ranges so the two parses can have different EDU sets). The single
     encoder pass is shared via `DMRSTParser.predict_both` when the segmenter
     is present.
@@ -57,9 +57,9 @@ def evaluate_dmrst(
 
         if not use_seg:
             pred = model.predict(gold)
-            m = compute_parseval_metrics(gold, pred)
+            metrics = compute_parseval_metrics(gold, pred)
             for k in totals_parseval:
-                totals_parseval[k] += m[k]
+                totals_parseval[k] += metrics[k]
             if output_dir is not None:
                 _write_rs4(pred, output_dir, basename)
             continue
@@ -70,17 +70,17 @@ def evaluate_dmrst(
         gold_edu_mapping = both["gold_edu_mapping"]
         pred_edu_mapping = both["pred_edu_mapping"]
 
-        # Gold-EDU Parseval.
+        # gold EDU Parseval
         m_par = compute_parseval_metrics(gold, gold_pred)
         for k in totals_parseval:
             totals_parseval[k] += m_par[k]
 
-        # Segmentation F1.
+        # segmentation f1
         m_seg = compute_seg_metrics(both["gold_edu_ends"], both["pred_edu_ends"])
         for k in totals_seg:
             totals_seg[k] += m_seg[k]
 
-        # End-to-end Parseval (token-range matching).
+        # end-to-end parseval (token-range matching).
         gold_tok_spans = spans_to_token_ranges(gold, gold_edu_mapping)
         if e2e_pred is not None and len(e2e_pred.edus) >= 2:
             pred_tok_spans = spans_to_token_ranges(e2e_pred, pred_edu_mapping)
