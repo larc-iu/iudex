@@ -14,41 +14,26 @@ from iudex.rst.parsers.common.encoding import (
 from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
 
 
-class _GRUDecoder(nn.Module):
-    """Unidirectional GRU decoder that maintains hidden state across decisions.
-
-    Args:
-        input_hidden_states: [1, length, input_size]
-        last_hidden:         [num_layers, 1, hidden_size]
-
-    Returns:
-        output: [1, length, hidden_size]
-        hidden: [num_layers, 1, hidden_size]
-    """
-
-    def __init__(self, input_size, hidden_size, num_layers, dropout):
-        super().__init__()
-        self.gru = nn.GRU(
-            input_size,
-            hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=(0 if num_layers == 1 else dropout),
-        )
-
-    def forward(self, input_hidden_states, last_hidden):
-        return self.gru(input_hidden_states, last_hidden)
-
-
 class _PointerAttention(nn.Module):
     """Pointer attention for selecting a split position within a span.
 
+    A span of n EDUs can be split at n - 1 different points, since after the split, at
+    least one EDU must remain on either side. Within these n - 1 points, each position k
+    scores the split just after EDU b + k.
+
+    The caller passes `edu_reprs[b : e - 1]`, the n - 1 EDUs that can serve as the last
+    EDU of the left side of the potential split.
+
+    With e_k = encoder_outputs[k] and d = decoder_output:
+        biaffine:    logit_k = (W1 e_k)·d + w2·e_k
+        dot_product: logit_k = e_k · d
+
     Args:
-        encoder_outputs: [length, hidden_size]  (EDU representations for the span)
-        decoder_output:  [hidden_size]          (current decoder hidden state)
+        encoder_outputs: [n - 1, hidden_size]
+        decoder_output:  [hidden_size]
 
     Returns:
-        logits: [1, length]
+        logits: [1, n - 1]  (leading dim is for F.cross_entropy's batch convention)
     """
 
     def __init__(self, attention_type, hidden_size):
@@ -69,55 +54,51 @@ class _PointerAttention(nn.Module):
 
 
 class _LabelClassifier(nn.Module):
-    """Deep biaffine classifier over joint nuclearity+relation labels.
+    """Deep biaffine classifier (Dozat & Manning) over joint nuclearity+relation
+    labels, e.g. "SN_elaboration".
+
+    Each side is projected (Linear → ELU → dropout) into a shared hidden space.
+    The score for class c is then
+
+        score_c = h_L^T B_c h_R  +  u_L^c · h_L  +  u_R^c · h_R  +  b_c
+
+    where B is `bilinear` (the pairwise interaction term) and u_L, u_R are the
+    per-side unary terms `linear_left`, `linear_right`.
 
     Args:
-        input_left:  [1, hidden_size]
-        input_right: [1, hidden_size]
+        input_left:  [1, input_size]
+        input_right: [1, input_size]
 
     Returns:
-        relation_weights:     [1, num_classes]  (softmax probabilities)
-        log_relation_weights: [1, num_classes]  (log-softmax for NLL loss)
+        logits: [1, num_classes]  (raw scores, caller applies softmax / cross_entropy)
     """
 
-    def __init__(self, input_size, classifier_hidden_size, num_classes, bias=True, dropout=0.5):
+    def __init__(self, input_size, hidden_size, num_classes, bias=True, dropout=0.5):
         super().__init__()
-        self.classifier_hidden_size = classifier_hidden_size
-        self.labelspace_left = nn.Linear(input_size, classifier_hidden_size, bias=False)
-        self.labelspace_right = nn.Linear(input_size, classifier_hidden_size, bias=False)
-        self.weight_left = nn.Linear(classifier_hidden_size, num_classes, bias=False)
-        self.weight_right = nn.Linear(classifier_hidden_size, num_classes, bias=False)
+        self.proj_left = nn.Linear(input_size, hidden_size, bias=False)
+        self.proj_right = nn.Linear(input_size, hidden_size, bias=False)
+        self.bilinear = nn.Bilinear(hidden_size, hidden_size, num_classes, bias=bias)
+        self.linear_left = nn.Linear(hidden_size, num_classes, bias=False)
+        self.linear_right = nn.Linear(hidden_size, num_classes, bias=False)
         self.dropout = nn.Dropout(dropout)
-        self.weight_bilateral = nn.Bilinear(
-            classifier_hidden_size, classifier_hidden_size, num_classes, bias=bias
-        )
 
     def forward(self, input_left, input_right):
-        labelspace_left = F.elu(self.labelspace_left(input_left))
-        labelspace_right = F.elu(self.labelspace_right(input_right))
-
-        union = self.dropout(torch.cat((labelspace_left, labelspace_right), 1))
-        labelspace_left = union[:, : self.classifier_hidden_size]
-        labelspace_right = union[:, self.classifier_hidden_size :]
-
-        output = (
-            self.weight_bilateral(labelspace_left, labelspace_right)
-            + self.weight_left(labelspace_left)
-            + self.weight_right(labelspace_right)
+        hidden_left = self.dropout(F.elu(self.proj_left(input_left)))
+        hidden_right = self.dropout(F.elu(self.proj_right(input_right)))
+        return (
+            self.bilinear(hidden_left, hidden_right) + self.linear_left(hidden_left) + self.linear_right(hidden_right)
         )
-        relation_weights = F.softmax(output, 1)
-        log_relation_weights = F.log_softmax(output + 1e-6, 1)
-        return relation_weights, log_relation_weights
 
 
 class _Segmenter(nn.Module):
     """Per-token EDU-boundary classifier.
 
-    Trains as a binary token-tagger that fires at EDU END positions; the class
-    weight on the positive label is typically large (~10) since end-of-EDU
-    tokens are rare. An optional second head can also be trained to fire at
-    EDU START positions (paper §3.1.1 describes a 3-class B/I/E head; upstream
-    code uses these two binary heads instead and that's what we mirror).
+    Trains as a binary token-tagger that fires at EDU **end** positions. The class
+    weight on the positive label is typically upweighted (as large as ~10x) since
+    end-of-EDU tokens are rare. An optional second head can also be trained to
+    fire at EDU **start** positions (section 3.1.1 of paper describes a 3-class
+    B/I/E head, but the model implementation uses these two binary heads instead,
+    and that's what we mirror).
     """
 
     def __init__(self, hidden_size: int, pos_weight: float, dropout: float = 0.5, start_loss: bool = False):
@@ -178,23 +159,14 @@ class _Segmenter(nn.Module):
 
 
 class DMRSTParser(nn.Module):
-    """DMRST parser (Liu, Shi & Chen, CODI 2021).
-
-    Pipeline per document:
-        tokens --(striding transformer)--> token embeddings
-        per-EDU mean --(2-layer BiGRU)--> contextual EDU vectors
-        edu_repr = reduce_dim([bigru_out, first_token, last_token])
-        decode top-down with a unidirectional GRU decoder whose hidden state
-        is carried across decisions (DFS, left-first); at each non-leaf span,
-        a pointer attention picks the split position and a bilinear classifier
-        picks the joint nuclearity+relation label.
+    """An end-to-end RST parser including its own segmenter.
 
     With `joint_segmentation=True`, a per-token EDU-boundary head trains
     alongside the parser and enables raw-text inference via `predict_from_text`.
 
     Training (`forward`) is teacher-forced and returns the split, label, and
     segmentation losses separately so the trainer can apply dynamic loss
-    weighting; `loss` is their unweighted sum for non-DLW callers.
+    weighting. `loss` is their unweighted sum for non-DLW callers.
     """
 
     def __init__(self, config: DMRSTConfig):
@@ -204,18 +176,18 @@ class DMRSTParser(nn.Module):
         self.stride = config.stride
 
         self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(config.model_name)
-        self.hidden_size = self.encoder.config.hidden_size
 
-        # Freeze early encoder layers (BERT/RoBERTa/XLM-R submodule layout).
-        if config.freeze_encoder_layers > 0:
+        # Optional freezing of embeddings and early encoder layers.
+        if config.freeze_embeddings:
             for p in self.encoder.embeddings.parameters():
                 p.requires_grad = False
+        if config.freeze_encoder_layers > 0:
             for layer in self.encoder.encoder.layer[: config.freeze_encoder_layers]:
                 for p in layer.parameters():
                     p.requires_grad = False
 
-        hidden_size = self.hidden_size
-        self.layer_norm = nn.LayerNorm(hidden_size, elementwise_affine=True)
+        hidden_size = self.encoder.config.hidden_size
+        self.layer_norm = nn.LayerNorm(hidden_size)
         self.encoder_dropout = nn.Dropout(config.encoder_dropout)
         self.doc_gru = nn.GRU(
             hidden_size,
@@ -227,7 +199,13 @@ class DMRSTParser(nn.Module):
         )
         self.reduce_dim = nn.Linear(hidden_size * 3, hidden_size, bias=False)
 
-        self.decoder = _GRUDecoder(hidden_size, hidden_size, config.num_rnn_layers, config.decoder_dropout)
+        self.decoder = nn.GRU(
+            hidden_size,
+            hidden_size,
+            num_layers=config.num_rnn_layers,
+            batch_first=True,
+            dropout=(0 if config.num_rnn_layers == 1 else config.decoder_dropout),
+        )
         self.pointer = _PointerAttention(config.attention_type, hidden_size)
         self.label_classifier = _LabelClassifier(
             hidden_size,
@@ -236,7 +214,9 @@ class DMRSTParser(nn.Module):
             bias=config.classifier_use_bias,
             dropout=config.labeler_dropout,
         )
-        self.average_edu_level = config.average_edu_level
+        if config.label_input_pooling not in ("mean", "last_edu"):
+            raise ValueError(f"Unknown label_input_pooling: {config.label_input_pooling!r}")
+        self.label_input_pooling = config.label_input_pooling
 
         self.segmenter = (
             _Segmenter(
@@ -256,8 +236,8 @@ class DMRSTParser(nn.Module):
     def _encode(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full encoder pass using gold EDU segmentation.
 
-        Computes the segmentation loss as a side-effect when joint segmentation
-        is enabled and the model is in train mode; otherwise returns a zero scalar.
+        Also computes the segmentation loss when joint segmentation is enabled and
+        the model is in train mode. Otherwise, returns a zero scalar.
 
         Returns:
             edu_reprs:    [num_edus, hidden_size]
@@ -265,14 +245,12 @@ class DMRSTParser(nn.Module):
             seg_loss:     scalar tensor (zero when joint segmentation is disabled)
         """
         input_ids, edu_mapping = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
-        embeddings = encode_tokens_strided(
-            self.encoder, self.tokenizer, input_ids, self.max_length, self.stride
-        )
+        embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(embeddings.float())  # [num_tokens, hidden_size]
 
         if self.segmenter is not None and self.training:
-            # End token (inclusive) of each gold EDU; segmenter operates on the
-            # layer-normed embeddings BEFORE dropout (matches upstream).
+            # End token (inclusive) of each gold EDU. Segmenter operates on the
+            # layer-normed embeddings BEFORE dropout (matches the original implementation).
             edu_ends = [end - 1 for _, end in edu_mapping]
             seg_loss = self.segmenter.loss(normed, edu_ends)
         else:
@@ -287,11 +265,12 @@ class DMRSTParser(nn.Module):
         embeddings: torch.Tensor,
         edu_mapping: list[tuple[int, int]],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build per-EDU representations from token embeddings.
+        """Pool token embeddings into one vector per EDU, plus the decoder's initial hidden state.
 
-        Shared back half of the encoder (after token encoding + LayerNorm
-        + dropout): per-EDU token mean -> BiGRU -> concat(gru_out, first,
-        last) -> reduce. Used by both the gold-EDU and predicted-EDU paths.
+        Each EDU's tokens are mean-pooled, run through a document-level BiGRU, then
+        each EDU's final repr is `reduce_dim([bigru_out, first_token, last_token])`.
+        The decoder's initial hidden state is the BiGRU's final (last-layer, both
+        directions concatenated) hidden state.
 
         Args:
             embeddings:  [num_tokens, hidden_size]
@@ -299,17 +278,27 @@ class DMRSTParser(nn.Module):
 
         Returns:
             edu_reprs:    [num_edus, hidden_size]
-            decoder_init: [1, 1, hidden_size]  (initial hidden state for the GRU decoder)
+            decoder_init: [1, 1, hidden_size]
         """
-        avg_edu_reprs = torch.stack([embeddings[b:e].mean(0) for b, e in edu_mapping])
+        # [1, num_edus, hidden_size]--note the unsqueeze to get the shape the GRU is expecting
+        avg_edu_reprs = torch.stack([embeddings[b:e].mean(0) for b, e in edu_mapping]).unsqueeze(0)
 
-        # Document-level BiGRU over averaged EDUs.
+        # Document-level BiGRU over averaged EDUs. Note that we need to unsqueeze
         # gru_out:    [1, num_edus, hidden_size]
-        # gru_hidden: [num_layers * num_directions, 1, hidden_size // 2]
-        gru_out, gru_hidden = self.doc_gru(avg_edu_reprs.unsqueeze(0))
-        # Take last layer, concat both directions -> [1, 1, hidden_size].
-        gru_hidden = gru_hidden.view(2, 2, 1, self.hidden_size // 2)[-1]
-        decoder_init = gru_hidden.transpose(0, 1).reshape(1, 1, -1).contiguous()
+        # gru_hidden: [num_layers * num_directions, 1, hidden_size // 2]   (= [4, 1, H/2])
+        gru_out, gru_hidden = self.doc_gru(avg_edu_reprs)
+
+        # We want the decoder's initial state to be the BiGRU's top-layer final
+        # hidden state, with the two directions concatenated. Build it in three steps:
+        H = self.encoder.config.hidden_size
+        # 1. Split the packed first dim into (layer, direction): [2, 2, 1, H/2].
+        #    nn.GRU's convention is layers-outer, directions-inner, so this view is safe.
+        gru_hidden = gru_hidden.view(2, 2, 1, H // 2)
+        # 2. Keep only the top layer (index -1) -> [num_directions=2, batch=1, H/2].
+        gru_hidden = gru_hidden[-1]
+        # 3. Put batch first, then flatten the two directions into one hidden dim
+        #    of size 2 * (H/2) = H. Result: [num_decoder_layers=1, batch=1, H].
+        decoder_init = gru_hidden.transpose(0, 1).reshape(1, 1, H).contiguous()
 
         final_reprs = []
         for i, (b, e) in enumerate(edu_mapping):
@@ -317,7 +306,7 @@ class DMRSTParser(nn.Module):
         edu_reprs = self.reduce_dim(torch.stack(final_reprs))
         return edu_reprs, decoder_init
 
-    def _label_inputs(
+    def _build_label_inputs(
         self,
         edu_reprs: torch.Tensor,
         b: int,
@@ -326,8 +315,8 @@ class DMRSTParser(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Left/right child representations fed to the label classifier.
 
-        For a 2-EDU span (or when `average_edu_level=False`), uses the edge EDU
-        of each child; otherwise uses the mean of all EDUs in each child.
+        Pooled as specified by `self.label_input_pooling`. A 2-EDU span short-circuits
+        to the edge form since both pooling modes collapse to picking the lone EDU.
 
         Args:
             edu_reprs:   [num_edus, hidden_size]
@@ -338,17 +327,27 @@ class DMRSTParser(nn.Module):
             input_left:  [1, hidden_size]
             input_right: [1, hidden_size]
         """
-        if e - b == 2 or not self.average_edu_level:
-            return edu_reprs[split_point - 1].unsqueeze(0), edu_reprs[e - 1].unsqueeze(0)
-        return edu_reprs[b:split_point].mean(0, keepdim=True), edu_reprs[split_point:e].mean(0, keepdim=True)
+        if e - b == 2 or self.label_input_pooling == "last_edu":
+            last_edu_left = edu_reprs[split_point - 1].unsqueeze(0)
+            last_edu_right = edu_reprs[e - 1].unsqueeze(0)
+            return last_edu_left, last_edu_right
+        else:
+            mean_of_left = edu_reprs[b:split_point].mean(0, keepdim=True)
+            mean_of_right = edu_reprs[split_point:e].mean(0, keepdim=True)
+            return mean_of_left, mean_of_right
 
     def forward(self, tree: RstTree) -> dict[str, torch.Tensor]:
         """Teacher-forced loss for one gold tree.
 
-        Walks the gold parse top-down (DFS, left-first) carrying decoder state
-        across decisions. At each non-leaf span [b, e), the pointer scores the
-        gold split position and the bilinear classifier scores the gold joint
-        nuc+rel label; both losses are accumulated and averaged.
+        Top-down parser with a pointer-network decoder (Vinyals et al. 2015):
+        the decoder GRU maintains hidden state across all parsing decisions,
+        and at each non-leaf span, pointer attention picks the split position
+        by attending over the span's EDU representations.
+
+        Per gold span (b, e):
+          1. Step the decoder on the span's mean EDU repr — output is the query.
+          2. Pointer attention scores the gold split (cross-entropy loss).
+          3. Bilinear classifier scores the gold (nuc, rel) label (CE loss).
 
         Returns:
             {
@@ -375,40 +374,41 @@ class DMRSTParser(nn.Module):
         while stack:
             b, e = stack.pop()
 
-            # Run decoder on the span's mean representation; this maintains
-            # sequential decoder state across all decisions in the tree.
+            # One decoder step per span. The input (mean of the span's EDUs)
+            # grounds the GRU in "what I'm deciding about now"; the carried
+            # hidden state grounds it in "what I've decided so far". The
+            # output is then used as the query for pointer attention below.
             decoder_input = edu_reprs[b:e].mean(0, keepdim=True).unsqueeze(0)
-            decoder_output, decoder_hidden = self.decoder(decoder_input, last_hidden=decoder_hidden)
+            decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
 
             gold_split, gold_label_str = gold_decisions[(b, e)]
             gold_label_idx = self.label_index.index(gold_label_str)
 
             if e - b == 2:
-                # Single forced split — no pointer loss, label_inputs use the two EDUs directly.
+                # Only one possible split — skip pointer loss, use the two EDUs directly.
                 input_left = edu_reprs[b].unsqueeze(0)
                 input_right = edu_reprs[b + 1].unsqueeze(0)
             else:
-                # Pointer attends over candidate splits (EDU indices b..e-2 inclusive).
+                # Pointer attention: query is the decoder output, keys are the
+                # n-1 candidate split anchors edu_reprs[b:e-1].
                 split_logits = self.pointer(edu_reprs[b : e - 1], decoder_output.squeeze(0).squeeze(0))
                 gold_pointer_idx = torch.tensor([gold_split - b - 1], device=self.device)
                 split_losses.append(F.cross_entropy(split_logits, gold_pointer_idx))
 
-                input_left, input_right = self._label_inputs(edu_reprs, b, e, gold_split)
+                input_left, input_right = self._build_label_inputs(edu_reprs, b, e, gold_split)
 
-                # Push right then left so left is on top — DFS left-first matches the
-                # order in which a sequential decoder should see decisions.
+                # Push right then left so left pops first — DFS left-first matches
+                # the order in which the sequential decoder should see decisions.
                 if e - gold_split > 1:
                     stack.append((gold_split, e))
                 if gold_split - b > 1:
                     stack.append((b, gold_split))
 
-            _, log_probs = self.label_classifier(input_left, input_right)
+            logits = self.label_classifier(input_left, input_right)
             label_target = torch.tensor([gold_label_idx], device=self.device)
-            label_losses.append(F.nll_loss(log_probs, label_target))
+            label_losses.append(F.cross_entropy(logits, label_target))
 
-        split_loss = (
-            sum(split_losses) / len(split_losses) if split_losses else torch.zeros((), device=self.device)
-        )
+        split_loss = sum(split_losses) / len(split_losses) if split_losses else torch.zeros((), device=self.device)
         label_loss = sum(label_losses) / len(label_losses)
         return {
             "loss": split_loss + label_loss + seg_loss,
@@ -440,7 +440,7 @@ class DMRSTParser(nn.Module):
             b, e = stack.pop()
 
             decoder_input = edu_reprs[b:e].mean(0, keepdim=True).unsqueeze(0)
-            decoder_output, decoder_hidden = self.decoder(decoder_input, last_hidden=decoder_hidden)
+            decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
 
             if e - b == 2:
                 split_point = b + 1
@@ -449,10 +449,10 @@ class DMRSTParser(nn.Module):
             else:
                 split_logits = self.pointer(edu_reprs[b : e - 1], decoder_output.squeeze(0).squeeze(0))
                 split_point = b + split_logits.argmax(-1).item() + 1
-                input_left, input_right = self._label_inputs(edu_reprs, b, e, split_point)
+                input_left, input_right = self._build_label_inputs(edu_reprs, b, e, split_point)
 
-            probs, _ = self.label_classifier(input_left, input_right)
-            pred_label = self.label_index[probs.argmax(-1).item()]
+            logits = self.label_classifier(input_left, input_right)
+            pred_label = self.label_index[logits.argmax(-1).item()]
             pred_nuc, pred_rel = pred_label.split("_", 1)
             actions.append((split_point, pred_nuc, pred_rel))
 
@@ -489,9 +489,7 @@ class DMRSTParser(nn.Module):
         if len(ids) == 0:
             return RstTree.from_parsing_actions([], [], relation_types=self.config.relation_types)
         input_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
-        embeddings = encode_tokens_strided(
-            self.encoder, self.tokenizer, input_ids, self.max_length, self.stride
-        )
+        embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(embeddings.float())
 
         breaks = self.segmenter.predict_breaks(normed)
@@ -502,9 +500,7 @@ class DMRSTParser(nn.Module):
             edu_mapping.append((prev, end_inclusive + 1))
             prev = end_inclusive + 1
         edu_texts = [
-            self.tokenizer.decode(
-                ids[b:e], skip_special_tokens=True, clean_up_tokenization_spaces=True
-            ).strip()
+            self.tokenizer.decode(ids[b:e], skip_special_tokens=True, clean_up_tokenization_spaces=True).strip()
             for b, e in edu_mapping
         ]
 
@@ -536,24 +532,18 @@ class DMRSTParser(nn.Module):
         """
         self.eval()
         input_ids, gold_edu_mapping = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
-        token_embeddings = encode_tokens_strided(
-            self.encoder, self.tokenizer, input_ids, self.max_length, self.stride
-        )
+        token_embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(token_embeddings.float())
         embeddings = self.encoder_dropout(normed)  # eval mode → identity
 
         # Gold-EDU path.
         gold_pred: RstTree
         if len(gold_edu_mapping) < 2:
-            gold_pred = RstTree.from_parsing_actions(
-                [], tree.edus, relation_types=self.config.relation_types
-            )
+            gold_pred = RstTree.from_parsing_actions([], tree.edus, relation_types=self.config.relation_types)
         else:
             edu_reprs, decoder_hidden = self._build_edu_reprs(embeddings, gold_edu_mapping)
             actions = self._decode_actions(edu_reprs, decoder_hidden)
-            gold_pred = RstTree.from_parsing_actions(
-                actions, tree.edus, relation_types=self.config.relation_types
-            )
+            gold_pred = RstTree.from_parsing_actions(actions, tree.edus, relation_types=self.config.relation_types)
         gold_edu_ends = [end - 1 for _, end in gold_edu_mapping]
 
         out: dict[str, Any] = {
@@ -577,23 +567,17 @@ class DMRSTParser(nn.Module):
             prev = end_inclusive + 1
         ids_list = input_ids.tolist()
         pred_edu_texts = [
-            self.tokenizer.decode(
-                ids_list[b:e], skip_special_tokens=True, clean_up_tokenization_spaces=True
-            ).strip()
+            self.tokenizer.decode(ids_list[b:e], skip_special_tokens=True, clean_up_tokenization_spaces=True).strip()
             for b, e in pred_edu_mapping
         ]
 
         e2e_pred: RstTree
         if len(pred_edu_mapping) < 2:
-            e2e_pred = RstTree.from_parsing_actions(
-                [], pred_edu_texts, relation_types=self.config.relation_types
-            )
+            e2e_pred = RstTree.from_parsing_actions([], pred_edu_texts, relation_types=self.config.relation_types)
         else:
             edu_reprs, decoder_hidden = self._build_edu_reprs(embeddings, pred_edu_mapping)
             actions = self._decode_actions(edu_reprs, decoder_hidden)
-            e2e_pred = RstTree.from_parsing_actions(
-                actions, pred_edu_texts, relation_types=self.config.relation_types
-            )
+            e2e_pred = RstTree.from_parsing_actions(actions, pred_edu_texts, relation_types=self.config.relation_types)
 
         out["e2e_pred"] = e2e_pred
         out["pred_edu_mapping"] = pred_edu_mapping

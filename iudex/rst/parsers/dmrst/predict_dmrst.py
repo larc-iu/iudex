@@ -53,9 +53,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     if args.input is not None:
         if os.path.isdir(args.input):
-            paths = sorted(glob(str(Path(args.input) / "*.rs3"))) + sorted(
-                glob(str(Path(args.input) / "*.rs4"))
-            )
+            paths = sorted(glob(str(Path(args.input) / "*.rs3"))) + sorted(glob(str(Path(args.input) / "*.rs4")))
         else:
             paths = [args.input]
     else:
@@ -99,9 +97,7 @@ def main():
                 f.write(pred.to_rs4_string())
             progress.advance(task)
 
-    console.print(
-        f"[bold green]Done![/bold green] Wrote {len(paths)} predictions to [path]{args.output_dir}[/path]"
-    )
+    console.print(f"[bold green]Done![/bold green] Wrote {len(paths)} predictions to [path]{args.output_dir}[/path]")
 
 
 if __name__ == "__main__":

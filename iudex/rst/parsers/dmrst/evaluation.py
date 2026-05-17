@@ -158,16 +158,3 @@ def dmrst_metrics_table(metrics: dict[str, float], title: str) -> Table:
         for name in ("span", "nuc", "rel", "full"):
             table.add_row(f"  {name.upper()}", f"{metrics[f'e2e_{name}_f1']:.4f}")
     return table
-
-
-def legal_val_metric_names(joint_segmentation: bool) -> list[str]:
-    """Return the set of metric keys `evaluate_dmrst` will produce for a given config.
-
-    Used by the trainer to validate `cfg.val_metric_name` at startup.
-    """
-    names = ["span_f1", "nuc_f1", "rel_f1", "full_f1"]
-    if joint_segmentation:
-        names += ["seg_p", "seg_r", "seg_f1"]
-        for m in ("span", "nuc", "rel", "full"):
-            names += [f"e2e_{m}_p", f"e2e_{m}_r", f"e2e_{m}_f1"]
-    return names

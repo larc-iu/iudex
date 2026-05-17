@@ -12,15 +12,16 @@
     // Model
     model_name: "xlm-roberta-base",
     stride: 100,
-    attention_type: "biaffine",
+    attention_type: "dot_product",
     classifier_use_bias: true,
     num_rnn_layers: 1,
     encoder_dropout: 0.5,
     decoder_dropout: 0.5,
     labeler_dropout: 0.5,
     doc_gru_dropout: 0.2,
-    average_edu_level: true,
+    label_input_pooling: "mean",
     freeze_encoder_layers: 3,
+    freeze_embeddings: true,
 
     // Joint EDU segmentation: train a per-subtoken EDU-end classifier alongside
     // the parser; enables `predict_from_text` for end-to-end inference.

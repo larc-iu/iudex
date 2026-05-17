@@ -116,8 +116,8 @@ class TopdownBiaffineParser(nn.Module):
         """
         # The first token of the whole span is the first token of every LEFT sub-span;
         # the last token of the whole span is the last token of every RIGHT sub-span.
-        span_first_h = embeddings[edu_boundaries[b, 0]]            # [hidden_size]
-        span_last_h = embeddings[edu_boundaries[e - 1, 1] - 1]     # [hidden_size]
+        span_first_h = embeddings[edu_boundaries[b, 0]]  # [hidden_size]
+        span_last_h = embeddings[edu_boundaries[e - 1, 1] - 1]  # [hidden_size]
 
         # For each candidate split k ∈ [b+1, e):
         #   - last token of the LEFT sub-span  = last token of EDU (k - 1)
@@ -183,9 +183,7 @@ class TopdownBiaffineParser(nn.Module):
             stack.append((gold_split, e))
             stack.append((b, gold_split))
 
-        split_loss = (
-            sum(split_losses) / len(split_losses) if split_losses else torch.zeros((), device=self.device)
-        )
+        split_loss = sum(split_losses) / len(split_losses) if split_losses else torch.zeros((), device=self.device)
         label_loss = sum(label_losses) / len(label_losses)
         return {"loss": (split_loss + label_loss) / 2}
 

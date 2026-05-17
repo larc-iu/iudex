@@ -24,22 +24,29 @@ class DMRSTConfig:
     # Model
     model_name: str = "xlm-roberta-base"
     stride: int = 100
-    attention_type: str = "biaffine"  # or "dot_product"
+    attention_type: str = "dot_product"  # or "biaffine"
     classifier_use_bias: bool = True
     num_rnn_layers: int = 1
     encoder_dropout: float = 0.5
     decoder_dropout: float = 0.5
     labeler_dropout: float = 0.5
     doc_gru_dropout: float = 0.2
-    average_edu_level: bool = True
-    # Number of XLM-R transformer layers to freeze (plus the embedding layer).
-    # Upstream DMRST_Parser freezes layers 0–2 + embeddings.
+    # How to pool the EDUs of each child of a split into the single vector fed
+    # to the label classifier:
+    #   "mean":     average of all EDU representations in the child (paper default)
+    #   "last_edu": the last EDU representation in the child (single-EDU edge stand-in)
+    # The two collapse to the same thing for a 2-EDU span (split is forced, each
+    # child has exactly one EDU).
+    label_input_pooling: str = "mean"
+    # Freezing embeddings and first n layers of the encoder.
+    # Original implementation freezes embeddings and first 3 layers.
+    freeze_embeddings: bool = True
     freeze_encoder_layers: int = 3
 
     # Joint EDU segmentation (cf. section 3.1.1 of paper). When True, training adds
-    # a per-token binary-classification loss over EDU end positions, and
+    # a per-token binary classification loss over EDU end positions, and
     # `predict_from_text` is available for raw-text → tree inference.
-    joint_segmentation: bool = False
+    joint_segmentation: bool = True
     seg_pos_weight: float = 10.0  # class weight on the positive (EDU-end) label
     seg_start_loss: bool = False  # add a second binary head for EDU starts
 

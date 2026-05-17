@@ -16,7 +16,6 @@ from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
 from iudex.rst.parsers.dmrst.evaluation import (
     dmrst_metrics_table,
     evaluate_dmrst,
-    legal_val_metric_names,
 )
 from iudex.rst.parsers.dmrst.modeling_dmrst import DMRSTParser
 from iudex.rst.training import (
@@ -65,30 +64,13 @@ def train(cfg: DMRSTConfig) -> None:
     else:
         dim(f"Using explicit `relation_types` from config ({len(cfg.relation_types)} pairs).")
 
-    legal_metrics = legal_val_metric_names(cfg.joint_segmentation)
-    if cfg.val_metric_name not in legal_metrics:
-        raise ValueError(
-            f"val_metric_name={cfg.val_metric_name!r} is not produced by evaluate_dmrst "
-            f"with joint_segmentation={cfg.joint_segmentation}. "
-            f"Legal keys: {legal_metrics}"
-        )
-    if cfg.joint_segmentation and cfg.val_metric_name in {"span_f1", "nuc_f1", "rel_f1", "full_f1"}:
-        warn(
-            f"val_metric_name={cfg.val_metric_name!r} is a gold-EDU metric. "
-            f"With joint_segmentation=True, consider `e2e_full_f1` (end-to-end parse) "
-            f"or `seg_f1` (segmentation-only) for early stopping."
-        )
-
     cfg_dict = dataclasses.asdict(cfg)
     run_dir, cfg_hash = prepare_run_dir(cfg_dict, cfg.checkpoint_dir, cfg.run_name)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DMRSTParser(cfg).to(device)
     train_trees = [
-        t
-        for _, t in read_rst_dir(
-            cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map
-        )
+        t for _, t in read_rst_dir(cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
     ]
     dev_pairs = read_rst_dir(cfg.dev_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
     test_pairs = (
@@ -126,7 +108,7 @@ def train(cfg: DMRSTConfig) -> None:
     # optimizer steps (only the last 3 are needed; older entries are dropped).
     # `weights` are the coefficients applied to the current step's forward;
     # they are recomputed at the end of each step from the ratio of the two
-    # most-recent stored step-losses (paper §3.2 / upstream `Training.py`):
+    # most-recent stored step-losses (paper §3.2 / original `Training.py`):
     # `r_k = L_k(t-1) / L_k(t-2)` so weights at step t use steps t-1 and t-2.
     # Components are `split` + `label`, plus `seg` when joint segmentation is on.
     components = ["split", "label"] + (["seg"] if cfg.joint_segmentation else [])
@@ -245,11 +227,11 @@ def train(cfg: DMRSTConfig) -> None:
                 global_step += 1
                 epoch_step += 1
 
-                # Dynamic loss weighting (lagged ratio per paper §3.2 / upstream).
+                # Dynamic loss weighting (lagged ratio per paper §3.2 / original implementation).
                 # Store this step's component losses, then — once we have at least 3
                 # stored — compute next step's weights from `r = list[-1] / list[-2]`,
                 # i.e. the ratio of the two most-recent step losses. Effectively no
-                # adaptation occurs before step 4, matching the upstream `> 2` guard.
+                # adaptation occurs before step 4, matching the original `> 2` guard.
                 if cfg.dlw_enabled:
                     for k in components:
                         loss_history[k].append(curr_sums[k])

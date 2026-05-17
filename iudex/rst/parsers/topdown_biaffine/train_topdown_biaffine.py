@@ -63,10 +63,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TopdownBiaffineParser(cfg).to(device)
     train_trees = [
-        t
-        for _, t in read_rst_dir(
-            cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map
-        )
+        t for _, t in read_rst_dir(cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
     ]
     dev_pairs = read_rst_dir(cfg.dev_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
     test_pairs = (
@@ -100,9 +97,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
     )
     scheduler = make_scheduler(optimizer, warmup, total_steps)
 
-    state = resume_or_init(
-        run_dir, model=model, optimizer=optimizer, scheduler=scheduler, expected_hash=cfg_hash
-    )
+    state = resume_or_init(run_dir, model=model, optimizer=optimizer, scheduler=scheduler, expected_hash=cfg_hash)
     global_step = state["global_step"]
     start_epoch = state["epoch"]
     best_val = state["best_val"]

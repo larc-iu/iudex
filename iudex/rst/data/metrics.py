@@ -169,7 +169,7 @@ def compute_seg_metrics(gold_ends: List[int], pred_ends: List[int]) -> Dict[str,
     """Position-level segmentation counts (Carlson/Marcu convention).
 
     `gold_ends` and `pred_ends` are inclusive token end indices, including
-    the forced terminal break — matches upstream `Metric.py:getSegMeasure`.
+    the forced terminal break — matches the original `Metric.py:getSegMeasure`.
     The terminal token is always a gold end and always a predicted end,
     so it contributes a guaranteed +1 to `seg_correct` per document.
     """

@@ -74,9 +74,7 @@ def main():
                 f.write(pred.to_rs4_string())
             progress.advance(task)
 
-    console.print(
-        f"[bold green]Done![/bold green] Wrote {len(paths)} predictions to [path]{args.output_dir}[/path]"
-    )
+    console.print(f"[bold green]Done![/bold green] Wrote {len(paths)} predictions to [path]{args.output_dir}[/path]")
 
 
 if __name__ == "__main__":

@@ -241,8 +241,7 @@ def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | 
         logger.info("Config hash mismatch; starting fresh")
         return None
     console.print(
-        f"[bold cyan]Resuming[/bold cyan] from step {ckpt.get('global_step', '?')}, "
-        f"epoch {ckpt.get('epoch', '?')}"
+        f"[bold cyan]Resuming[/bold cyan] from step {ckpt.get('global_step', '?')}, epoch {ckpt.get('epoch', '?')}"
     )
     return ckpt
 
@@ -291,8 +290,7 @@ def evaluate(
         return (2 * p * r) / (p + r) if (p + r) > 0 else 0.0
 
     return {
-        f"{m}_f1": f1(totals[f"{m}_p_count"] / n, totals[f"{m}_r_count"] / n)
-        for m in ["span", "nuc", "rel", "full"]
+        f"{m}_f1": f1(totals[f"{m}_p_count"] / n, totals[f"{m}_r_count"] / n) for m in ["span", "nuc", "rel", "full"]
     }
 
 
