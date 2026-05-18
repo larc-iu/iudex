@@ -18,7 +18,7 @@ DATASETS: dict[str, dict] = {
         "url": "https://catalog.ldc.upenn.edu/LDC2002T07",
         "language": "English",
         "description": (
-            "385 WSJ articles from the Penn Treebank, annotated in RST with a fine-grained relation inventory."
+            "385 WSJ articles from the Penn Treebank, annotated in RST with a fine-grained relation inventory. "
             "RST-DT is the traditional English benchmark for RST parsing."
         ),
         "citation_text": (
