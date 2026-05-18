@@ -17,10 +17,10 @@ from rich.progress import (
 
 from iudex.common.log import console, setup_logging
 from iudex.rst.data.reader import read_rst_file
-from iudex.rst.parsers.hfhub import load_parser_from_pretrained
 from iudex.rst.parsers.common.inference import load_parser_from_checkpoint, resolve_source
 from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
 from iudex.rst.parsers.dmrst.modeling_dmrst import DMRSTParser
+from iudex.rst.parsers.hfhub import load_parser_from_pretrained
 
 setup_logging()
 logger = logging.getLogger(__name__)

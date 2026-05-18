@@ -20,9 +20,22 @@ class _SegmentationConfig(FromParams):
 class _DLWConfig(FromParams):
     """Dynamic loss weighting (paper §3.2). Presence on `DMRSTConfig`
     enables DLW; `dlw: null` falls back to unweighted sum of component losses.
+
+    The weight update compares the mean of the most recent `window // 2`
+    optimizer steps' component losses against the mean of the preceding
+    `window // 2` (or the rest, for odd `window`). With `window=2` (default)
+    this collapses to `L_k(t-1) / L_k(t-2)`, exactly reproducing the paper's
+    formulation. Larger windows yield much less noisy ratios — useful for
+    whole-tree training where per-step loss is dominated by single-document
+    variance. `window=2` is the minimum.
     """
 
     temperature: float = 2.0
+    window: int = 2
+
+    def __post_init__(self):
+        if self.window < 2:
+            raise ValueError(f"_DLWConfig.window must be >= 2 (got {self.window})")
 
 
 @dataclass

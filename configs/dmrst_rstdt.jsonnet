@@ -44,6 +44,9 @@
     seed: 42,
     val_metric_name: "e2e_full_f1",
 
-    // Dynamic loss weighting. Set to `null` for unweighted sum.
-    dlw: { temperature: 2.0 },
+    // Dynamic loss weighting. `window: 2` reproduces the paper's lagged
+    // L(t-1)/L(t-2) ratio; larger windows give smoother ratios at the cost
+    // of slower adaptation (recommended for noisy whole-tree training).
+    // Set to `null` for unweighted sum.
+    dlw: { temperature: 2.0, window: 2 },
 }

@@ -283,20 +283,29 @@ def train(cfg: DMRSTConfig) -> None:
                 # stored — compute next step's weights from `r = list[-1] / list[-2]`.
                 # Adaptation effectively begins at step 4.
                 if cfg.dlw is not None:
+                    window = cfg.dlw.window
                     for k in components:
                         loss_history[k].append(curr_sums[k])
-                        if len(loss_history[k]) > 3:
-                            loss_history[k] = loss_history[k][-3:]
-                    if len(loss_history[components[0]]) > 2:
+                        if len(loss_history[k]) > window + 1:
+                            loss_history[k] = loss_history[k][-(window + 1) :]
+                    # Need `window + 1` stored before triggering — one warm-up
+                    # step beyond the window itself, matching the original code's
+                    # `> 2` guard when `window == 2`.
+                    if len(loss_history[components[0]]) > window:
                         temperature = cfg.dlw.temperature
                         num_components = len(components)
+                        # Compare mean of recent half vs mean of earlier half.
+                        # For window=2: half=1, recent=history[-1], earlier=history[-2]
+                        #   — exactly the original paper's L(t-1)/L(t-2) ratio.
+                        # For window=20: half=10, ten-step means each side.
+                        half = max(window // 2, 1)
+                        recent = {k: sum(loss_history[k][-half:]) / half for k in components}
+                        earlier = {k: sum(loss_history[k][-window:-half]) / max(window - half, 1) for k in components}
                         # Subtract max before exp for numerical stability: when one
                         # component's loss collapses to near-zero, its ratio can
                         # explode past `math.exp`'s domain (≈709). The constant
                         # cancels in the softmax normalization below.
-                        exp_args = {
-                            k: (loss_history[k][-1] / max(loss_history[k][-2], 1e-8)) / temperature for k in components
-                        }
+                        exp_args = {k: (recent[k] / max(earlier[k], 1e-8)) / temperature for k in components}
                         max_arg = max(exp_args.values())
                         expw = {k: math.exp(exp_args[k] - max_arg) for k in components}
                         norm = sum(expw.values())
