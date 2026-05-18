@@ -77,8 +77,10 @@ $ iudex runs list
 ┏━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━┳━━━━━━━━━━━━━━━━━━┓
 ┃ run_id       ┃ run_name ┃ parser           ┃ model_name                   ┃ train_dir             ┃  best_val ┃ step ┃ modified         ┃
 ┡━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━╇━━━━━━━━━━━━━━━━━━┩
-│ 007f69457a0c │ -        │ dmrst            │ xlm-roberta-base             │ data/rstdt/train      │ (no best) │    - │ 2026-05-13 16:49 │
-│ f4f2bbc875b6 │ -        │ dmrst            │ xlm-roberta-base             │ data/rstdt/train      │ (no best) │    - │ 2026-05-13 16:26 │
+│ 245b1d774676 │ -        │ dmrst            │ xlm-roberta-base             │ data/gum_12.1.0/train │    0.3099 │ 1704 │ 2026-05-18 18:02 │
+│ 41bc0fe1dd50 │ -        │ topdown_biaffine │ SpanBERT/spanbert-base-cased │ data/rstdt/train      │    0.7576 │ 2149 │ 2026-05-18 13:51 │
+│ 91525e48d63d │ -        │ topdown_biaffine │ SpanBERT/spanbert-base-cased │ data/gum_12.1.0/train │    0.6364 │ 1899 │ 2026-05-18 14:31 │
+│ ad934ca992d4 │ -        │ dmrst            │ xlm-roberta-base             │ data/rstdt/train      │    0.4665 │ 3090 │ 2026-05-18 16:46 │
 └──────────────┴──────────┴──────────────────┴──────────────────────────────┴───────────────────────┴───────────┴──────┴──────────────────┘
 ```
 
