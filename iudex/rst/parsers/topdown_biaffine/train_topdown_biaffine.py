@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import json
 import logging
 import os
 import random
@@ -10,29 +11,55 @@ import torch
 from tonga import Params
 
 from iudex.common.log import console, dim, rule, setup_logging, success, warn
+from iudex.rst.data.metrics import evaluate_parseval, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
+from iudex.rst.data.tree import RstTree
 from iudex.rst.parsers.topdown_biaffine.configuration_topdown_biaffine import TopdownBiaffineConfig
 from iudex.rst.parsers.topdown_biaffine.modeling_topdown_biaffine import TopdownBiaffineParser
 from iudex.rst.training import (
     build_optimizer,
     config_panel,
     device_panel,
-    evaluate,
-    final_evaluation,
     gpu_mem_gb,
     make_progress_bar,
     make_scheduler,
-    metrics_table,
     model_panel,
     prepare_run_dir,
     resume_or_init,
     save_checkpoint,
     schedule_panel,
     set_seeds,
+    write_run_config,
 )
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+def _write_rs4(tree: RstTree, output_dir: str, basename: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, basename), "w", encoding="utf-8") as f:
+        f.write(tree.to_rs4_string())
+
+
+@torch.no_grad()
+def _evaluate_on_dev(
+    model: TopdownBiaffineParser,
+    dev_pairs: list[tuple[str, RstTree]],
+    output_dir: str | None = None,
+) -> dict[str, float]:
+    """Run the model over `dev_pairs` and aggregate gold-EDU Parseval.
+    No segmentation — this parser assumes gold EDUs."""
+    gold_trees: list[RstTree] = []
+    gold_preds: list[RstTree] = []
+    for filepath, gold in dev_pairs:
+        gold_trees.append(gold)
+        pred = model.predict(gold)
+        gold_preds.append(pred)
+        if output_dir is not None:
+            basename = os.path.splitext(os.path.basename(filepath))[0] + ".rs4"
+            _write_rs4(pred, output_dir, basename)
+    return evaluate_parseval(gold_trees, gold_preds)
 
 
 def train(cfg: TopdownBiaffineConfig) -> None:
@@ -45,20 +72,23 @@ def train(cfg: TopdownBiaffineConfig) -> None:
     automatically.
     """
     set_seeds(cfg.seed)
+
+    run_dir, cfg_hash = prepare_run_dir(dataclasses.asdict(cfg), cfg.checkpoint_dir, cfg.run_name)
+
     if cfg.relation_map is not None:
         dim(f"Applying `relation_map` ({len(cfg.relation_map)} entries) to all read trees.")
-    if cfg.relation_types is None:
-        cfg.relation_types = infer_relation_types([cfg.train_dir, cfg.dev_dir], relation_map=cfg.relation_map)
-        dim(
-            f"Inferred {len(cfg.relation_types)} (relation, kind) pairs from "
-            f"{cfg.train_dir} + {cfg.dev_dir}"
-            + (" (after relation_map)." if cfg.relation_map is not None else ".")
-            + " See Config panel below for the full list."
-        )
-    else:
-        dim(f"Using explicit `relation_types` from config ({len(cfg.relation_types)} pairs).")
+    cfg.relation_types = infer_relation_types([cfg.train_dir, cfg.dev_dir], relation_map=cfg.relation_map)
+    dim(
+        f"Inferred {len(cfg.relation_types)} (relation, kind) pairs from "
+        f"{cfg.train_dir} + {cfg.dev_dir}"
+        + (" (after relation_map)." if cfg.relation_map is not None else ".")
+        + " See Config panel below for the full list."
+    )
+
+    # Resolved cfg_dict (post-inference) is written to the audit config.json,
+    # embedded in the .pt, and uploaded to the Hub.
     cfg_dict = dataclasses.asdict(cfg)
-    run_dir, cfg_hash = prepare_run_dir(cfg_dict, cfg.checkpoint_dir, cfg.run_name)
+    write_run_config(run_dir, cfg_dict)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TopdownBiaffineParser(cfg).to(device)
@@ -121,7 +151,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
         nonlocal best_val, stale
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         model.eval()
-        metrics = evaluate(model.predict, dev_pairs, output_dir=pred_dir)
+        metrics = _evaluate_on_dev(model, dev_pairs, output_dir=pred_dir)
         console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
         score = metrics[cfg.val_metric_name]
         if score > best_val:
@@ -203,7 +233,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
                 )
 
                 if epoch_step % cfg.log_every == 0:
-                    mem_log = f"  mem=[dim]{mem[0]:.1f}/{mem[1]:.1f}GB[/dim]" if mem else ""
+                    mem_log = f"  mem=[dim]{mem[1]:.1f}GB[/dim]" if mem else ""
                     progress.console.print(
                         f"  [step]step {epoch_step}/{steps_per_epoch}[/step]  "
                         f"loss=[loss]{avg_loss:.4f}[/loss]  "
@@ -235,15 +265,33 @@ def train(cfg: TopdownBiaffineConfig) -> None:
             warn(f"\nEarly stopping at step {global_step}")
             break
 
-    final_evaluation(
-        model=model,
-        run_dir=run_dir,
-        predict_fn=model.predict,
-        dev_pairs=dev_pairs,
-        val_metric_name=cfg.val_metric_name,
-        best_val=best_val,
-        test_pairs=test_pairs,
-    )
+    rule("Final Evaluation")
+    best_path = os.path.join(run_dir, "best_model.pt")
+    if os.path.exists(best_path):
+        checkpoint = torch.load(best_path, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        dev_m = _evaluate_on_dev(
+            model,
+            dev_pairs,
+            output_dir=os.path.join(run_dir, "dev_predictions", "final"),
+        )
+        console.print(metrics_table(dev_m, title="Final Dev Results"))
+        final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
+        if test_pairs is not None:
+            test_m = _evaluate_on_dev(
+                model,
+                test_pairs,
+                output_dir=os.path.join(run_dir, "test_predictions", "final"),
+            )
+            console.print(metrics_table(test_m, title="Final Test Results"))
+            final_metrics["test"] = test_m
+        # Sidecar for downstream tools (e.g. hub.py model card) so they don't
+        # need to torch.load the checkpoint just to read corpus-level numbers.
+        with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(final_metrics, f, indent=2)
+    else:
+        success(f"Training complete. Best {cfg.val_metric_name}: {best_val:.4f}")
 
 
 def main():

@@ -16,7 +16,8 @@ from rich.progress import (
 
 from iudex.common.log import console, setup_logging
 from iudex.rst.data.reader import read_rst_file
-from iudex.rst.parsers.common.inference import load_parser_from_checkpoint, resolve_checkpoint
+from iudex.rst.parsers.hfhub import load_parser_from_pretrained
+from iudex.rst.parsers.common.inference import load_parser_from_checkpoint, resolve_source
 from iudex.rst.parsers.topdown_biaffine.configuration_topdown_biaffine import TopdownBiaffineConfig
 from iudex.rst.parsers.topdown_biaffine.modeling_topdown_biaffine import TopdownBiaffineParser
 
@@ -29,20 +30,29 @@ def main():
     source_group = parser.add_mutually_exclusive_group(required=True)
     source_group.add_argument("--config", help="Jsonnet config; load best_model.pt from the derived run dir")
     source_group.add_argument("--checkpoint", help="Direct path to a .pt checkpoint")
+    source_group.add_argument(
+        "--hub-id", dest="hub_id", help="HuggingFace Hub repo id (e.g. larc-iu/topdown_biaffine-rstdt-coarse)"
+    )
     parser.add_argument("--input", required=True, help="RS3/RS4 file or directory")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    checkpoint_path = resolve_checkpoint(
+    kind, source = resolve_source(
         args.config,
         args.checkpoint,
+        args.hub_id,
         TopdownBiaffineConfig,
         "iudex.rst.parsers.topdown_biaffine.train_topdown_biaffine",
     )
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = load_parser_from_checkpoint(checkpoint_path, device, TopdownBiaffineConfig, TopdownBiaffineParser)
-    console.print(f"[dim]Loaded model from[/dim] [path]{checkpoint_path}[/path]")
+    if kind == "hub":
+        model = load_parser_from_pretrained(
+            source, parser_cls=TopdownBiaffineParser, config_cls=TopdownBiaffineConfig, device=device
+        )
+    else:
+        model = load_parser_from_checkpoint(source, device, TopdownBiaffineConfig, TopdownBiaffineParser)
+    console.print(f"[dim]Loaded model from[/dim] [path]{source}[/path]")
 
     os.makedirs(args.output_dir, exist_ok=True)
     if os.path.isdir(args.input):

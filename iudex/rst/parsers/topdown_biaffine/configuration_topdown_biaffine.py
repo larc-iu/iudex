@@ -1,24 +1,26 @@
 from dataclasses import dataclass
 
+from tonga import FromParams
+
 from iudex.rst.parsers.common.config import parse_config_dict
 
 
 @dataclass
-class TopdownBiaffineConfig:
+class TopdownBiaffineConfig(FromParams):
     train_dir: str
     dev_dir: str
     # Optional held-out test split. If set, final evaluation runs on both
     # dev and test after the dev table; if null, only dev is reported.
     test_dir: str | None = None
 
-    # If null, the trainer infers the inventory from (relation, nuclearity)
-    # pairs observed in train_dir + dev_dir.
+    # Populated at training time by inferring (relation, nuclearity) pairs
+    # from train_dir + dev_dir; not user-configurable. Persists in the
+    # checkpointed config so predict/from_pretrained know the label space.
     relation_types: list[tuple[str, str]] | None = None
 
     # Optional fine→coarse relation remap applied by the reader. When set,
     # every non-"span" relname in the data must be a key (missing keys raise).
-    # `relation_types` (if inferred) and the model's label space are in the
-    # mapped space.
+    # `relation_types` and the model's label space are in the mapped space.
     relation_map: dict[str, str] | None = None
 
     # Model
@@ -30,7 +32,7 @@ class TopdownBiaffineConfig:
     # Training
     lr: float = 2e-4
     encoder_lr: float | None = None  # if set, encoder params use this LR instead of `lr`
-    max_epochs: int = 100
+    max_epochs: int = 50
     grad_accum: int = 1
     patience: int = 10
     max_grad_norm: float = 1.0

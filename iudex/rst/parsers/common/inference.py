@@ -1,4 +1,4 @@
-"""Shared checkpoint-resolution and model-loading for RST parser CLIs."""
+"""Checkpoint-resolution and model-loading helpers for RST parser CLIs."""
 
 import dataclasses
 import os
@@ -66,3 +66,25 @@ def load_parser_from_checkpoint(
     model = parser_cls(cfg)
     model.load_state_dict(checkpoint["model_state_dict"])
     return model.to(device).eval()
+
+
+def resolve_source(
+    config_path: str | None,
+    checkpoint_path: str | None,
+    hub_id: str | None,
+    config_cls: type,
+    train_module: str,
+) -> tuple[str, str]:
+    """Pick where to load the parser from. Returns (kind, value).
+
+    Exactly one of the three args is non-None (predict CLIs enforce via a
+    mutually-exclusive argparse group). `kind` is one of:
+
+      - `"local"`: `value` is a local `.pt` path. Caller passes it to
+        `load_parser_from_checkpoint`.
+      - `"hub"`:   `value` is a Hub repo id. Caller passes it to
+        `load_parser_from_pretrained`.
+    """
+    if hub_id is not None:
+        return "hub", hub_id
+    return "local", resolve_checkpoint(config_path, checkpoint_path, config_cls, train_module)

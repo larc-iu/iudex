@@ -73,6 +73,36 @@ class TopdownBiaffineParser(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        repo_or_path: str,
+        *,
+        device: str | torch.device | None = None,
+        revision: str | None = None,
+        cache_dir: str | None = None,
+        token: str | bool | None = None,
+    ) -> "TopdownBiaffineParser":
+        """Load from a HuggingFace Hub repo id, a local run dir, or a `.pt` file.
+
+        See `iudex.rst.parsers.hfhub.load_parser_from_pretrained` for the
+        full resolution rules (including how Hub vs. local paths are detected).
+        """
+        from iudex.rst.parsers.hfhub import load_parser_from_pretrained
+
+        dev = (
+            torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        return load_parser_from_pretrained(
+            repo_or_path,
+            parser_cls=cls,
+            config_cls=TopdownBiaffineConfig,
+            device=dev,
+            revision=revision,
+            cache_dir=cache_dir,
+            token=token,
+        )
+
     def _encode_tree(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor]:
         """Tokenize the tree's EDUs and return their token-level embeddings.
 
@@ -179,7 +209,7 @@ class TopdownBiaffineParser(nn.Module):
             label_target = torch.tensor([gold_label_idx], device=self.device)
             label_losses.append(F.cross_entropy(label_logits[gold_split_idx].unsqueeze(0), label_target))
 
-            # Recurse into the GOLD sub-spans (teacher forcing — not the predicted split).
+            # Recurse into the gold sub-spans (teacher forcing).
             stack.append((gold_split, e))
             stack.append((b, gold_split))
 

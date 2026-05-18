@@ -65,34 +65,16 @@ def _process_dict(d: Dict[str, Any]) -> Tuple[List[RstNode], List[RstEdge]]:
     nodes = terminals + nonterminals
 
     terminal_edges = [
-        RstEdge(source=n["parent"], target=n["id"], relation=n["relname"])
-        for n in d["terminals"]
-        if "parent" in n
+        RstEdge(source=n["parent"], target=n["id"], relation=n["relname"]) for n in d["terminals"] if "parent" in n
     ]
     nonterminal_edges = [
-        RstEdge(source=n["parent"], target=n["id"], relation=n["relname"])
-        for n in d["nonterminals"]
-        if "parent" in n
+        RstEdge(source=n["parent"], target=n["id"], relation=n["relname"]) for n in d["nonterminals"] if "parent" in n
     ]
     secondary_edges = [
         RstEdge(source=e["source"], target=e["target"], relation=e["relname"], secondary=True)
         for e in d["secondary_edges"]
     ]
     edges = terminal_edges + nonterminal_edges + secondary_edges
-
-    # Older `to_rs4_string` always wrote `type="span"` for the root. Re-type any
-    # such node back to "multinuc" when its primary children all share the same
-    # non-"span" relname — the structural signature of a multinuc node.
-    primary_by_source: Dict[str, List[RstEdge]] = {}
-    for e in edges:
-        if not e.secondary:
-            primary_by_source.setdefault(e.source, []).append(e)
-    for n in nodes:
-        if n.type != "span":
-            continue
-        children = primary_by_source.get(n.id, [])
-        if len(children) >= 2 and all(c.relation == children[0].relation for c in children) and children[0].relation != "span":
-            n.type = "multinuc"
 
     return nodes, edges
 
@@ -105,17 +87,15 @@ def read_rst_file(
 ) -> RstTree:
     """Read an RS3 or RS4 file and return an RstTree. If `relation_map` is
     set, the tree applies it at its output boundary (e.g. `parsing_actions`,
-    `spans`, `relation_of`) — edges retain raw labels so that structure-
+    `spans`, `relation_of`); edges retain raw labels so that structure-
     inference logic that distinguishes multinuc-siblings from satellites by
     relation-name distinctness is not broken by fine→coarse collapses.
     """
-    logger.info(f"Reading {filepath}")
+    logger.debug(f"Reading {filepath}")
     d = _read_rs4_into_dict(filepath)
     _validate_dict(filepath, d)
     nodes, edges = _process_dict(d)
-    return RstTree(
-        nodes, edges, binarize=binarize, relation_types=relation_types, relation_map=relation_map
-    )
+    return RstTree(nodes, edges, binarize=binarize, relation_types=relation_types, relation_map=relation_map)
 
 
 def read_rst_dir(
@@ -131,9 +111,7 @@ def read_rst_dir(
     paths += sorted(glob(str(Path(directory) / "*.rs4")))
     results = []
     for p in paths:
-        tree = read_rst_file(
-            p, binarize=binarize, relation_types=relation_types, relation_map=relation_map
-        )
+        tree = read_rst_file(p, binarize=binarize, relation_types=relation_types, relation_map=relation_map)
         results.append((p, tree))
     return results
 
@@ -148,7 +126,7 @@ def infer_relation_types(
     mononuclear in some contexts and multinuclear in others.
 
     When `relation_map` is set, observed relations are reported in the mapped
-    (typically coarse-grained) space. Sorted for deterministic config hashing.
+    space. Sorted for deterministic config hashing.
     """
     seen = set()
     for directory in directories:

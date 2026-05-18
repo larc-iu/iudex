@@ -1,12 +1,9 @@
 """Training utilities for iudex RST parsers.
 
-This module is a bag of utility functions; parser-specific training scripts
-(e.g. `iudex/rst/parsers/<name>/train_<name>.py`) import what they need and
-own their own training loop. There is no `Trainer` class here intentionally —
-the goal is that one file per parser tells the full training story top-to-bottom.
-
-Each utility takes its inputs explicitly. We avoid assuming anything about
-model or cfg structure beyond standard `nn.Module` interfaces.
+A bag of helpers consumed by parser-specific training scripts (e.g.
+`iudex/rst/parsers/<name>/train_<name>.py`). There is no `Trainer` class —
+each `train_<name>.py` owns its own loop. Each utility takes its inputs
+explicitly and assumes only standard `nn.Module` interfaces.
 """
 
 import hashlib
@@ -14,7 +11,7 @@ import json
 import logging
 import os
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 import torch
@@ -34,20 +31,47 @@ from rich.table import Table
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from iudex.common.log import console, rule, success
-from iudex.rst.data.metrics import compute_parseval_metrics
-from iudex.rst.data.tree import RstTree
+from iudex.common.log import console, dim, warn
 
 logger = logging.getLogger(__name__)
 
 
+# Fields stripped before hashing the config to compute `run_id`. Anything in
+# this list can change between runs without invalidating an existing
+# checkpoint.
+#
+# Categories:
+#   - display:        run_name
+#   - inferred:       relation_types (populated post-hash from train/dev data;
+#                     would silently mismatch between train and predict)
+#   - storage:        checkpoint_dir (moving runs shouldn't reissue run_ids)
+#   - training-loop:  max_epochs, patience, validate_every, checkpoint_every,
+#                     log_every, val_metric_name (don't change the weights)
+#   - eval-only:      test_dir (read only at final eval)
+DEFAULT_HASH_EXCLUDE: tuple[str, ...] = (
+    "run_name",
+    "relation_types",
+    "checkpoint_dir",
+    "max_epochs",
+    "patience",
+    "log_every",
+    "validate_every",
+    "checkpoint_every",
+    "val_metric_name",
+    "test_dir",
+)
+
+
 def config_hash(obj: Any) -> str:
-    """First 12 hex chars (48-bit prefix) of SHA-256 over any JSON-serializable
-    object (typically `dataclasses.asdict(cfg)`). Short enough to read in run-dir
-    names, long enough that collisions across hundreds of runs are vanishingly
-    rare (birthday-bound ≈ √2⁴⁸ ≈ 16M).
+    """First 12 hex chars (48-bit prefix) of SHA-256 over a JSON-serializable
+    object (typically `dataclasses.asdict(cfg)`). Collision-resistance is
+    birthday-bound ≈ √2⁴⁸ ≈ 16M.
+
+    Raises TypeError if `obj` contains a value json doesn't know how to encode
+    — silently `str()`-ifying would make hashes platform- and
+    Python-version-dependent. Add an explicit serializer for any new type.
     """
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:12]
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:12]
 
 
 def set_seeds(seed: int) -> None:
@@ -71,14 +95,13 @@ def derive_run_id(
     config_dict: dict,
     run_name: str | None = None,
     *,
-    hash_exclude: tuple[str, ...] = ("run_name",),
+    hash_exclude: tuple[str, ...] = DEFAULT_HASH_EXCLUDE,
 ) -> tuple[str, str]:
-    """Pure: compute the run id ("{run_name}-{hash}" or just "{hash}") and hash.
+    """Compute the run id ("{run_name}-{hash}" or just "{hash}") and hash.
 
-    Display-only fields named in `hash_exclude` are stripped before hashing so
-    they don't affect run identity. No I/O — safe to call from inference paths
-    that just need to locate a previously-prepared run directory.
-    Returns (run_id, cfg_hash).
+    Fields named in `hash_exclude` are stripped before hashing so they don't
+    affect run identity (see `DEFAULT_HASH_EXCLUDE`). No I/O — safe to call
+    from inference paths. Returns (run_id, cfg_hash).
     """
     hashable = {k: v for k, v in config_dict.items() if k not in hash_exclude}
     cfg_hash = config_hash(hashable)
@@ -91,17 +114,79 @@ def prepare_run_dir(
     checkpoint_dir: str,
     run_name: str | None = None,
     *,
-    hash_exclude: tuple[str, ...] = ("run_name",),
+    hash_exclude: tuple[str, ...] = DEFAULT_HASH_EXCLUDE,
 ) -> tuple[str, str]:
-    """Derive `{checkpoint_dir}/{run_name}-{hash}` (or just `/{hash}`), `mkdir -p`
-    it, and write `config.json` for audit. Returns (run_dir, cfg_hash).
+    """Derive `{checkpoint_dir}/{run_name}-{hash}` (or just `/{hash}`) and
+    `mkdir -p` it. Returns (run_dir, cfg_hash).
+
+    On first creation (no `last.pt` present), prints a hint about the closest
+    sibling run if one exists, so an accidental field change that branched
+    into a new run is visible.
+
+    Does NOT write `config.json`; callers should `write_run_config` separately
+    once they've resolved any inferred-at-training fields (e.g. relation_types).
     """
     run_id, cfg_hash = derive_run_id(config_dict, run_name, hash_exclude=hash_exclude)
     run_dir = os.path.join(checkpoint_dir, run_id)
+    is_fresh = not os.path.exists(os.path.join(run_dir, "last.pt"))
     os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(config_dict, f, indent=2, default=str)
+    if is_fresh:
+        _hint_closest_sibling(run_dir, checkpoint_dir, config_dict, hash_exclude=hash_exclude)
     return run_dir, cfg_hash
+
+
+def write_run_config(run_dir: str, config_dict: dict) -> None:
+    """Write `{run_dir}/config.json` for audit. Overwrites if present.
+
+    Train scripts call this *after* resolving inferred fields (relation_types,
+    etc.) so the on-disk audit, the embedded checkpoint config, and any
+    Hub-published config.json all match.
+    """
+    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=2)
+
+
+def _hint_closest_sibling(
+    new_run_dir: str,
+    checkpoint_dir: str,
+    new_config: dict,
+    *,
+    hash_exclude: tuple[str, ...],
+) -> None:
+    """Print a hint if there's a sibling run whose config differs by only a
+    handful of fields. Silent if there are no siblings, or the closest one
+    differs in more than 5 hash-affecting fields. Excluded fields are ignored.
+    """
+    if not os.path.isdir(checkpoint_dir):
+        return
+    best: tuple[int, str, list[str]] | None = None
+    for entry in os.listdir(checkpoint_dir):
+        sibling = os.path.join(checkpoint_dir, entry)
+        if sibling == new_run_dir or not os.path.isdir(sibling):
+            continue
+        sibling_cfg_path = os.path.join(sibling, "config.json")
+        if not os.path.exists(sibling_cfg_path):
+            continue
+        try:
+            with open(sibling_cfg_path, encoding="utf-8") as f:
+                sibling_cfg = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        keys = (set(new_config) | set(sibling_cfg)) - set(hash_exclude)
+        diffs = sorted(k for k in keys if new_config.get(k) != sibling_cfg.get(k))
+        if not diffs:
+            continue
+        if best is None or len(diffs) < best[0]:
+            best = (len(diffs), entry, diffs)
+    if best is None or best[0] > 5:
+        return
+    n, run_id, diffs = best
+    field_list = ", ".join(diffs[:5]) + (f", +{len(diffs) - 5} more" if len(diffs) > 5 else "")
+    dim(
+        f"  New run. Closest existing run: [path]{run_id}[/path] "
+        f"(differs in {n} field{'s' if n != 1 else ''}: {field_list}).\n"
+        f"  If you meant to resume that, revert those fields. Otherwise this is fine."
+    )
 
 
 def resume_or_init(
@@ -130,42 +215,6 @@ def resume_or_init(
         "best_val": ckpt.get("best_val", -1.0),
         "stale_validations": ckpt.get("stale_validations", 0),
     }
-
-
-def final_evaluation(
-    *,
-    model: nn.Module,
-    run_dir: str,
-    predict_fn: Callable[["RstTree"], "RstTree"],
-    dev_pairs: list[tuple[str, "RstTree"]],
-    val_metric_name: str,
-    best_val: float,
-    test_pairs: list[tuple[str, "RstTree"]] | None = None,
-) -> None:
-    """Reload `{run_dir}/best_model.pt` if present, re-evaluate, and print results.
-    Always reports dev; reports test too when `test_pairs` is given. Falls back to
-    printing the recorded best metric if no best checkpoint exists."""
-    rule("Final Evaluation")
-    best_path = os.path.join(run_dir, "best_model.pt")
-    if not os.path.exists(best_path):
-        success(f"Training complete. Best {val_metric_name}: {best_val:.4f}")
-        return
-    ckpt = torch.load(best_path, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    dev_metrics = evaluate(
-        predict_fn,
-        dev_pairs,
-        output_dir=os.path.join(run_dir, "dev_predictions", "final"),
-    )
-    console.print(metrics_table(dev_metrics, title="Final Dev Results"))
-    if test_pairs is not None:
-        test_metrics = evaluate(
-            predict_fn,
-            test_pairs,
-            output_dir=os.path.join(run_dir, "test_predictions", "final"),
-        )
-        console.print(metrics_table(test_metrics, title="Final Test Results"))
 
 
 def build_optimizer(
@@ -220,7 +269,12 @@ def make_scheduler(optimizer, warmup_steps: int, total_steps: int):
 
 
 def save_checkpoint(path: str, model: nn.Module, optimizer, scheduler, **extra) -> None:
-    """Save model + training state. Caller passes any other state (config, step, etc.) via **extra."""
+    """Save model + training state. Caller passes any other state (config, step, etc.) via **extra.
+
+    Also writes a `<path>.json` sidecar with the scalar `extra` fields, so
+    list-style tools (e.g. `python -m iudex runs list`) can read run metadata
+    without `torch.load`-ing the full checkpoint.
+    """
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -230,68 +284,34 @@ def save_checkpoint(path: str, model: nn.Module, optimizer, scheduler, **extra) 
         },
         path,
     )
+    sidecar = {k: v for k, v in extra.items() if k != "config" and isinstance(v, (int, float, str, bool))}
+    sidecar_path = (path[:-3] if path.endswith(".pt") else path) + ".json"
+    with open(sidecar_path, "w", encoding="utf-8") as f:
+        json.dump(sidecar, f, indent=2)
 
 
 def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | None:
-    """Return the checkpoint dict iff it exists and its config_hash matches; otherwise None."""
+    """Return the checkpoint dict iff it exists and its config_hash matches; otherwise None.
+
+    A mismatch indicates a hand-copied `last.pt` or a checkpoint left behind
+    by a previous hash scheme; we warn loudly so the user can stop us before
+    we overwrite it.
+    """
     if not os.path.exists(checkpoint_path):
         return None
     ckpt = torch.load(checkpoint_path, weights_only=False)
-    if ckpt.get("config_hash") != expected_hash:
-        logger.info("Config hash mismatch; starting fresh")
+    found_hash = ckpt.get("config_hash")
+    if found_hash != expected_hash:
+        warn(
+            f"Config hash mismatch on [path]{checkpoint_path}[/path] "
+            f"(checkpoint={found_hash!r}, expected={expected_hash!r}). "
+            f"Starting fresh — this run will overwrite the existing last.pt."
+        )
         return None
     console.print(
         f"[bold cyan]Resuming[/bold cyan] from step {ckpt.get('global_step', '?')}, epoch {ckpt.get('epoch', '?')}"
     )
     return ckpt
-
-
-def metrics_table(metrics: dict[str, float], title: str) -> Table:
-    table = Table(title=title, show_header=True, header_style="bold cyan", padding=(0, 1))
-    table.add_column("Metric", style="dim")
-    table.add_column("F1", justify="right", style="bold green")
-    for name in ["span", "nuc", "rel", "full"]:
-        table.add_row(name.upper(), f"{metrics[f'{name}_f1']:.4f}")
-    return table
-
-
-@torch.no_grad()
-def evaluate(
-    predict_fn: Callable[[RstTree], RstTree],
-    dev_pairs: list[tuple[str, RstTree]],
-    output_dir: str | None = None,
-) -> dict[str, float]:
-    """Run `predict_fn` over each (path, gold_tree) pair and report Parseval F1s.
-
-    Caller is responsible for setting the underlying model to eval mode if applicable.
-    If `output_dir` is given, write predicted .rs4 files keyed by the input filename stem.
-    """
-    if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
-
-    totals = {f"{m}_{x}_count": 0 for m in ["span", "nuc", "rel", "full"] for x in ["p", "r"]}
-    totals["num_spans"] = 0
-
-    for filepath, gold in dev_pairs:
-        pred = predict_fn(gold)
-        m = compute_parseval_metrics(gold, pred)
-        for k in totals:
-            totals[k] += m[k]
-        if output_dir is not None:
-            basename = os.path.splitext(os.path.basename(filepath))[0] + ".rs4"
-            with open(os.path.join(output_dir, basename), "w", encoding="utf-8") as f:
-                f.write(pred.to_rs4_string())
-
-    n = totals["num_spans"]
-    if n == 0:
-        return {f"{m}_f1": 0.0 for m in ["span", "nuc", "rel", "full"]}
-
-    def f1(p, r):
-        return (2 * p * r) / (p + r) if (p + r) > 0 else 0.0
-
-    return {
-        f"{m}_f1": f1(totals[f"{m}_p_count"] / n, totals[f"{m}_r_count"] / n) for m in ["span", "nuc", "rel", "full"]
-    }
 
 
 def make_progress_bar() -> Progress:

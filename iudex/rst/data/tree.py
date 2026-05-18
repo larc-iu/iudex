@@ -80,7 +80,7 @@ class RstTree:
         self._relation_types = relation_types
         # Applied at output boundary (parsing_actions, relation_of, etc.) so
         # that binarization / multinuc-vs-satellite disambiguation — which key
-        # off relation-name distinctness — see the raw labels.
+        # off relation-name distinctness — sees the raw labels.
         self._relation_map = relation_map
 
         has_parent = set()
@@ -179,15 +179,15 @@ class RstTree:
                 if len(current_edges) == 1:
                     continue
                 # 1 nucleus (relname='span') + N satellites with distinct relations
-                # is valid RST. This is not done in GUM, but there are instances of
-                # it in RST-DT.
-                # Emit one satellite per action, outermost-first, so the `spans()`
-                # `bounds` accumulator narrows each successive emit's enclosing range
-                # and the model sees a distinct gold split for each.
+                # is valid RST (rare in GUM, present in RST-DT). Emit one satellite
+                # per action, outermost-first, so the `spans()` `bounds` accumulator
+                # narrows each successive emit's enclosing range and the model sees
+                # a distinct gold split for each.
                 satellite_edges = [e for e in current_edges if e.relation != "span"]
                 if len(satellite_edges) > 1:
                     nucleus_edge = next(e for e in current_edges if e.relation == "span")
                     nucleus_yield = edu_yields[nucleus_edge.target]
+
                     def dist_to_nucleus(edge):
                         y = edu_yields[edge.target]
                         if y[-1] < nucleus_yield[0]:
@@ -195,6 +195,7 @@ class RstTree:
                         if y[0] > nucleus_yield[-1]:
                             return y[0] - nucleus_yield[-1]
                         return 0
+
                     satellite_edges = sorted(satellite_edges, key=dist_to_nucleus, reverse=True)
                 for edge in satellite_edges:
                     handle_satellite(sequence, edge, edu_yield)
@@ -252,9 +253,14 @@ class RstTree:
         header = E("header", *[relations])
         body_children = []
         for edu in self.edus:
-            body_children.append(
-                E("segment", edu.text, id=edu.id, parent=self.parent_of(edu.id), relname=self.relation_of(edu.id))
-            )
+            parent = self.parent_of(edu.id)
+            relname = self.relation_of(edu.id)
+            # Omit parent/relname when None (single-EDU case, where the EDU is
+            # itself the root): lxml's ElementMaker rejects None-valued attrs.
+            if parent is not None:
+                body_children.append(E("segment", edu.text, id=edu.id, parent=parent, relname=relname))
+            else:
+                body_children.append(E("segment", edu.text, id=edu.id))
         for node in self.nonterminals:
             parent = self.parent_of(node.id)
             relname = self.relation_of(node.id)
@@ -269,9 +275,7 @@ class RstTree:
                     )
                 )
             else:
-                body_children.append(
-                    E("group", id=node.id, type=("multinuc" if node.type == "multinuc" else "span"))
-                )
+                body_children.append(E("group", id=node.id, type=("multinuc" if node.type == "multinuc" else "span")))
         body = E("body", *body_children)
         root = E("rst", *[header, body])
         return ET.tostring(root, encoding="utf-8", pretty_print=True).decode("utf-8")
@@ -417,9 +421,7 @@ def binarize_tree(nodes, edges):
         child_edges = edge_index[n.id]
         edge_labels = sorted(list(Counter([e.relation for e in child_edges]).items()), key=lambda x: -x[1])
         if len(edge_labels) > 2:
-            logger.warning(
-                f"Multinuc node at {n.id} has more than two relation types: {edge_labels}."
-            )
+            logger.warning(f"Multinuc node at {n.id} has more than two relation types: {edge_labels}.")
         if len(edge_labels) == 2 and edge_labels[1][1] != 1:
             logger.warning(
                 f"Multinuc node at {n.id} has two relation types, of which one does not occur exactly once: {edge_labels}."

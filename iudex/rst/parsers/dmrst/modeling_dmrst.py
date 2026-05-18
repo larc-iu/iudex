@@ -96,9 +96,7 @@ class _Segmenter(nn.Module):
     Trains as a binary token-tagger that fires at EDU **end** positions. The class
     weight on the positive label is typically upweighted (as large as ~10x) since
     end-of-EDU tokens are rare. An optional second head can also be trained to
-    fire at EDU **start** positions (section 3.1.1 of paper describes a 3-class
-    B/I/E head, but the model implementation uses these two binary heads instead,
-    and that's what we mirror).
+    fire at EDU **start** positions.
     """
 
     def __init__(self, hidden_size: int, pos_weight: float, dropout: float = 0.5, start_loss: bool = False):
@@ -144,10 +142,10 @@ class _Segmenter(nn.Module):
 
         Returns:
             Sorted, deduped list of inclusive end indices. The last token is
-            always forced to be a break so the final EDU is closed. We dedupe
-            because argmax can fire on `last` independently of the force-append,
-            and a duplicate would yield an empty (prev, end+1) interval downstream
-            that NaNs out the per-EDU mean.
+            always forced to be a break so the final EDU is closed. Dedupe is
+            needed because argmax can fire on `last` independently of the
+            force-append, and a duplicate would yield an empty (prev, end+1)
+            interval downstream that NaNs out the per-EDU mean.
         """
         logits = self.linear(embeddings)
         preds = logits.argmax(-1).tolist()
@@ -161,12 +159,12 @@ class _Segmenter(nn.Module):
 class DMRSTParser(nn.Module):
     """An end-to-end RST parser including its own segmenter.
 
-    With `joint_segmentation=True`, a per-token EDU-boundary head trains
-    alongside the parser and enables raw-text inference via `predict_from_text`.
+    When `cfg.segmentation` is non-null, a per-token EDU-boundary head trains
+    alongside the parser and `predict_from_text` becomes available.
 
     Training (`forward`) is teacher-forced and returns the split, label, and
     segmentation losses separately so the trainer can apply dynamic loss
-    weighting. `loss` is their unweighted sum for non-DLW callers.
+    weighting; `loss` is their unweighted sum.
     """
 
     def __init__(self, config: DMRSTConfig):
@@ -177,7 +175,6 @@ class DMRSTParser(nn.Module):
 
         self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(config.model_name)
 
-        # Optional freezing of embeddings and early encoder layers.
         if config.freeze_embeddings:
             for p in self.encoder.embeddings.parameters():
                 p.requires_grad = False
@@ -221,17 +218,47 @@ class DMRSTParser(nn.Module):
         self.segmenter = (
             _Segmenter(
                 hidden_size,
-                pos_weight=config.seg_pos_weight,
+                pos_weight=config.segmentation.pos_weight,
                 dropout=config.encoder_dropout,
-                start_loss=config.seg_start_loss,
+                start_loss=config.segmentation.start_loss,
             )
-            if config.joint_segmentation
+            if config.segmentation is not None
             else None
         )
 
     @property
     def device(self):
         return next(self.parameters()).device
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        repo_or_path: str,
+        *,
+        device: str | torch.device | None = None,
+        revision: str | None = None,
+        cache_dir: str | None = None,
+        token: str | bool | None = None,
+    ) -> "DMRSTParser":
+        """Load from a HuggingFace Hub repo id, a local run dir, or a `.pt` file.
+
+        See `iudex.rst.parsers.hfhub.load_parser_from_pretrained` for the
+        full resolution rules (including how Hub vs. local paths are detected).
+        """
+        from iudex.rst.parsers.hfhub import load_parser_from_pretrained
+
+        dev = (
+            torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        return load_parser_from_pretrained(
+            repo_or_path,
+            parser_cls=cls,
+            config_cls=DMRSTConfig,
+            device=dev,
+            revision=revision,
+            cache_dir=cache_dir,
+            token=token,
+        )
 
     def _encode(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full encoder pass using gold EDU segmentation.
@@ -250,7 +277,7 @@ class DMRSTParser(nn.Module):
 
         if self.segmenter is not None and self.training:
             # End token (inclusive) of each gold EDU. Segmenter operates on the
-            # layer-normed embeddings BEFORE dropout (matches the original implementation).
+            # layer-normed embeddings BEFORE dropout.
             edu_ends = [end - 1 for _, end in edu_mapping]
             seg_loss = self.segmenter.loss(normed, edu_ends)
         else:
@@ -280,23 +307,22 @@ class DMRSTParser(nn.Module):
             edu_reprs:    [num_edus, hidden_size]
             decoder_init: [1, 1, hidden_size]
         """
-        # [1, num_edus, hidden_size]--note the unsqueeze to get the shape the GRU is expecting
+        # [1, num_edus, hidden_size] — unsqueeze gives the batch dim the GRU expects.
         avg_edu_reprs = torch.stack([embeddings[b:e].mean(0) for b, e in edu_mapping]).unsqueeze(0)
 
-        # Document-level BiGRU over averaged EDUs. Note that we need to unsqueeze
         # gru_out:    [1, num_edus, hidden_size]
         # gru_hidden: [num_layers * num_directions, 1, hidden_size // 2]   (= [4, 1, H/2])
         gru_out, gru_hidden = self.doc_gru(avg_edu_reprs)
 
-        # We want the decoder's initial state to be the BiGRU's top-layer final
-        # hidden state, with the two directions concatenated. Build it in three steps:
+        # Decoder's initial state = BiGRU's top-layer final hidden state, with
+        # the two directions concatenated:
         H = self.encoder.config.hidden_size
         # 1. Split the packed first dim into (layer, direction): [2, 2, 1, H/2].
-        #    nn.GRU's convention is layers-outer, directions-inner, so this view is safe.
+        #    nn.GRU's convention is layers-outer, directions-inner.
         gru_hidden = gru_hidden.view(2, 2, 1, H // 2)
-        # 2. Keep only the top layer (index -1) -> [num_directions=2, batch=1, H/2].
+        # 2. Keep only the top layer -> [num_directions=2, batch=1, H/2].
         gru_hidden = gru_hidden[-1]
-        # 3. Put batch first, then flatten the two directions into one hidden dim
+        # 3. Batch first, then flatten the two directions into one hidden dim
         #    of size 2 * (H/2) = H. Result: [num_decoder_layers=1, batch=1, H].
         decoder_init = gru_hidden.transpose(0, 1).reshape(1, 1, H).contiguous()
 
@@ -377,7 +403,7 @@ class DMRSTParser(nn.Module):
             # One decoder step per span. The input (mean of the span's EDUs)
             # grounds the GRU in "what I'm deciding about now"; the carried
             # hidden state grounds it in "what I've decided so far". The
-            # output is then used as the query for pointer attention below.
+            # output becomes the query for pointer attention below.
             decoder_input = edu_reprs[b:e].mean(0, keepdim=True).unsqueeze(0)
             decoder_output, decoder_hidden = self.decoder(decoder_input, decoder_hidden)
 
@@ -385,7 +411,7 @@ class DMRSTParser(nn.Module):
             gold_label_idx = self.label_index.index(gold_label_str)
 
             if e - b == 2:
-                # Only one possible split — skip pointer loss, use the two EDUs directly.
+                # Only one possible split; skip pointer loss, use the two EDUs directly.
                 input_left = edu_reprs[b].unsqueeze(0)
                 input_right = edu_reprs[b + 1].unsqueeze(0)
             else:
@@ -398,7 +424,7 @@ class DMRSTParser(nn.Module):
                 input_left, input_right = self._build_label_inputs(edu_reprs, b, e, gold_split)
 
                 # Push right then left so left pops first — DFS left-first matches
-                # the order in which the sequential decoder should see decisions.
+                # the order in which the sequential decoder sees decisions.
                 if e - gold_split > 1:
                     stack.append((gold_split, e))
                 if gold_split - b > 1:
@@ -423,8 +449,6 @@ class DMRSTParser(nn.Module):
         decoder_hidden: torch.Tensor,
     ) -> list[tuple[int, str, str]]:
         """Greedy top-down decode given precomputed EDU reprs and decoder init.
-
-        Shared between the gold-EDU and predicted-EDU prediction paths.
 
         Args:
             edu_reprs:      [num_edus, hidden_size]
@@ -478,16 +502,18 @@ class DMRSTParser(nn.Module):
     def predict_from_text(self, text: str) -> RstTree:
         """End-to-end inference from raw document text.
 
-        Requires `joint_segmentation=True` in the config so the model has a
-        trained segmenter to predict EDU boundaries.
+        Requires `cfg.segmentation` to be non-null so the model has a trained
+        segmenter to predict EDU boundaries.
         """
         if self.segmenter is None:
-            raise RuntimeError("predict_from_text requires joint_segmentation=True")
+            raise RuntimeError("predict_from_text requires `cfg.segmentation` to be non-null")
         self.eval()
 
         ids = self.tokenizer.encode(text, add_special_tokens=False)
         if len(ids) == 0:
-            return RstTree.from_parsing_actions([], [], relation_types=self.config.relation_types)
+            # A 0-EDU tree is unconstructible (`RstTree.__init__` requires
+            # exactly one root). Single-EDU is handled below.
+            raise ValueError("predict_from_text: input text tokenized to zero tokens")
         input_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
         embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(embeddings.float())
@@ -516,9 +542,8 @@ class DMRSTParser(nn.Module):
     def predict_both(self, tree: RstTree) -> dict[str, Any]:
         """Single encoder pass yielding both the gold-EDU and end-to-end predictions.
 
-        Used by dev evaluation when joint segmentation is enabled, to avoid two
-        encoder passes per dev tree. When `self.segmenter is None`, only the
-        gold-EDU keys are populated and the e2e keys are `None`.
+        When `self.segmenter is None`, only the gold-EDU keys are populated and
+        the e2e keys are `None`.
 
         Returns:
             {

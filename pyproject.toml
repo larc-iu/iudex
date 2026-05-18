@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "iudex"
@@ -11,10 +11,14 @@ requires-python = ">=3.10"
 dependencies = [
     "torch",
     "transformers",
+    "huggingface_hub",
     "tonga-config",
     "lxml",
     "rich",
 ]
+
+[project.scripts]
+iudex = "iudex.__main__:main"
 
 [project.optional-dependencies]
 dev = ["ruff"]

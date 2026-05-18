@@ -5,6 +5,10 @@ from typing import Any
 import torch
 from transformers import AutoModel, AutoTokenizer
 
+# Tokenizers report `model_max_length = int(1e30)` when they have no advertised
+# limit (e.g. SpanBERT). Treat anything above this sentinel as "unspecified".
+_TOKENIZER_MAX_LEN_SENTINEL = 1_000_000
+
 
 def load_encoder_and_tokenizer(model_name: str) -> tuple[torch.nn.Module, Any, int]:
     """Load a BERT-style HF encoder + tokenizer and return (encoder, tokenizer, max_length).
@@ -13,6 +17,13 @@ def load_encoder_and_tokenizer(model_name: str) -> tuple[torch.nn.Module, Any, i
     dtype, and many HF checkpoints (e.g. SpanBERT) are fp16, which makes AdamW
     updates NaN immediately. Raises if the tokenizer lacks CLS/SEP, since the
     striding encoder relies on both.
+
+    `max_length` is the largest input length (inclusive of special tokens) the
+    encoder can safely accept. We trust `tokenizer.model_max_length` when set
+    (modern checkpoints report the correct usable cap with any RoBERTa-style
+    padding offset already baked in); when unset, fall back to
+    `cfg.max_position_embeddings` (this path is only taken by BERT-family
+    checkpoints like SpanBERT, where no padding offset applies).
     """
     encoder = AutoModel.from_pretrained(model_name).float()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -21,7 +32,11 @@ def load_encoder_and_tokenizer(model_name: str) -> tuple[torch.nn.Module, Any, i
             f"Tokenizer for {model_name!r} lacks cls_token and/or sep_token; "
             f"this parser only supports BERT-style encoders."
         )
-    return encoder, tokenizer, encoder.config.max_position_embeddings
+
+    max_length = tokenizer.model_max_length
+    if max_length > _TOKENIZER_MAX_LEN_SENTINEL:
+        max_length = encoder.config.max_position_embeddings
+    return encoder, tokenizer, max_length
 
 
 def tokenize_edus(

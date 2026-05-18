@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import json
 import logging
 import math
 import os
@@ -11,12 +12,11 @@ import torch
 from tonga import Params
 
 from iudex.common.log import console, dim, rule, setup_logging, success, warn
+from iudex.rst.data.metrics import evaluate_parseval, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
+from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
+from iudex.rst.data.tree import RstTree
 from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
-from iudex.rst.parsers.dmrst.evaluation import (
-    dmrst_metrics_table,
-    evaluate_dmrst,
-)
 from iudex.rst.parsers.dmrst.modeling_dmrst import DMRSTParser
 from iudex.rst.training import (
     build_optimizer,
@@ -31,10 +31,62 @@ from iudex.rst.training import (
     schedule_panel,
     set_seeds,
     try_resume,
+    write_run_config,
 )
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+def _write_rs4(tree: RstTree, output_dir: str, basename: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, basename), "w", encoding="utf-8") as f:
+        f.write(tree.to_rs4_string())
+
+
+@torch.no_grad()
+def _evaluate_on_dev(
+    model: DMRSTParser,
+    dev_pairs: list[tuple[str, RstTree]],
+    output_dir: str | None = None,
+) -> dict[str, float]:
+    """Run the model over `dev_pairs` and aggregate Parseval (+ seg + e2e when
+    joint segmentation is on). One encoder pass per tree via `predict_both`."""
+    use_seg = model.segmenter is not None
+    gold_trees: list[RstTree] = []
+    gold_preds: list[RstTree] = []
+    seg_data: list[dict] | None = [] if use_seg else None
+    for filepath, gold in dev_pairs:
+        basename = os.path.splitext(os.path.basename(filepath))[0] + ".rs4"
+        gold_trees.append(gold)
+        if not use_seg:
+            pred = model.predict(gold)
+            gold_preds.append(pred)
+            if output_dir is not None:
+                _write_rs4(pred, output_dir, basename)
+            continue
+        both = model.predict_both(gold)
+        gold_preds.append(both["gold_pred"])
+        seg_data.append(
+            {
+                k: both[k]
+                for k in (
+                    "gold_edu_ends",
+                    "pred_edu_ends",
+                    "e2e_pred",
+                    "gold_edu_mapping",
+                    "pred_edu_mapping",
+                )
+            }
+        )
+        if output_dir is not None:
+            _write_rs4(both["gold_pred"], os.path.join(output_dir, "gold"), basename)
+            if both["e2e_pred"] is not None:
+                _write_rs4(both["e2e_pred"], os.path.join(output_dir, "e2e"), basename)
+    metrics = evaluate_parseval(gold_trees, gold_preds)
+    if seg_data is not None:
+        metrics.update(evaluate_seg_and_e2e(gold_trees, seg_data))
+    return metrics
 
 
 def train(cfg: DMRSTConfig) -> None:
@@ -51,21 +103,23 @@ def train(cfg: DMRSTConfig) -> None:
     automatically (DLW state is restored from the checkpoint when present).
     """
     set_seeds(cfg.seed)
+
+    run_dir, cfg_hash = prepare_run_dir(dataclasses.asdict(cfg), cfg.checkpoint_dir, cfg.run_name)
+
     if cfg.relation_map is not None:
         dim(f"Applying `relation_map` ({len(cfg.relation_map)} entries) to all read trees.")
-    if cfg.relation_types is None:
-        cfg.relation_types = infer_relation_types([cfg.train_dir, cfg.dev_dir], relation_map=cfg.relation_map)
-        dim(
-            f"Inferred {len(cfg.relation_types)} (relation, kind) pairs from "
-            f"{cfg.train_dir} + {cfg.dev_dir}"
-            + (" (after relation_map)." if cfg.relation_map is not None else ".")
-            + " See Config panel below for the full list."
-        )
-    else:
-        dim(f"Using explicit `relation_types` from config ({len(cfg.relation_types)} pairs).")
+    cfg.relation_types = infer_relation_types([cfg.train_dir, cfg.dev_dir], relation_map=cfg.relation_map)
+    dim(
+        f"Inferred {len(cfg.relation_types)} (relation, kind) pairs from "
+        f"{cfg.train_dir} + {cfg.dev_dir}"
+        + (" (after relation_map)." if cfg.relation_map is not None else ".")
+        + " See Config panel below for the full list."
+    )
 
+    # Resolved cfg_dict (post-inference) is written to the audit config.json,
+    # embedded in the .pt, and uploaded to the Hub.
     cfg_dict = dataclasses.asdict(cfg)
-    run_dir, cfg_hash = prepare_run_dir(cfg_dict, cfg.checkpoint_dir, cfg.run_name)
+    write_run_config(run_dir, cfg_dict)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DMRSTParser(cfg).to(device)
@@ -104,14 +158,9 @@ def train(cfg: DMRSTConfig) -> None:
     )
     scheduler = make_scheduler(optimizer, warmup, total_steps)
 
-    # DLW state — `loss_history` keeps the per-component losses from recent
-    # optimizer steps (only the last 3 are needed; older entries are dropped).
-    # `weights` are the coefficients applied to the current step's forward;
-    # they are recomputed at the end of each step from the ratio of the two
-    # most-recent stored step-losses (paper §3.2 / original `Training.py`):
-    # `r_k = L_k(t-1) / L_k(t-2)` so weights at step t use steps t-1 and t-2.
-    # Components are `split` + `label`, plus `seg` when joint segmentation is on.
-    components = ["split", "label"] + (["seg"] if cfg.joint_segmentation else [])
+    # DLW (paper §3.2): weights at step t are `r_k = L_k(t-1) / L_k(t-2)`,
+    # so we keep the last 3 per-component step losses.
+    components = ["split", "label"] + (["seg"] if cfg.segmentation is not None else [])
     loss_history = {k: [] for k in components}
     curr_sums = {k: 0.0 for k in components}
     weights = {k: 1.0 for k in components}
@@ -157,8 +206,8 @@ def train(cfg: DMRSTConfig) -> None:
         nonlocal best_val, stale
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         model.eval()
-        metrics = evaluate_dmrst(model, dev_pairs, output_dir=pred_dir)
-        console.print(dmrst_metrics_table(metrics, title=f"Dev @ step {global_step}"))
+        metrics = _evaluate_on_dev(model, dev_pairs, output_dir=pred_dir)
+        console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
         score = metrics[cfg.val_metric_name]
         if score > best_val:
             best_val = score
@@ -227,18 +276,17 @@ def train(cfg: DMRSTConfig) -> None:
                 global_step += 1
                 epoch_step += 1
 
-                # Dynamic loss weighting (lagged ratio per paper §3.2 / original implementation).
-                # Store this step's component losses, then — once we have at least 3
-                # stored — compute next step's weights from `r = list[-1] / list[-2]`,
-                # i.e. the ratio of the two most-recent step losses. Effectively no
-                # adaptation occurs before step 4, matching the original `> 2` guard.
-                if cfg.dlw_enabled:
+                # Dynamic loss weighting (paper §3.2, lagged ratio). Store this
+                # step's component losses, then — once we have at least 3
+                # stored — compute next step's weights from `r = list[-1] / list[-2]`.
+                # Adaptation effectively begins at step 4.
+                if cfg.dlw is not None:
                     for k in components:
                         loss_history[k].append(curr_sums[k])
                         if len(loss_history[k]) > 3:
                             loss_history[k] = loss_history[k][-3:]
                     if len(loss_history[components[0]]) > 2:
-                        temperature = cfg.dlw_temperature
+                        temperature = cfg.dlw.temperature
                         num_components = len(components)
                         expw = {
                             k: math.exp((loss_history[k][-1] / max(loss_history[k][-2], 1e-8)) / temperature)
@@ -263,10 +311,10 @@ def train(cfg: DMRSTConfig) -> None:
                 )
 
                 if epoch_step % cfg.log_every == 0:
-                    mem_log = f"  mem=[dim]{mem[0]:.1f}/{mem[1]:.1f}GB[/dim]" if mem else ""
+                    mem_log = f"  mem=[dim]{mem[1]:.1f}GB[/dim]" if mem else ""
                     w_log = (
                         "  w=[dim]" + "/".join(f"{weights[k]:.2f}" for k in components) + "[/dim]"
-                        if cfg.dlw_enabled
+                        if cfg.dlw is not None
                         else ""
                     )
                     progress.console.print(
@@ -306,19 +354,25 @@ def train(cfg: DMRSTConfig) -> None:
         checkpoint = torch.load(best_path, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
-        dev_m = evaluate_dmrst(
+        dev_m = _evaluate_on_dev(
             model,
             dev_pairs,
             output_dir=os.path.join(run_dir, "dev_predictions", "final"),
         )
-        console.print(dmrst_metrics_table(dev_m, title="Final Dev Results"))
+        console.print(metrics_table(dev_m, title="Final Dev Results"))
+        final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
         if test_pairs is not None:
-            test_m = evaluate_dmrst(
+            test_m = _evaluate_on_dev(
                 model,
                 test_pairs,
                 output_dir=os.path.join(run_dir, "test_predictions", "final"),
             )
-            console.print(dmrst_metrics_table(test_m, title="Final Test Results"))
+            console.print(metrics_table(test_m, title="Final Test Results"))
+            final_metrics["test"] = test_m
+        # Sidecar for downstream tools (e.g. hub.py model card) so they don't
+        # need to torch.load the checkpoint just to read corpus-level numbers.
+        with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(final_metrics, f, indent=2)
     else:
         success(f"Training complete. Best {cfg.val_metric_name}: {best_val:.4f}")
 

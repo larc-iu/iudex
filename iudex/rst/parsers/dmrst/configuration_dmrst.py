@@ -1,24 +1,46 @@
 from dataclasses import dataclass
 
+from tonga import FromParams
+
 from iudex.rst.parsers.common.config import parse_config_dict
 
 
 @dataclass
-class DMRSTConfig:
+class _SegmentationConfig(FromParams):
+    """Joint per-token EDU-boundary head. Presence of this sub-config on
+    `DMRSTConfig` is itself the "enabled" signal; set `segmentation: null`
+    in jsonnet to disable joint segmentation (and lose `predict_from_text`).
+    """
+
+    pos_weight: float = 10.0  # class weight on the positive (EDU-end) label
+    start_loss: bool = False  # second binary head for EDU starts
+
+
+@dataclass
+class _DLWConfig(FromParams):
+    """Dynamic loss weighting (paper §3.2). Presence on `DMRSTConfig`
+    enables DLW; `dlw: null` falls back to unweighted sum of component losses.
+    """
+
+    temperature: float = 2.0
+
+
+@dataclass
+class DMRSTConfig(FromParams):
     train_dir: str
     dev_dir: str
     # Optional held-out test split. If set, final evaluation runs on both
     # dev and test after the dev table; if null, only dev is reported.
     test_dir: str | None = None
 
-    # If null, the trainer infers the inventory from (relation, nuclearity)
-    # pairs observed in train_dir + dev_dir.
+    # Populated at training time by inferring (relation, nuclearity) pairs
+    # from train_dir + dev_dir; not user-configurable. Persists in the
+    # checkpointed config so predict/from_pretrained know the label space.
     relation_types: list[tuple[str, str]] | None = None
 
     # Optional fine→coarse relation remap applied by the reader. When set,
     # every non-"span" relname in the data must be a key (missing keys raise).
-    # `relation_types` (if inferred) and the model's label space are in the
-    # mapped space.
+    # `relation_types` and the model's label space are in the mapped space.
     relation_map: dict[str, str] | None = None
 
     # Model
@@ -33,27 +55,26 @@ class DMRSTConfig:
     doc_gru_dropout: float = 0.2
     # How to pool the EDUs of each child of a split into the single vector fed
     # to the label classifier:
-    #   "mean":     average of all EDU representations in the child (paper default)
-    #   "last_edu": the last EDU representation in the child (single-EDU edge stand-in)
+    #   "mean":     average of all EDU representations in the child
+    #   "last_edu": the last EDU representation in the child
     # The two collapse to the same thing for a 2-EDU span (split is forced, each
     # child has exactly one EDU).
     label_input_pooling: str = "mean"
-    # Freezing embeddings and first n layers of the encoder.
-    # Original implementation freezes embeddings and first 3 layers.
     freeze_embeddings: bool = True
     freeze_encoder_layers: int = 3
 
-    # Joint EDU segmentation (cf. section 3.1.1 of paper). When True, training adds
-    # a per-token binary classification loss over EDU end positions, and
-    # `predict_from_text` is available for raw-text → tree inference.
-    joint_segmentation: bool = True
-    seg_pos_weight: float = 10.0  # class weight on the positive (EDU-end) label
-    seg_start_loss: bool = False  # add a second binary head for EDU starts
+    # Joint EDU segmentation (paper §3.1.1). When non-null, training adds a
+    # per-token binary classification loss over EDU end positions and
+    # `predict_from_text` is available for raw-text inference.
+    segmentation: _SegmentationConfig | None = None
+
+    # Dynamic loss weighting (paper §3.2). Set to `null` for unweighted sum.
+    dlw: _DLWConfig | None = None
 
     # Training
     lr: float = 1e-4
     encoder_lr: float | None = 2e-5
-    max_epochs: int = 100
+    max_epochs: int = 50
     grad_accum: int = 3
     patience: int = 10
     max_grad_norm: float = 5.0
@@ -66,10 +87,6 @@ class DMRSTConfig:
     run_name: str | None = None
     seed: int = 42
     val_metric_name: str = "span_f1"
-
-    # Dynamic loss weighting (paper §3.2)
-    dlw_enabled: bool = True
-    dlw_temperature: float = 2.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "DMRSTConfig":
