@@ -288,10 +288,15 @@ def train(cfg: DMRSTConfig) -> None:
                     if len(loss_history[components[0]]) > 2:
                         temperature = cfg.dlw.temperature
                         num_components = len(components)
-                        expw = {
-                            k: math.exp((loss_history[k][-1] / max(loss_history[k][-2], 1e-8)) / temperature)
-                            for k in components
+                        # Subtract max before exp for numerical stability: when one
+                        # component's loss collapses to near-zero, its ratio can
+                        # explode past `math.exp`'s domain (≈709). The constant
+                        # cancels in the softmax normalization below.
+                        exp_args = {
+                            k: (loss_history[k][-1] / max(loss_history[k][-2], 1e-8)) / temperature for k in components
                         }
+                        max_arg = max(exp_args.values())
+                        expw = {k: math.exp(exp_args[k] - max_arg) for k in components}
                         norm = sum(expw.values())
                         weights = {k: num_components * expw[k] / norm for k in components}
                 curr_sums = {k: 0.0 for k in components}
