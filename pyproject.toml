@@ -3,11 +3,32 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "IUDEX"
-version = "0.1.0"
+name = "larc-iudex"
+version = "0.1.0a1"
 description = "A collection of discourse parsers and associated code focused on readability and usability."
+readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [{name = "Luke Gessler", email = "lukegessler@gmail.com"}]
+keywords = [
+    "discourse parsing",
+    "rhetorical structure theory",
+    "RST",
+    "NLP",
+    "computational linguistics",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Linguistic",
+]
 dependencies = [
     "torch",
     "transformers",
@@ -15,13 +36,19 @@ dependencies = [
     "tonga-config",
     "lxml",
     "rich",
+    "sentencepiece",
 ]
+
+[project.urls]
+Homepage = "https://github.com/larc-iu/iudex"
+Repository = "https://github.com/larc-iu/iudex"
+Issues = "https://github.com/larc-iu/iudex/issues"
 
 [project.scripts]
 iudex = "iudex.__main__:main"
 
 [project.optional-dependencies]
-dev = ["ruff"]
+dev = ["ruff", "build", "twine"]
 
 [tool.setuptools.packages.find]
 include = ["iudex*"]

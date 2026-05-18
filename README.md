@@ -4,17 +4,52 @@ The ***I*ndiana *U*niversity *D*iscourse *EX*hibition** (IUDEX) is a collection 
 
 ## Setup
 
+For the latest release:
+
+```
+pip install larc-iudex
+```
+
+For the current state of `master`:
+
 ```
 pip install git+https://github.com/larc-iu/iudex
 ```
 
-or for development:
+Or for development:
 
 ```
+git clone https://github.com/larc-iu/iudex && cd iudex
 pip install -e .
 ```
 
-(PyPI deployment will come eventually.)
+Note that the command you will invoke is `iudex`, not `larc-iudex`.
+
+### Grabbing Example Configurations
+
+Model configurations required for training are not bundled with the package distributed via PyPI.
+
+To get them you may visit [the associated directory](https://github.com/larc-iu/iudex/tree/master/configs) and download the configurations you're interested in manually.
+
+If you want to grab all of them at once, you can use the command line like so:
+
+**bash / zsh / macOS / Linux:**
+
+```bash
+curl -fL https://github.com/larc-iu/iudex/archive/refs/heads/master.tar.gz \
+  | tar -xz --strip-components=1 --wildcards '*/configs'
+```
+
+**Windows PowerShell:**
+
+```powershell
+Invoke-WebRequest https://github.com/larc-iu/iudex/archive/refs/heads/master.zip -OutFile iudex.zip
+Expand-Archive iudex.zip -DestinationPath .
+Move-Item iudex-master/configs configs
+Remove-Item -Recurse -Force iudex-master, iudex.zip
+```
+
+Either leaves you with a local `configs/` directory you can edit and pass to `iudex … train configs/<name>.jsonnet`.
 
 ## Quick Start
 

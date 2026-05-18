@@ -8,3 +8,4 @@ scratch.py
 CLAUDE.md
 .claude
 *.egg-info/
+dist/
