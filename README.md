@@ -63,7 +63,7 @@ iudex topdown_biaffine train configs/topdown_biaffine_rstdt.jsonnet
 Note that `configs/topdown_biaffine_rstdt.jsonnet` is a configuration.
 You may either edit it directly or copy and modify it in a new location.
 
-## Configuration Hashes
+### Configuration Hashes
 
 Your configuration is used as the basis for a unique hash, which (by default) corresponds to a directory under `checkpoints/`.
 This hash is used for several purposes.
@@ -110,6 +110,9 @@ iudex topdown_biaffine predict \
     --output-dir out/ \
     --device cuda
 ```
+
+### Available Models
+All official IUDEX model releases are [tagged with `iudex` on the HuggingFace Hub](https://huggingface.co/models?other=iudex).
 
 ### Pushing Models to HF Hub
 You may host a trained model using each parser's `push` subcommand. 
