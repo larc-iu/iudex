@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+import signal
 from collections.abc import Sequence
 from typing import Any
 
@@ -79,6 +80,27 @@ def set_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
+
+
+def install_abort_handler():
+    """Replace SIGINT with a soft-abort: first Ctrl-C sets `flag.value = True`,
+    the second Ctrl-C restores the default handler so the user can still
+    hard-kill if the cleanup path hangs. Returns the flag object."""
+
+    class _Flag:
+        value = False
+
+    flag = _Flag()
+
+    def handler(signum, frame):
+        if flag.value:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            return
+        flag.value = True
+        console.print("\n[yellow]Abort received; finishing the current step and writing the best model.[/yellow]")
+
+    signal.signal(signal.SIGINT, handler)
+    return flag
 
 
 def gpu_mem_gb(device: torch.device) -> tuple[float, float] | None:

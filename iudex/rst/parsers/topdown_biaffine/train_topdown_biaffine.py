@@ -21,6 +21,7 @@ from iudex.rst.training import (
     config_panel,
     device_panel,
     gpu_mem_gb,
+    install_abort_handler,
     make_progress_bar,
     make_scheduler,
     model_panel,
@@ -164,6 +165,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
             dim(f"  No improvement ({stale}/{cfg.patience})")
         model.train()
 
+    aborted = install_abort_handler()
     training_complete = start_epoch >= cfg.max_epochs or stale >= cfg.patience
     if training_complete:
         reason = "max_epochs reached" if start_epoch >= cfg.max_epochs else "patience exhausted"
@@ -176,7 +178,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
     training_start = time.monotonic()
 
     for epoch in range(start_epoch, cfg.max_epochs):
-        if stale >= cfg.patience:
+        if stale >= cfg.patience or aborted.value:
             break
         trees = list(train_trees)
         rng.shuffle(trees)
@@ -243,7 +245,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
 
                 if cfg.validate_every and global_step % cfg.validate_every == 0:
                     _validate(epoch + 1)
-                    if stale >= cfg.patience:
+                    if stale >= cfg.patience or aborted.value:
                         break
 
                 if cfg.checkpoint_every and global_step % cfg.checkpoint_every == 0:
@@ -258,10 +260,10 @@ def train(cfg: TopdownBiaffineConfig) -> None:
             if not cfg.validate_every:
                 _validate(epoch + 1)
             _save(os.path.join(run_dir, "last.pt"), epoch + 1)
-            if stale >= cfg.patience:
+            if stale >= cfg.patience or aborted.value:
                 warn(f"\nEarly stopping after {cfg.patience} validations without improvement")
                 break
-        elif stale >= cfg.patience:
+        elif stale >= cfg.patience or aborted.value:
             warn(f"\nEarly stopping at step {global_step}")
             break
 
