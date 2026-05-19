@@ -9,7 +9,7 @@ Examples:
     python -m iudex topdown_biaffine predict --config configs/topdown_biaffine_rstdt.jsonnet \\
         --input data/test --output-dir out/
     python -m iudex dmrst predict --hub-id larc-iu/dmrst-rstdt-coarse \\
-        --input-text doc.txt --output-dir out/
+        --text-file doc.txt --output-dir out/
     python -m iudex dmrst push --config configs/dmrst_rstdt.jsonnet --repo-id larc-iu/dmrst-rstdt-coarse
     python -m iudex runs list
 

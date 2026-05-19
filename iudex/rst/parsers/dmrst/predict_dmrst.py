@@ -37,12 +37,19 @@ def main():
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--input", help="RS3/RS4 file or directory (uses gold EDU segmentation)")
     input_group.add_argument(
-        "--input-text",
-        help="Raw .txt file or directory of .txt (requires `cfg.segmentation` to be non-null)",
+        "--text-file",
+        dest="text_file",
+        help="Path to a raw .txt file or a directory of .txt files (requires `cfg.segmentation` to be non-null)",
     )
-    parser.add_argument("--output-dir", required=True)
+    input_group.add_argument(
+        "--text",
+        help="Inline raw text string; parsed tree is written to stdout as RS4",
+    )
+    parser.add_argument("--output-dir", help="Required unless --text is used")
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
+    if args.text is None and not args.output_dir:
+        parser.error("--output-dir is required when --input or --text-file is used")
 
     kind, source = resolve_source(
         args.config,
@@ -58,6 +65,17 @@ def main():
         model = load_parser_from_checkpoint(source, device, DMRSTConfig, DMRSTParser)
     console.print(f"[dim]Loaded model from[/dim] [path]{source}[/path]")
 
+    if args.text is not None:
+        if model.segmenter is None:
+            console.print(
+                "[bold red]This model has no segmenter[/bold red] — train with "
+                "a non-null `segmentation:` block in your jsonnet to use --text."
+            )
+            sys.exit(1)
+        pred = model.predict_from_text(args.text)
+        print(pred.to_rs4_string())
+        return
+
     os.makedirs(args.output_dir, exist_ok=True)
     if args.input is not None:
         if os.path.isdir(args.input):
@@ -68,13 +86,13 @@ def main():
         if model.segmenter is None:
             console.print(
                 "[bold red]This model has no segmenter[/bold red] — train with "
-                "a non-null `segmentation:` block in your jsonnet to use --input-text."
+                "a non-null `segmentation:` block in your jsonnet to use --text-file."
             )
             sys.exit(1)
-        if os.path.isdir(args.input_text):
-            paths = sorted(glob(str(Path(args.input_text) / "*.txt")))
+        if os.path.isdir(args.text_file):
+            paths = sorted(glob(str(Path(args.text_file) / "*.txt")))
         else:
-            paths = [args.input_text]
+            paths = [args.text_file]
 
     with Progress(
         SpinnerColumn("dots"),

@@ -25,6 +25,97 @@ pip install -e .
 
 Note that the command you will invoke is `iudex`, not `larc-iudex`.
 
+## Quick Start
+
+Parse a sample document end-to-end with a pretrained DMRST model pulled from the HuggingFace Hub. From the command line:
+
+```
+$ iudex dmrst predict \
+    --hub-id larc-iu/dmrst-gum-12.1.0 \
+    --text "Although the experiment was carefully designed, the results were inconclusive. We plan to repeat it tonight."
+<rst>
+  <relations><!-- ... --></relations>
+  <body>
+    <segment id="1" parent="2" relname="adversative-concession">Although the experiment was carefully # designed,</segment>
+    <segment id="2" parent="4" relname="span">the results were inconclusive.</segment>
+    <segment id="3" parent="5" relname="span">We plan to repeat it tonight.</segment>
+    <group id="4" type="span" parent="3" relname="adversative-antithesis"/>
+    <group id="5" type="span"/>
+  </body>
+</rst>
+```
+
+The parsed RS4 tree is printed to stdout.
+
+The same flow from Python:
+
+```python
+from iudex.rst.parsers.dmrst.modeling_dmrst import DMRSTParser
+parser = DMRSTParser.from_pretrained("larc-iu/dmrst-gum-12.1.0")
+tree = parser.predict_from_text(
+    "Although the experiment was carefully designed, "
+    "the results were inconclusive. "
+    "We plan to repeat it tonight."
+)
+print(tree.to_rs4_string())
+# <rst>
+#   <relations><!-- ... --></relations>
+#   <body>
+#     <segment id="1" parent="2" relname="adversative-concession">Although the experiment was carefully # designed,</segment>
+#     <segment id="2" parent="4" relname="span">the results were inconclusive.</segment>
+#     <segment id="3" parent="5" relname="span">We plan to repeat it tonight.</segment>
+#     <group id="4" type="span" parent="3" relname="adversative-antithesis"/>
+#     <group id="5" type="span"/>
+#   </body>
+# </rst>
+```
+
+`from_pretrained` accepts a Hub repo id, a local run directory, or a `.pt` path.
+Optional kwargs include `device`, `revision`, `cache_dir`, `token`.
+
+### Other Ways to Run Inference
+
+To identify a model on the command line, you may use a configuration file (`--config`), a PyTorch checkpoint (`--checkpoint`), or a HuggingFace Hub repository (`--hub-id`).
+
+To provide input, you may specify an inline string (`--text`), a path to a raw text file or directory (`--text-file`, for parsers which support this), or an RS3/RS4 file or directory with gold EDUs already supplied (`--input`).
+
+For `--text-file` and `--input`, results are written to `--output-dir` as `.rs4` files.
+
+```
+# From the Hub, end-to-end on a directory of .txt files:
+iudex dmrst predict \
+    --hub-id larc-iu/dmrst-gum-12.1.0 \
+    --text-file path/to/docs/ \
+    --output-dir out/ \
+    --device cuda
+
+# From an explicit checkpoint:
+iudex dmrst predict \
+    --checkpoint checkpoints/<run_id>/best_model.pt \
+    --text-file path/to/doc.txt \
+    --output-dir out/
+
+# From a trained run's config, parsing pre-segmented RS3/RS4 with gold EDUs:
+iudex topdown_biaffine predict \
+    --config configs/topdown_biaffine_rstdt.jsonnet \
+    --input data/rstdt/test \
+    --output-dir out/
+```
+
+### Available Models
+All official IUDEX model releases are [tagged with `iudex` on the HuggingFace Hub](https://huggingface.co/models?other=iudex).
+
+## Training
+
+To train a new top-down biaffine parser on RSTDT:
+
+```
+iudex topdown_biaffine train configs/topdown_biaffine_rstdt.jsonnet
+```
+
+Note that `configs/topdown_biaffine_rstdt.jsonnet` is a configuration.
+You may either edit it directly or copy and modify it in a new location.
+
 ### Grabbing Example Configurations
 
 Model configurations required for training are not bundled with the package distributed via PyPI.
@@ -51,18 +142,6 @@ Remove-Item -Recurse -Force iudex-master, iudex.zip
 
 Either leaves you with a local `configs/` directory you can edit and pass to `iudex … train configs/<name>.jsonnet`.
 
-## Quick Start
-
-### Training
-To train a new top-down biaffine parser on RSTDT:
-
-```
-iudex topdown_biaffine train configs/topdown_biaffine_rstdt.jsonnet
-```
-
-Note that `configs/topdown_biaffine_rstdt.jsonnet` is a configuration.
-You may either edit it directly or copy and modify it in a new location.
-
 ### Configuration Hashes
 
 Your configuration is used as the basis for a unique hash, which (by default) corresponds to a directory under `checkpoints/`.
@@ -84,40 +163,8 @@ $ iudex runs list
 └──────────────┴──────────┴──────────────────┴──────────────────────────────┴───────────────────────┴───────────┴──────┴──────────────────┘
 ```
 
-### Inference
-
-To identify a model, you may use a configuration file (`--config`), a PyTorch checkpoint (`--checkpoint`), or a HuggingFace Hub repository (`--hub-id`).
-
-To provide input, you may specify either an RS3/RS4 input file (`--input`) with gold EDUs already supplied, or (for parsers which support this) a plain text file (`--input-text`).
-Both arguments also support directories containing files of the appropriate type.
-Examples:
-
-```
-# From a trained run, parsing pre-segmented RS3/RS4:
-iudex topdown_biaffine predict \
-    --config configs/topdown_biaffine_rstdt.jsonnet \
-    --input data/rstdt/test \
-    --output-dir out/
-
-# From an explicit checkpoint, end-to-end on raw text:
-iudex topdown_biaffine predict \
-    --checkpoint checkpoints/<run_id>/best_model.pt \
-    --input-text path/to/doc.txt \
-    --output-dir out/
-
-# From the Hub:
-iudex topdown_biaffine predict \
-    --hub-id larc-iu/topdown_biaffine-rstdt-coarse \
-    --input-text path/to/doc.txt \
-    --output-dir out/ \
-    --device cuda
-```
-
-### Available Models
-All official IUDEX model releases are [tagged with `iudex` on the HuggingFace Hub](https://huggingface.co/models?other=iudex).
-
 ### Pushing Models to HF Hub
-You may host a trained model using each parser's `push` subcommand. 
+You may host a trained model using each parser's `push` subcommand.
 Each uploads `best_model.pt`, `config.json`, and an auto-generated `README.md` in a single commit:
 
 ```
@@ -126,21 +173,6 @@ iudex topdown_biaffine push \
     --repo-id larc-iu/topdown_biaffine-rstdt-coarse \
     [--private] [--message "..."] [--token $HF_TOKEN]
 ```
-
-## Programmatic API
-
-Beyond the CLI, you may also use IUDEX as a library:
-
-```python
-from iudex.rst.parsers.topdown_biaffine import TopdownBiaffineParser
-
-parser = TopdownBiaffineParser.from_pretrained("larc-iu/topdown_biaffine-rstdt-coarse")
-tree = parser.predict_from_text("Your document text here. Multiple sentences are fine.")
-print(tree.to_rs4_string())
-```
-
-`from_pretrained` accepts a Hub repo id, a local run directory, or a `.pt` path.
-Optional kwargs include `device`, `revision`, `cache_dir`, `token`.
 
 ## Citation
 

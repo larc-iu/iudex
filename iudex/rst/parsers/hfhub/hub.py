@@ -228,9 +228,7 @@ def _format_relation_labels(config: dict[str, Any]) -> str:
     distinct.sort()
 
     if relation_map is None:
-        descriptor = (
-            f"{len(distinct)} labels"
-        )
+        descriptor = f"{len(distinct)} labels"
     else:
         descriptor = (
             f"Mapped from an original label inventory with {len(relation_map)} items "
@@ -332,7 +330,7 @@ def render_model_card(
     if config.get("segmentation") is not None:
         predict_snippet = 'tree = parser.predict_from_text("Your document text here. Multiple sentences are fine.")'
         cli_snippet = (
-            f"python -m iudex {parser_kind} predict --hub-id {repo_id} --input-text <doc.txt> --output-dir out/"
+            f"python -m iudex {parser_kind} predict --hub-id {repo_id} --text-file <doc.txt> --output-dir out/"
         )
     else:
         predict_snippet = (
