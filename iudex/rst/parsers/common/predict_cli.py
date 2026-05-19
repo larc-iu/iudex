@@ -1,11 +1,5 @@
-"""Shared `iudex <parser> predict` CLI.
-
-Each parser's `predict_<name>.py` is a thin shim that calls `run_predict(name)`.
-Everything the predict CLI does is the same across parsers; the only
-per-parser knobs are the Config / Parser classes (looked up via the
-`PARSERS` registry) and whether `--text` / `--text-file` are exposed
-(`ParserSpec.supports_text`).
-"""
+"""Shared `iudex <parser> predict` CLI. Each parser's `predict_<name>.py`
+is a thin shim that calls `run_predict(name)`."""
 
 import argparse
 import logging

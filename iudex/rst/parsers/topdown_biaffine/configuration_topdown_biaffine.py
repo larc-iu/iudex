@@ -9,13 +9,10 @@ from iudex.rst.parsers.common.config import parse_config_dict
 class TopdownBiaffineConfig(FromParams):
     train_dir: str
     dev_dir: str
-    # Optional held-out test split. If set, final evaluation runs on both
-    # dev and test after the dev table; if null, only dev is reported.
     test_dir: str | None = None
 
-    # Populated at training time by inferring (relation, nuclearity) pairs
-    # from train_dir + dev_dir; not user-configurable. Persists in the
-    # checkpointed config so predict/from_pretrained know the label space.
+    # Inferred at training time from train_dir + dev_dir; persisted so
+    # predict / from_pretrained know the label space.
     relation_types: list[tuple[str, str]] | None = None
 
     # Optional fine→coarse relation remap applied by the reader. When set,

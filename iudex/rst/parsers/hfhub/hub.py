@@ -1,17 +1,9 @@
 """HuggingFace Hub distribution for iudex RST parsers.
 
-On Hub load (`load_parser_from_pretrained("iudex/...")`), two repos are pulled
-the first time:
-
-  1. The iudex parser repo: `best_model.pt`, `config.json`, `README.md`.
-  2. The underlying encoder (e.g. `xlm-roberta-base`), because the parser's
-     `__init__` calls `AutoModel.from_pretrained(cfg["model_name"])` before
-     `load_state_dict` overwrites the encoder weights with the fine-tuned
-     ones from the parser checkpoint.
-
-Both downloads are cached by `huggingface_hub`, so subsequent loads are local.
-The encoder re-download is benign: `load_state_dict` is strict, so any drift
-between the encoder architecture today and at training time fails loudly.
+On load, both the parser repo and the underlying encoder (e.g.
+`xlm-roberta-base`) are fetched and cached; the encoder weights are then
+immediately overwritten by `load_state_dict` (strict mode catches
+architecture drift).
 """
 
 from __future__ import annotations
@@ -38,13 +30,8 @@ HUB_CARD_NAME = "README.md"
 
 _HUB_ID_PATTERN = re.compile(r"^[\w.\-]+/[\w.\-]+$")
 
-# Per-parser metadata for model-card generation.
-#
-# Keys:
-#   human_name, module_path, class_name: required.
-#   description: required, one-sentence blurb used in the card intro.
-#   paper_*: present iff the parser re-implements an external paper
-#       (yields a "re-implementation of …" intro + paper bibtex block).
+# Per-parser model-card metadata. `paper_*` keys present iff this parser
+# re-implements an external paper (toggles intro wording + bibtex block).
 _PARSER_META: dict[str, dict[str, str]] = {
     "dmrst": {
         "human_name": "DMRST parser",
@@ -70,12 +57,7 @@ _PARSER_META: dict[str, dict[str, str]] = {
 
 
 def _is_hub_id(s: str) -> bool:
-    """True if `s` looks like an HF repo id and isn't a local path.
-
-    Anything that points to an existing file/dir or ends in `.pt` is treated as
-    local; otherwise an `org/name` shape (one slash, word chars + `.-_`) is a
-    Hub id.
-    """
+    """True if `s` looks like `org/name` and isn't an existing path or `.pt` file."""
     if os.path.exists(s) or s.endswith(".pt"):
         return False
     return bool(_HUB_ID_PATTERN.match(s))
@@ -93,11 +75,9 @@ def load_parser_from_pretrained(
 ) -> ParserT:
     """Load a parser from a Hub repo id, a local run directory, or a `.pt` file.
 
-    For a Hub id, downloads `best_model.pt` (+ `config.json` and `README.md`
-    when present) via `huggingface_hub.snapshot_download` into the HF cache,
-    then rehydrates from it. For a local path, accepts either a directory
-    containing `best_model.pt` or the `.pt` file directly. All branches
-    delegate to `load_parser_from_checkpoint`.
+    Hub ids pull `best_model.pt` / `config.json` / `README.md` via
+    `snapshot_download`; directories look for `best_model.pt`; `.pt` paths
+    load as-is.
     """
     if _is_hub_id(repo_or_path):
         snapshot_dir = snapshot_download(
@@ -131,18 +111,8 @@ def push_parser_to_hub(
     token: str | bool | None = None,
     extra_card_fields: dict[str, Any] | None = None,
 ) -> str:
-    """Upload weights, config, and a generated model card to `repo_id`.
-
-    Reads the checkpoint once to extract the embedded config dict and a few
-    scalar metadata fields (`best_val`, `global_step`, `epoch`, `config_hash`)
-    for the model card, then uploads three files to the Hub:
-
-      - `best_model.pt`  — the checkpoint, as-is.
-      - `config.json`    — copied from the adjacent run-dir file if present,
-                            otherwise serialized from the embedded config.
-      - `README.md`      — generated via `render_model_card`.
-
-    Returns the repo URL.
+    """Upload `best_model.pt`, `config.json`, and a generated `README.md`
+    to `repo_id` in a single commit. Returns the repo URL.
     """
     if parser_kind not in _PARSER_META:
         raise ValueError(f"Unknown parser_kind: {parser_kind!r}")
@@ -208,13 +178,7 @@ def push_parser_to_hub(
 
 
 def _format_relation_labels(config: dict[str, Any]) -> str:
-    """Render the 'Relation labels' line: distinct post-mapping relation names
-    plus a note about whether a `relation_map` was applied.
-
-    `cfg.relation_types` is a list of `(relation, kind)` pairs spanning the
-    model's full label space; we deduplicate to relation names for display and
-    sort alphabetically so the listing is stable across runs.
-    """
+    """Render the 'Relation labels' line. Sorted alphabetically for stable output."""
     relation_types = config.get("relation_types") or []
     relation_map = config.get("relation_map")
 
@@ -248,8 +212,7 @@ def _render_data_section(
     checkpoint_meta: dict[str, Any],
     final_metrics: dict[str, dict[str, float]] | None,
 ) -> str:
-    """Render the consolidated "Data" section: dataset registry info,
-    relation-label treatment, and corpus metrics."""
+    """Render the "Data" section: dataset info, relation labels, corpus metrics."""
     parts: list[str] = ["## Data\n"]
 
     dataset = lookup_dataset(train_dir)
@@ -263,17 +226,11 @@ def _render_data_section(
         parts.append(header + ".\n")
         if dataset.get("description"):
             parts.append(dataset["description"] + "\n")
-        # if dataset.get("citation_text"):
-        #     parts.append(f"> {dataset['citation_text']}\n")
-        # if dataset.get("citation_bibtex"):
-        #     parts.append("```bibtex\n" + dataset["citation_bibtex"] + "\n```\n")
     elif train_dir:
         parts.append(f"Trained on `{train_dir}` (no entry in the iudex dataset registry).\n")
 
     parts.append("\n" + _format_relation_labels(config))
 
-    # Metrics. Prefer the final_metrics sidecar; otherwise fall back to the
-    # scalar best_val on the checkpoint.
     metric_name = config.get("val_metric_name", "?")
     if final_metrics:
         # Stable split ordering: dev first, then test, then anything else alpha.

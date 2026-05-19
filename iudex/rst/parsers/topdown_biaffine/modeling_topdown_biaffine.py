@@ -13,8 +13,6 @@ from iudex.rst.parsers.topdown_biaffine.configuration_topdown_biaffine import To
 
 
 class _FeedForward(nn.Sequential):
-    """Two-layer GELU feed-forward block with dropout between the layers."""
-
     def __init__(self, input_dim, hidden_dim, output_dim, dropout_p):
         super().__init__(
             nn.Linear(input_dim, hidden_dim),
@@ -53,8 +51,6 @@ class _DeepBiAffine(nn.Module):
 
 
 class TopdownBiaffineParser(nn.Module):
-    """Top-down RST parser with biaffine split and label scoring."""
-
     def __init__(self, config: TopdownBiaffineConfig):
         super().__init__()
         self.config = config
@@ -110,11 +106,9 @@ class TopdownBiaffineParser(nn.Module):
         )
 
     def _encode_tree(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokenize the tree's EDUs and return their token-level embeddings.
-
-        Returns:
-            embeddings:     shape [num_tokens, hidden_size]
-            edu_boundaries: shape [num_edus, 2], each a pair of (start_token, end_token_exclusive)
+        """Returns:
+        embeddings:     [num_tokens, hidden_size]
+        edu_boundaries: [num_edus, 2] — (start_token, end_token_exclusive) per EDU
         """
         input_ids, boundaries = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
         embeddings = encode_tokens_strided(
@@ -162,9 +156,6 @@ class TopdownBiaffineParser(nn.Module):
         left_last_idx = edu_boundaries[ks - 1, 1] - 1  # remember -1 because end index is exclusive
         right_first_idx = edu_boundaries[ks, 0]
 
-        # Average the two endpoints of each sub-span. Broadcasting: span_first_h
-        # has shape [hidden_size] and is added elementwise to each row of
-        # embeddings[left_last_idx], which has shape [num_splits, hidden_size].
         packed_l = (span_first_h + embeddings[left_last_idx]) / 2
         packed_r = (embeddings[right_first_idx] + span_last_h) / 2
         return packed_l, packed_r
@@ -225,11 +216,7 @@ class TopdownBiaffineParser(nn.Module):
 
     @torch.no_grad()
     def predict(self, tree: RstTree) -> RstTree:
-        """Greedy top-down decode using gold EDU segmentation from `tree.edus`.
-
-        At each span [b, e), pick the argmax split and argmax label; recurse
-        into both sub-spans. Returns a new tree built from the parsing actions.
-        """
+        """Greedy top-down decode using gold EDU segmentation from `tree.edus`."""
         self.eval()
         num_edus = len(tree.edus)
         if num_edus < 2:

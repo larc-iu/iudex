@@ -11,19 +11,11 @@ _TOKENIZER_MAX_LEN_SENTINEL = 1_000_000
 
 
 def load_encoder_and_tokenizer(model_name: str) -> tuple[torch.nn.Module, Any, int]:
-    """Load a BERT-style HF encoder + tokenizer and return (encoder, tokenizer, max_length).
+    """Load a BERT-style HF encoder + tokenizer; returns (encoder, tokenizer, max_length).
 
-    Forces the encoder to fp32: transformers >=5 honors the checkpoint's saved
-    dtype, and many HF checkpoints (e.g. SpanBERT) are fp16, which makes AdamW
-    updates NaN immediately. Raises if the tokenizer lacks CLS/SEP, since the
-    striding encoder relies on both.
-
-    `max_length` is the largest input length (inclusive of special tokens) the
-    encoder can safely accept. We trust `tokenizer.model_max_length` when set
-    (modern checkpoints report the correct usable cap with any RoBERTa-style
-    padding offset already baked in); when unset, fall back to
-    `cfg.max_position_embeddings` (this path is only taken by BERT-family
-    checkpoints like SpanBERT, where no padding offset applies).
+    Forces fp32: transformers>=5 honors the checkpoint dtype, and fp16
+    checkpoints (e.g. SpanBERT) NaN immediately under AdamW. Raises if
+    CLS/SEP are missing (the striding encoder needs both).
     """
     encoder = AutoModel.from_pretrained(model_name).float()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -69,19 +61,11 @@ def encode_tokens_strided(
 ) -> torch.Tensor:
     """Encode a flat token sequence with overlapping sliding windows.
 
-    Long documents exceed the LM's positional budget, so we tile the input
-    with windows that overlap by `stride` tokens; overlapped positions keep
-    the embedding from the *earlier* window (more left context).
+    Long documents exceed the LM's positional budget, so we tile with windows
+    that overlap by `stride` tokens; overlapped positions keep the embedding
+    from the *earlier* window (more left context).
 
-    Args:
-        encoder:    HF encoder (e.g. AutoModel.from_pretrained(...))
-        tokenizer:  matching HF tokenizer (needs cls/sep/pad token ids)
-        input_ids:  [num_tokens]
-        max_length: per-window length budget, including CLS/SEP
-        stride:     overlap between consecutive windows, in tokens
-
-    Returns:
-        embeddings: [num_tokens, hidden_size]  (1:1 with input positions)
+    Returns: [num_tokens, hidden_size]  (1:1 with input positions).
     """
     max_content = max_length - 2  # leave room for [CLS] ... [SEP] per chunk
     cls_id = tokenizer.cls_token_id

@@ -65,14 +65,6 @@ def _evaluate_on_dev(
 
 
 def train(cfg: TopdownBiaffineConfig) -> None:
-    """Run the full training loop.
-
-    `cfg` is the single source of truth: it is serialized via `dataclasses.asdict`
-    for run-id hashing, checkpoint storage, and the on-disk `config.json` audit.
-    Multiple runs with different configs coexist under `cfg.checkpoint_dir/`,
-    each in its own `{run_id}/` subdirectory; a matching `last.pt` is resumed
-    automatically.
-    """
     set_seeds(cfg.seed)
 
     run_dir, cfg_hash = prepare_run_dir(

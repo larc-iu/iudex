@@ -1,15 +1,8 @@
-"""Registry of RST parsers.
-
-One ParserSpec per parser. This is the single source of truth used by:
-
-  - the top-level dispatcher (`iudex/__main__.py`) to route commands
-  - the shared `push` CLI (`hfhub/push.py`) and the shared `predict` CLI
-    (`common/predict_cli.py`) to look up the Config / Parser classes
-  - `runs list` (`iudex/runs.py`) to tag rows by parser kind.
-
-To add a parser: add one entry below. Module paths follow the convention
-`<package>/{configuration,modeling,train,predict}_<name>.py` and class
-names follow `<Name>Config` / `<Name>Parser`.
+"""Registry of RST parsers — single source of truth for the dispatcher,
+the shared `push` / `predict` CLIs, and `runs list`. To add a parser, add
+one `ParserSpec` entry; module paths follow `<package>/{configuration,
+modeling,train,predict}_<name>.py` and class names follow `<Name>Config`
+/ `<Name>Parser`.
 """
 
 import importlib

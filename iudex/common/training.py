@@ -1,14 +1,9 @@
-"""Training utilities shared across iudex frameworks.
+"""Training utilities shared across parser-specific `train_<name>.py` scripts.
 
-A bag of helpers consumed by parser-specific training scripts (e.g.
-`iudex/<framework>/parsers/<name>/train_<name>.py`). There is no `Trainer`
-class — each `train_<name>.py` owns its own loop. Each utility takes its
-inputs explicitly and assumes only standard `nn.Module` interfaces.
-
-The sidecar conventions written by `save_checkpoint` and `write_run_config`
-(specifically `last.pt` / `last.json`, `best_model.pt` / `best_model.json`,
-`config.json`) are also the contract that `iudex.runs` reads. Frameworks
-that bypass these helpers will not show up in `iudex runs list`.
+The on-disk layout written here (`last.pt`/`last.json`,
+`best_model.pt`/`best_model.json`, `config.json`) is the contract
+`iudex.runs` reads — frameworks that bypass these helpers don't show up
+in `iudex runs list`.
 """
 
 import hashlib
@@ -42,20 +37,10 @@ from iudex.common.log import console, dim, warn
 logger = logging.getLogger(__name__)
 
 
-# Generic, framework-agnostic fields stripped before hashing the config to
-# compute `run_id`. Anything in this list can change between runs without
-# invalidating an existing checkpoint.
-#
-# Categories:
-#   - display:        run_name
-#   - storage:        checkpoint_dir (moving runs shouldn't reissue run_ids)
-#   - training-loop:  max_epochs, patience, validate_every, checkpoint_every,
-#                     log_every, val_metric_name (don't change the weights)
-#   - eval-only:      test_dir (read only at final eval)
-#
-# Frameworks add their own inferred-or-transient fields on top (e.g.
-# `iudex.rst.HASH_EXCLUDE` extends this with `relation_types`). Trainers
-# pass the framework's combined tuple via `hash_exclude=`.
+# Framework-agnostic fields stripped before hashing for `run_id`. Changing
+# any of these leaves an existing run resumable. Frameworks extend this
+# (e.g. `iudex.rst.HASH_EXCLUDE` adds `relation_types`) and pass the
+# combined tuple via `hash_exclude=`.
 DEFAULT_HASH_EXCLUDE: tuple[str, ...] = (
     "run_name",
     "checkpoint_dir",
@@ -70,24 +55,14 @@ DEFAULT_HASH_EXCLUDE: tuple[str, ...] = (
 
 
 def config_hash(obj: Any) -> str:
-    """First 12 hex chars (48-bit prefix) of SHA-256 over a JSON-serializable
-    object (typically `dataclasses.asdict(cfg)`). Collision-resistance is
-    birthday-bound ≈ √2⁴⁸ ≈ 16M.
-
-    Raises TypeError if `obj` contains a value json doesn't know how to encode
-    — silently `str()`-ifying would make hashes platform- and
-    Python-version-dependent. Add an explicit serializer for any new type.
-    """
+    """First 12 hex chars of SHA-256 over a JSON-serializable obj. Raises
+    TypeError on non-JSON values (silent `str()`-ifying would make hashes
+    platform- and Python-version-dependent)."""
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:12]
 
 
 def set_seeds(seed: int) -> None:
-    """Seed torch (and cuda, if present) plus the stdlib `random` module.
-
-    Also opts into TF32 matmul on Ampere+ NVIDIA GPUs. No-op on hardware
-    without TF32 support (older NVIDIA, AMD, CPU-only), so it's safe to
-    call unconditionally.
-    """
+    """Seed torch/cuda/random and opt into TF32 matmul (no-op on non-Ampere)."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
@@ -95,9 +70,9 @@ def set_seeds(seed: int) -> None:
 
 
 def install_abort_handler():
-    """Replace SIGINT with a soft-abort: first Ctrl-C sets `flag.value = True`,
-    the second Ctrl-C restores the default handler so the user can still
-    hard-kill if the cleanup path hangs. Returns the flag object."""
+    """SIGINT soft-abort: first Ctrl-C sets `flag.value = True`; the
+    second restores the default handler so a hung cleanup path is still
+    hard-killable. Returns the flag object."""
 
     class _Flag:
         value = False
@@ -116,7 +91,7 @@ def install_abort_handler():
 
 
 def gpu_mem_gb(device: torch.device) -> tuple[float, float] | None:
-    """Return (allocated_gb, reserved_gb) for CUDA devices, else None."""
+    """(allocated_gb, reserved_gb) for CUDA devices, else None."""
     if device.type != "cuda":
         return None
     return (
@@ -150,15 +125,11 @@ def prepare_run_dir(
     *,
     hash_exclude: tuple[str, ...] = DEFAULT_HASH_EXCLUDE,
 ) -> tuple[str, str]:
-    """Derive `{checkpoint_dir}/{run_name}-{hash}` (or just `/{hash}`) and
-    `mkdir -p` it. Returns (run_dir, cfg_hash).
-
-    On first creation (no `last.pt` present), prints a hint about the closest
-    sibling run if one exists, so an accidental field change that branched
-    into a new run is visible.
-
-    Does NOT write `config.json`; callers should `write_run_config` separately
-    once they've resolved any inferred-at-training fields (e.g. relation_types).
+    """`mkdir -p` the derived run dir and return (run_dir, cfg_hash). On
+    first creation, hints at the closest sibling run (catches accidental
+    field bumps that branched into a new hash). Does NOT write
+    `config.json` — callers do that after resolving inferred fields, so
+    the on-disk audit, embedded ckpt config, and Hub config.json all match.
     """
     run_id, cfg_hash = derive_run_id(config_dict, run_name, hash_exclude=hash_exclude)
     run_dir = os.path.join(checkpoint_dir, run_id)
@@ -170,11 +141,8 @@ def prepare_run_dir(
 
 
 def write_run_config(run_dir: str, config_dict: dict) -> None:
-    """Write `{run_dir}/config.json` for audit. Overwrites if present.
-
-    Train scripts call this *after* resolving inferred fields (relation_types,
-    etc.) so the on-disk audit, the embedded checkpoint config, and any
-    Hub-published config.json all match.
+    """Write `{run_dir}/config.json` (overwrites). Call after resolving
+    inferred fields so audit / embedded ckpt config / Hub config all match.
     """
     with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config_dict, f, indent=2)
@@ -187,10 +155,7 @@ def _hint_closest_sibling(
     *,
     hash_exclude: tuple[str, ...],
 ) -> None:
-    """Print a hint if there's a sibling run whose config differs by only a
-    handful of fields. Silent if there are no siblings, or the closest one
-    differs in more than 5 hash-affecting fields. Excluded fields are ignored.
-    """
+    """Print a hint if a sibling run differs by ≤5 hash-affecting fields."""
     if not os.path.isdir(checkpoint_dir):
         return
     best: tuple[int, str, list[str]] | None = None
@@ -231,11 +196,8 @@ def resume_or_init(
     scheduler,
     expected_hash: str,
 ) -> dict[str, Any]:
-    """Try to resume `{run_dir}/last.pt`. If it exists with matching hash, restore
-    model/optimizer/scheduler state and return the saved training state. Otherwise
-    return fresh state.
-
-    Returned dict keys: global_step, epoch, best_val, stale_validations.
+    """Restore from `{run_dir}/last.pt` if hash matches; else fresh state.
+    Returns dict with keys: global_step, epoch, best_val, stale_validations.
     """
     ckpt = try_resume(os.path.join(run_dir, "last.pt"), expected_hash=expected_hash)
     if ckpt is None:
@@ -258,12 +220,9 @@ def build_optimizer(
     *,
     submodule_lrs: Sequence[tuple[nn.Module, float]] = (),
 ) -> AdamW:
-    """Build AdamW with no-decay on biases and norm weights, and per-submodule LRs.
-
-    Params belonging to each `(submodule, sub_lr)` entry use `sub_lr`; everything
-    else uses `lr`. If a param belongs to multiple listed submodules, the first
-    listed wins. With an empty `submodule_lrs`, every param uses `lr` (two groups,
-    decay vs no-decay).
+    """AdamW with no-decay on biases / norm weights, plus per-submodule LRs.
+    Params in each `(submodule, sub_lr)` entry use `sub_lr` (first listed
+    wins on overlap); everything else uses `lr`.
     """
 
     def _is_no_decay(name: str) -> bool:
@@ -303,11 +262,9 @@ def make_scheduler(optimizer, warmup_steps: int, total_steps: int):
 
 
 def save_checkpoint(path: str, model: nn.Module, optimizer, scheduler, **extra) -> None:
-    """Save model + training state. Caller passes any other state (config, step, etc.) via **extra.
-
-    Also writes a `<path>.json` sidecar with the scalar `extra` fields, so
-    list-style tools (e.g. `python -m iudex runs list`) can read run metadata
-    without `torch.load`-ing the full checkpoint.
+    """Save model + training state to `path`. Also writes a `<path>.json`
+    sidecar with the scalar `extra` fields so `iudex runs list` can read
+    metadata without `torch.load`-ing the full checkpoint.
     """
     torch.save(
         {
@@ -325,11 +282,9 @@ def save_checkpoint(path: str, model: nn.Module, optimizer, scheduler, **extra) 
 
 
 def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | None:
-    """Return the checkpoint dict iff it exists and its config_hash matches; otherwise None.
-
-    A mismatch indicates a hand-copied `last.pt` or a checkpoint left behind
-    by a previous hash scheme; we warn loudly so the user can stop us before
-    we overwrite it.
+    """Checkpoint dict iff it exists and config_hash matches; else None.
+    Mismatch warns loudly (hand-copied last.pt, or a previous hash scheme)
+    so the user can stop us before overwriting.
     """
     if not os.path.exists(checkpoint_path):
         return None
@@ -349,7 +304,7 @@ def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | 
 
 
 def make_progress_bar() -> Progress:
-    """Configured rich Progress for whole-tree training. `with make_progress_bar() as p:`"""
+    """Rich Progress configured for whole-tree training."""
     return Progress(
         SpinnerColumn("dots"),
         TextColumn("[epoch]Epoch {task.fields[epoch]}[/epoch]"),
@@ -370,7 +325,6 @@ def make_progress_bar() -> Progress:
 
 
 def config_panel(cfg_dict: dict) -> Panel:
-    """Render a config dict (typically `dataclasses.asdict(cfg)`) as a pretty panel."""
     return Panel(Pretty(cfg_dict), title="[bold cyan]Config[/bold cyan]", border_style="cyan")
 
 

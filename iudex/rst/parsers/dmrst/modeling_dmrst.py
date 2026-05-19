@@ -17,12 +17,8 @@ from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
 class _PointerAttention(nn.Module):
     """Pointer attention for selecting a split position within a span.
 
-    A span of n EDUs can be split at n - 1 different points, since after the split, at
-    least one EDU must remain on either side. Within these n - 1 points, each position k
-    scores the split just after EDU b + k.
-
-    The caller passes `edu_reprs[b : e - 1]`, the n - 1 EDUs that can serve as the last
-    EDU of the left side of the potential split.
+    A span of n EDUs can be split at n - 1 different points (at least one
+    EDU on either side); position k scores the split just after EDU b + k.
 
     With e_k = encoder_outputs[k] and d = decoder_output:
         biaffine:    logit_k = (W1 e_k)·d + w2·e_k
@@ -33,7 +29,7 @@ class _PointerAttention(nn.Module):
         decoder_output:  [hidden_size]
 
     Returns:
-        logits: [1, n - 1]  (leading dim is for F.cross_entropy's batch convention)
+        logits: [1, n - 1]  (leading dim is F.cross_entropy's batch convention)
     """
 
     def __init__(self, attention_type, hidden_size):
@@ -91,13 +87,8 @@ class _LabelClassifier(nn.Module):
 
 
 class _Segmenter(nn.Module):
-    """Per-token EDU-boundary classifier.
-
-    Trains as a binary token-tagger that fires at EDU **end** positions. The class
-    weight on the positive label is typically upweighted (as large as ~10x) since
-    end-of-EDU tokens are rare. An optional second head can also be trained to
-    fire at EDU **start** positions.
-    """
+    """Per-token EDU-boundary classifier: binary tagger over EDU end
+    positions, with an optional second head for EDU starts."""
 
     def __init__(self, hidden_size: int, pos_weight: float, dropout: float = 0.5, start_loss: bool = False):
         super().__init__()
@@ -107,9 +98,7 @@ class _Segmenter(nn.Module):
         self.register_buffer("class_weight", torch.tensor([1.0, pos_weight]))
 
     def loss(self, embeddings: torch.Tensor, edu_end_positions: list[int]) -> torch.Tensor:
-        """Compute the segmentation loss against gold EDU ends.
-
-        Args:
+        """Args:
             embeddings:        [num_tokens, hidden_size]
             edu_end_positions: token indices of EDU ends (inclusive)
 
@@ -135,9 +124,7 @@ class _Segmenter(nn.Module):
 
     @torch.no_grad()
     def predict_breaks(self, embeddings: torch.Tensor) -> list[int]:
-        """Predict EDU end token indices from `embeddings`.
-
-        Args:
+        """Args:
             embeddings: [num_tokens, hidden_size]
 
         Returns:

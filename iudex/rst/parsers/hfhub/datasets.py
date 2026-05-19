@@ -1,17 +1,12 @@
-"""Registry of known RST corpora for model-card rendering and other UX surfaces.
+"""Registry of known RST corpora for model-card rendering.
 
-Keys are directory prefixes — `lookup("data/rstdt/train")` returns the RST-DT
-entry. Add a new corpus by extending `DATASETS`; the prefix is the directory
-root under which `train/`, `dev/`, `test/` live.
-
-Each entry's fields are all optional for the renderer's purposes (missing
-fields are simply omitted from the card), but `name` should always be present.
+Keys are directory prefixes — `lookup("data/rstdt/train")` returns the
+RST-DT entry. Fields beyond `name` are optional; missing ones are omitted
+from the card.
 """
 
 from __future__ import annotations
 
-# Ordered longest-prefix-first so a more specific entry wins over a generic one
-# if you ever add both (e.g. `data/gum_12.1.0` vs `data/gum`).
 DATASETS: dict[str, dict] = {
     "data/rstdt": {
         "name": "RST Discourse Treebank (RST-DT)",

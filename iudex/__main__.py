@@ -1,17 +1,8 @@
-"""iudex top-level dispatcher.
+"""iudex CLI dispatcher.
 
-Frameworks (RST, eventually PDTB, ...) declare their CLI surface as
-three module-level attributes on the framework's `__init__.py`:
-
-  - `PARSERS`                  — the parser registry
-  - `PARSER_SCOPED_COMMANDS`   — `{cmd: module_path}` for `iudex <parser> <cmd>`
-  - `GLOBAL_COMMANDS`          — `{cmd: module_path}` for `iudex <cmd>`
-
-The dispatcher imports each framework named in `iudex.FRAMEWORKS`, merges
-the three dicts (after seeding the global-commands map with project-level
-entries from `iudex.GLOBAL_COMMANDS`), and refuses to start on a name
-collision. To add a framework, add its dotted path to `iudex.FRAMEWORKS`
-and give it the three attributes.
+`iudex <parser> <cmd>` or `iudex <cmd>` for globals. Routes by merging the
+registries declared by each framework in `iudex.FRAMEWORKS`; see
+`iudex/__init__.py` for the framework contract.
 """
 
 import importlib
@@ -21,12 +12,8 @@ import iudex
 
 
 def _merge_frameworks() -> tuple[dict, dict, dict]:
-    """Import every framework module and merge its three dicts. Seeds the
-    global-commands map with project-level entries from `iudex.GLOBAL_COMMANDS`
-    so things like `runs` are always available without being owned by a
-    framework. Aborts on a name collision (two frameworks claiming the same
-    parser name, or a framework redeclaring a project-level global command).
-    """
+    """Merge each framework's three registry dicts atop project-level
+    `iudex.GLOBAL_COMMANDS`. Aborts on a name collision."""
     parsers: dict = {}
     parser_scoped: dict = {}
     global_cmds: dict = dict(iudex.GLOBAL_COMMANDS)

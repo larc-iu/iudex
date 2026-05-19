@@ -1,11 +1,4 @@
-"""Upload a trained parser checkpoint to the HuggingFace Hub.
-
-Dispatched from `iudex <parser_kind> push ...` via the shared-command path in
-`iudex/__main__.py`. The dispatcher passes `parser_kind` as a kwarg; the
-Config class is then looked up via the parser registry.
-
-Not meant to be invoked directly with `python -m`; use the dispatcher.
-"""
+"""Shared `iudex <parser> push` CLI. Dispatched via `iudex/__main__.py`."""
 
 import argparse
 import logging

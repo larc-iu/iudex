@@ -1,24 +1,7 @@
 """Inspect and manage iudex training runs.
 
-Usage:
-    python -m iudex runs list   [--checkpoint-dir DIR]
-    python -m iudex runs show   <run_id>            [--checkpoint-dir DIR]
-    python -m iudex runs diff   <run_id_a> <run_id_b>  [--checkpoint-dir DIR]
-    python -m iudex runs rename <run_id> <new_run_name> [--checkpoint-dir DIR]
-    python -m iudex runs delete <run_id> [--yes]    [--checkpoint-dir DIR]
-    python -m iudex runs delete-all                 [--checkpoint-dir DIR]
-
-`<run_id>` may be any unique prefix of an actual run dir name; ambiguous
-prefixes error out listing the candidates.
-
-Framework-agnostic: walks every framework declared in `iudex.FRAMEWORKS`,
-unioning each framework's `PARSERS` registry to tag run rows by parser
-kind via the `signature_field` (a config field unique to each parser
-dataclass).
-
-Assumes the sidecar conventions written by `iudex.common.training`
-(`config.json`, `best_model.json`, `best_model.pt`, `last.pt`). Frameworks
-that bypass those helpers won't show up here.
+Reads the sidecars written by `iudex.common.training`; walks every framework
+in `iudex.FRAMEWORKS` to tag rows by parser kind via `PARSERS[*].signature_field`.
 """
 
 import argparse
@@ -43,10 +26,8 @@ _HASH_SUFFIX_RE = re.compile(r"(?:^|-)([0-9a-f]{12})$")
 
 
 def _all_parsers() -> dict:
-    """Merge `PARSERS` across every framework in `iudex.FRAMEWORKS`. Aborts
-    on a `signature_field` collision — each parser's signature_field must
-    be globally unique so `_infer_parser_kind` is well-defined.
-    """
+    """Merge `PARSERS` across `iudex.FRAMEWORKS`. Aborts on a
+    `signature_field` collision so `_infer_parser_kind` is well-defined."""
     merged: dict = {}
     by_sig: dict[str, str] = {}
     for fw_path in iudex.FRAMEWORKS:
@@ -73,8 +54,7 @@ def _infer_parser_kind(config: dict, parsers: dict) -> str:
 
 
 def _list_run_dirs(checkpoint_dir: str) -> list[str]:
-    """Return sorted run-dir basenames under `checkpoint_dir` that look like
-    actual runs (have a `config.json`)."""
+    """Sorted basenames under `checkpoint_dir` that have a `config.json`."""
     if not os.path.isdir(checkpoint_dir):
         return []
     out = []
@@ -85,8 +65,8 @@ def _list_run_dirs(checkpoint_dir: str) -> list[str]:
 
 
 def _resolve_run_id(checkpoint_dir: str, partial: str) -> str:
-    """Find the unique run dir whose name starts with `partial`. Exits
-    non-zero if no match or multiple matches (listing the candidates)."""
+    """Unique run dir starting with `partial`; exits with the candidate
+    list on no/multi match."""
     matches = [e for e in _list_run_dirs(checkpoint_dir) if e.startswith(partial)]
     if not matches:
         console.print(f"[bold red]No run matching[/bold red] [path]{partial}[/path] in [path]{checkpoint_dir}[/path]")
@@ -100,10 +80,8 @@ def _resolve_run_id(checkpoint_dir: str, partial: str) -> str:
 
 
 def _read_best_meta(run_dir: str) -> tuple[str, str]:
-    """(best_val_str, step_str) read from the best_model.json sidecar.
-
-    Falls back to "-" / "-" if no sidecar (e.g. a run that hasn't validated yet).
-    """
+    """(best_val_str, step_str) from `best_model.json`; ("-", "-") if absent
+    or unreadable. "(no best)" if no `best_model.pt` exists at all."""
     sidecar = os.path.join(run_dir, "best_model.json")
     if not os.path.exists(sidecar):
         return ("(no best)" if not os.path.exists(os.path.join(run_dir, "best_model.pt")) else "-"), "-"
@@ -120,7 +98,6 @@ def _read_best_meta(run_dir: str) -> tuple[str, str]:
 
 
 def _dir_size(path: str) -> int:
-    """Total bytes under `path`, following dirents only (no symlinks)."""
     total = 0
     for root, _, files in os.walk(path):
         for f in files:
@@ -144,8 +121,8 @@ def _format_size(n: int) -> str:
 
 
 def _latest_mtime(run_dir: str) -> float:
-    """Use the freshest signal (best_model.pt → last.pt → config.json) so
-    callers see when the run last did real work."""
+    """mtime of the freshest of best_model.pt / last.pt / config.json (so
+    callers see real work, not dir-touch)."""
     for name in ("best_model.pt", "last.pt", "config.json"):
         p = os.path.join(run_dir, name)
         if os.path.exists(p):
@@ -310,7 +287,6 @@ def diff_runs(checkpoint_dir: str, partial_a: str, partial_b: str) -> None:
 
 
 def _short_repr(v) -> str:
-    """One-line repr suitable for a table cell; truncates long collections."""
     if isinstance(v, (dict, list)) and len(str(v)) > 60:
         return f"{type(v).__name__}({len(v)} items)"
     return repr(v)

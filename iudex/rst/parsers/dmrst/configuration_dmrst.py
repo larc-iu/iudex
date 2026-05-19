@@ -7,27 +7,22 @@ from iudex.rst.parsers.common.config import parse_config_dict
 
 @dataclass
 class _SegmentationConfig(FromParams):
-    """Joint per-token EDU-boundary head. Presence of this sub-config on
-    `DMRSTConfig` is itself the "enabled" signal; set `segmentation: null`
-    in jsonnet to disable joint segmentation (and lose `predict_from_text`).
-    """
+    """Joint per-token EDU-boundary head. Set `segmentation: null` in
+    jsonnet to disable (and lose `predict_from_text`)."""
 
-    pos_weight: float = 10.0  # class weight on the positive (EDU-end) label
-    start_loss: bool = False  # second binary head for EDU starts
+    pos_weight: float = 10.0  # upweighted because EDU ends are rare
+    start_loss: bool = False
 
 
 @dataclass
 class _DLWConfig(FromParams):
-    """Dynamic loss weighting (paper §3.2). Presence on `DMRSTConfig`
-    enables DLW; `dlw: null` falls back to unweighted sum of component losses.
+    """Dynamic loss weighting (paper §3.2). Set `dlw: null` for unweighted sum.
 
     The weight update compares the mean of the most recent `window // 2`
     optimizer steps' component losses against the mean of the preceding
     `window // 2` (or the rest, for odd `window`). With `window=2` (default)
-    this collapses to `L_k(t-1) / L_k(t-2)`, exactly reproducing the paper's
-    formulation. Larger windows yield much less noisy ratios — useful for
-    whole-tree training where per-step loss is dominated by single-document
-    variance. `window=2` is the minimum.
+    this collapses to `L_k(t-1) / L_k(t-2)`, reproducing the paper's
+    formulation.
     """
 
     temperature: float = 2.0
@@ -42,13 +37,10 @@ class _DLWConfig(FromParams):
 class DMRSTConfig(FromParams):
     train_dir: str
     dev_dir: str
-    # Optional held-out test split. If set, final evaluation runs on both
-    # dev and test after the dev table; if null, only dev is reported.
     test_dir: str | None = None
 
-    # Populated at training time by inferring (relation, nuclearity) pairs
-    # from train_dir + dev_dir; not user-configurable. Persists in the
-    # checkpointed config so predict/from_pretrained know the label space.
+    # Inferred at training time from train_dir + dev_dir; persisted so
+    # predict / from_pretrained know the label space.
     relation_types: list[tuple[str, str]] | None = None
 
     # Optional fine→coarse relation remap applied by the reader. When set,
@@ -76,12 +68,10 @@ class DMRSTConfig(FromParams):
     freeze_embeddings: bool = True
     freeze_encoder_layers: int = 3
 
-    # Joint EDU segmentation (paper §3.1.1). When non-null, training adds a
-    # per-token binary classification loss over EDU end positions and
-    # `predict_from_text` is available for raw-text inference.
+    # Joint EDU segmentation (paper §3.1.1). See `_SegmentationConfig`.
     segmentation: _SegmentationConfig | None = None
 
-    # Dynamic loss weighting (paper §3.2). Set to `null` for unweighted sum.
+    # Dynamic loss weighting (paper §3.2). See `_DLWConfig`.
     dlw: _DLWConfig | None = None
 
     # Training

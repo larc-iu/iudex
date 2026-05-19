@@ -92,17 +92,10 @@ def _evaluate_on_dev(
 
 
 def train(cfg: DMRSTConfig) -> None:
-    """Run the full training loop, including dynamic loss weighting (paper §3.2).
-
-    The trainer combines the model's `split_loss`, `label_loss` and (when joint
-    segmentation is on) `seg_loss` with weights that adapt to the recent rate
-    of decrease in each component, recomputed at every optimizer step.
-
-    `cfg` is the single source of truth: it is serialized via `dataclasses.asdict`
-    for run-id hashing, checkpoint storage, and the on-disk `config.json` audit.
-    Multiple runs with different configs coexist under `cfg.checkpoint_dir/`,
-    each in its own `{run_id}/` subdirectory; a matching `last.pt` is resumed
-    automatically (DLW state is restored from the checkpoint when present).
+    """Full training loop with dynamic loss weighting (paper §3.2): the
+    `split_loss`, `label_loss`, and (when joint segmentation is on)
+    `seg_loss` are combined with weights that adapt to the recent
+    per-component rate of decrease at every optimizer step.
     """
     set_seeds(cfg.seed)
 

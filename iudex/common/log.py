@@ -1,4 +1,4 @@
-"""Sexy logging for iudex, powered by Rich."""
+"""Rich-based logging and console helpers."""
 
 import logging
 
@@ -6,7 +6,6 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.theme import Theme
 
-# Project-wide console with a custom theme
 theme = Theme(
     {
         "info": "cyan",
@@ -27,27 +26,22 @@ console = Console(theme=theme)
 
 
 def success(msg: str) -> None:
-    """Bold-green status line."""
     console.print(f"[bold green]{msg}[/bold green]")
 
 
 def warn(msg: str) -> None:
-    """Bold-yellow status line."""
     console.print(f"[bold yellow]{msg}[/bold yellow]")
 
 
 def dim(msg: str) -> None:
-    """Dimmed status line."""
     console.print(f"[dim]{msg}[/dim]")
 
 
 def rule(title: str) -> None:
-    """Horizontal rule with a bold-magenta title."""
     console.rule(f"[bold magenta]{title}[/bold magenta]")
 
 
 def setup_logging(level: int = logging.INFO) -> None:
-    """Configure logging with Rich for beautiful terminal output."""
     logging.basicConfig(
         level=level,
         format="%(message)s",

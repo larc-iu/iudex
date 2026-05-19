@@ -22,17 +22,10 @@ def resolve_checkpoint(
     config_cls: type,
     parser_name: str,
 ) -> str:
-    """Return the .pt path to load.
-
-    Exactly one of the two paths is non-None. With `checkpoint_path`, use the
-    path as-is; with `config_path`, derive the run dir from the resolved
-    config and look up `best_model.pt`. Both branches exit non-zero with a
-    helpful message if the file is missing.
-
-    Args:
-        config_cls:    the parser's config dataclass (used to re-derive run_id)
-        parser_name:   the registry name (e.g. "dmrst"), used in the
-                       "train first with: iudex <name> train ..." hint
+    """Return the .pt path to load. Exactly one of `config_path` /
+    `checkpoint_path` must be set. With `config_path`, derive the run dir
+    from the resolved config and look up `best_model.pt`. Exits non-zero
+    with a helpful message if missing.
     """
     if checkpoint_path:
         if not os.path.exists(checkpoint_path):
@@ -61,8 +54,7 @@ def load_parser_from_checkpoint(
     config_cls: type[ConfigT],
     parser_cls: type[ParserT],
 ) -> ParserT:
-    """Rehydrate a parser from a checkpoint: rebuild the config, init the
-    model, load weights, move to `device`, and put it in eval mode."""
+    """Rehydrate a parser from a `.pt` checkpoint into eval mode on `device`."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = config_cls.from_dict(checkpoint["config"])
     model = parser_cls(cfg)
@@ -77,15 +69,12 @@ def resolve_source(
     config_cls: type,
     parser_name: str,
 ) -> tuple[str, str]:
-    """Pick where to load the parser from. Returns (kind, value).
+    """Pick where to load the parser from. Returns (kind, value):
 
-    Exactly one of the three args is non-None (predict CLIs enforce via a
-    mutually-exclusive argparse group). `kind` is one of:
+      - `"local"`: `value` is a local `.pt` path (→ `load_parser_from_checkpoint`).
+      - `"hub"`:   `value` is a Hub repo id (→ `load_parser_from_pretrained`).
 
-      - `"local"`: `value` is a local `.pt` path. Caller passes it to
-        `load_parser_from_checkpoint`.
-      - `"hub"`:   `value` is a Hub repo id. Caller passes it to
-        `load_parser_from_pretrained`.
+    Exactly one of `config_path` / `checkpoint_path` / `hub_id` must be set.
     """
     if hub_id is not None:
         return "hub", hub_id
