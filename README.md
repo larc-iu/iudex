@@ -25,7 +25,7 @@ pip install -e .
 
 Note that the command you will invoke is `iudex`, not `larc-iudex`.
 
-## Quick Start
+## Quick Start with Inference
 
 Parse a sample document end-to-end with a pretrained DMRST model pulled from the HuggingFace Hub. From the command line:
 
@@ -74,7 +74,7 @@ Yields:
 </rst>
 ```
 
-### Other Ways to Run Inference
+## Inference CLI
 
 To identify a model on the command line, you may use a configuration file (`--config`), a PyTorch checkpoint (`--checkpoint`), or a HuggingFace Hub repository (`--hub-id`).
 
@@ -103,7 +103,7 @@ iudex topdown_biaffine predict \
     --output-dir out/
 ```
 
-### Available Models
+## Available Models
 All official IUDEX model releases are [tagged with `iudex` on the HuggingFace Hub](https://huggingface.co/models?other=iudex).
 
 ## Training
