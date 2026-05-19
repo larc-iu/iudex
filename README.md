@@ -1,6 +1,6 @@
 # IUDEX
 
-The ***I*ndiana *U*niversity *D*iscourse *EX*hibition** (IUDEX) is a collection of parsers and other code related to discourse parsing.
+The **<u>I</u>ndiana <u>U</u>niversity <u>D</u>iscourse <u>Ex</u>hibition** (IUDEX) is a collection of parsers and other code related to discourse parsing.
 
 ## Setup
 
