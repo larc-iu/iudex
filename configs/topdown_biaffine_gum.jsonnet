@@ -4,7 +4,7 @@
     relation_map: null,
 
     // Model
-    model_name: "jhu-clsp/ettin-encoder-150m",
+    model_name: "jhu-clsp/ettin-encoder-400m",
     ffn_hidden_size: 512,
     dropout: 0.2,
     stride: 100,

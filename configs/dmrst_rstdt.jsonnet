@@ -3,7 +3,7 @@
     relation_map: import 'lib/rstdt_coarse_map.libsonnet',
 
     // Model
-    model_name: "jhu-clsp/ettin-encoder-150m",
+    model_name: "jhu-clsp/ettin-encoder-400m",
     stride: 100,
     attention_type: "dot_product",
     classifier_use_bias: true,
