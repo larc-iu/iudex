@@ -47,5 +47,5 @@
     // L(t-1)/L(t-2) ratio; larger windows give smoother ratios at the cost
     // of slower adaptation (recommended for noisy whole-tree training).
     // Set to `null` for unweighted sum.
-    dlw: { temperature: 2.0, window: 2 },
+    dlw: { temperature: 2.0, window: 30 },
 }
