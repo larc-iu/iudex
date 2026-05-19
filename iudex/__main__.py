@@ -1,71 +1,74 @@
 """iudex top-level dispatcher.
 
-Usage:
-    python -m iudex <parser_name> <command> [args...]
-    python -m iudex runs <subcommand> [args...]
+Frameworks (RST, eventually PDTB, ...) declare their CLI surface as
+three module-level attributes on the framework's `__init__.py`:
 
-Examples:
-    python -m iudex topdown_biaffine train configs/topdown_biaffine_rstdt.jsonnet
-    python -m iudex topdown_biaffine predict --config configs/topdown_biaffine_rstdt.jsonnet \\
-        --input data/test --output-dir out/
-    python -m iudex dmrst predict --hub-id larc-iu/dmrst-rstdt-coarse \\
-        --text-file doc.txt --output-dir out/
-    python -m iudex dmrst push --config configs/dmrst_rstdt.jsonnet --repo-id larc-iu/dmrst-rstdt-coarse
-    python -m iudex runs list
+  - `PARSERS`                  — the parser registry
+  - `PARSER_SCOPED_COMMANDS`   — `{cmd: module_path}` for `iudex <parser> <cmd>`
+  - `GLOBAL_COMMANDS`          — `{cmd: module_path}` for `iudex <cmd>`
 
-To add a new parser, register its package path in `PARSERS`. Each parser folder
-is expected to provide `train_<name>.py` and `predict_<name>.py` (or any other
-`<command>_<name>.py`) — the dispatcher imports `<package>.<command>_<name>`
-and calls its `main()`.
-
-Commands whose implementation is parser-agnostic (e.g. `push`) live in
-`SHARED_COMMANDS`. The dispatcher routes `iudex <parser> <cmd>` to the shared
-module and passes the parser name as `main(parser_kind=...)`, so per-parser
-shim files are unnecessary.
-
-Top-level (parser-less) commands live in `TOP_LEVEL_COMMANDS`. They dispatch to
-a module's `main()` directly without the `<command>_<parser>` naming dance.
+The dispatcher imports each framework named in `iudex.FRAMEWORKS`, merges
+the three dicts (after seeding the global-commands map with project-level
+entries from `iudex.GLOBAL_COMMANDS`), and refuses to start on a name
+collision. To add a framework, add its dotted path to `iudex.FRAMEWORKS`
+and give it the three attributes.
 """
 
 import importlib
 import sys
 
-# {parser_name: importable package containing this parser's command scripts}
-PARSERS = {
-    "topdown_biaffine": "iudex.rst.parsers.topdown_biaffine",
-    "dmrst": "iudex.rst.parsers.dmrst",
-}
+import iudex
 
-# {command_name: module path}. Implementation is shared across parsers; the
-# dispatcher calls `main(parser_kind=...)` with the parser name from argv.
-SHARED_COMMANDS = {
-    "push": "iudex.rst.parsers.hfhub.push",
-}
 
-# {command_name: module path} for commands with no associated parser.
-TOP_LEVEL_COMMANDS = {
-    "runs": "iudex.rst.runs",
-}
+def _merge_frameworks() -> tuple[dict, dict, dict]:
+    """Import every framework module and merge its three dicts. Seeds the
+    global-commands map with project-level entries from `iudex.GLOBAL_COMMANDS`
+    so things like `runs` are always available without being owned by a
+    framework. Aborts on a name collision (two frameworks claiming the same
+    parser name, or a framework redeclaring a project-level global command).
+    """
+    parsers: dict = {}
+    parser_scoped: dict = {}
+    global_cmds: dict = dict(iudex.GLOBAL_COMMANDS)
+    for fw_path in iudex.FRAMEWORKS:
+        fw = importlib.import_module(fw_path)
+        _merge_no_collide(parsers, fw.PARSERS, fw_path, "parser name")
+        _merge_no_collide(parser_scoped, fw.PARSER_SCOPED_COMMANDS, fw_path, "parser-scoped command")
+        _merge_no_collide(global_cmds, fw.GLOBAL_COMMANDS, fw_path, "global command")
+    return parsers, parser_scoped, global_cmds
+
+
+def _merge_no_collide(dst: dict, src: dict, fw_path: str, kind: str) -> None:
+    for k, v in src.items():
+        if k in dst and dst[k] is not v:
+            sys.stderr.write(
+                f"iudex: {kind} {k!r} declared by both an earlier framework and {fw_path!r}. Rename one of them.\n"
+            )
+            sys.exit(2)
+        dst[k] = v
+
+
+PARSERS, PARSER_SCOPED_COMMANDS, GLOBAL_COMMANDS = _merge_frameworks()
 
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         print(__doc__.strip())
         print(f"\nKnown parsers: {', '.join(sorted(PARSERS))}")
-        print(f"Top-level commands: {', '.join(sorted(TOP_LEVEL_COMMANDS))}")
+        print(f"Global commands: {', '.join(sorted(GLOBAL_COMMANDS))}")
         sys.exit(0)
 
     if len(sys.argv) < 2:
         sys.stderr.write(__doc__.strip() + "\n\n")
         sys.stderr.write(f"Known parsers: {', '.join(sorted(PARSERS))}\n")
-        sys.stderr.write(f"Top-level commands: {', '.join(sorted(TOP_LEVEL_COMMANDS))}\n")
+        sys.stderr.write(f"Global commands: {', '.join(sorted(GLOBAL_COMMANDS))}\n")
         sys.exit(2)
 
     head = sys.argv[1]
 
-    if head in TOP_LEVEL_COMMANDS:
-        module = importlib.import_module(TOP_LEVEL_COMMANDS[head])
-        sys.argv = [TOP_LEVEL_COMMANDS[head]] + sys.argv[2:]
+    if head in GLOBAL_COMMANDS:
+        module = importlib.import_module(GLOBAL_COMMANDS[head])
+        sys.argv = [GLOBAL_COMMANDS[head]] + sys.argv[2:]
         module.main()
         return
 
@@ -80,17 +83,17 @@ def main():
     if parser_name not in PARSERS:
         sys.stderr.write(f"Unknown parser: {parser_name!r}\n")
         sys.stderr.write(f"Known parsers: {', '.join(sorted(PARSERS))}\n")
-        sys.stderr.write(f"Top-level commands: {', '.join(sorted(TOP_LEVEL_COMMANDS))}\n")
+        sys.stderr.write(f"Global commands: {', '.join(sorted(GLOBAL_COMMANDS))}\n")
         sys.exit(2)
 
-    if command in SHARED_COMMANDS:
-        shared_path = SHARED_COMMANDS[command]
+    if command in PARSER_SCOPED_COMMANDS:
+        shared_path = PARSER_SCOPED_COMMANDS[command]
         module = importlib.import_module(shared_path)
         sys.argv = [f"iudex {parser_name} {command}"] + sys.argv[3:]
         module.main(parser_kind=parser_name)
         return
 
-    module_path = f"{PARSERS[parser_name]}.{command}_{parser_name}"
+    module_path = f"{PARSERS[parser_name].package}.{command}_{parser_name}"
     try:
         module = importlib.import_module(module_path)
     except ImportError as e:

@@ -11,12 +11,13 @@ import torch
 from tonga import Params
 
 from iudex.common.log import console, dim, rule, setup_logging, success, warn
+from iudex.rst import HASH_EXCLUDE
 from iudex.rst.data.metrics import evaluate_parseval, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
 from iudex.rst.data.tree import RstTree
 from iudex.rst.parsers.topdown_biaffine.configuration_topdown_biaffine import TopdownBiaffineConfig
 from iudex.rst.parsers.topdown_biaffine.modeling_topdown_biaffine import TopdownBiaffineParser
-from iudex.rst.training import (
+from iudex.common.training import (
     build_optimizer,
     config_panel,
     device_panel,
@@ -74,7 +75,9 @@ def train(cfg: TopdownBiaffineConfig) -> None:
     """
     set_seeds(cfg.seed)
 
-    run_dir, cfg_hash = prepare_run_dir(dataclasses.asdict(cfg), cfg.checkpoint_dir, cfg.run_name)
+    run_dir, cfg_hash = prepare_run_dir(
+        dataclasses.asdict(cfg), cfg.checkpoint_dir, cfg.run_name, hash_exclude=HASH_EXCLUDE
+    )
 
     if cfg.relation_map is not None:
         dim(f"Applying `relation_map` ({len(cfg.relation_map)} entries) to all read trees.")

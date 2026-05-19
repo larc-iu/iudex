@@ -2,9 +2,19 @@
 
 Usage:
     python -m iudex runs list [--checkpoint-dir checkpoints/]
+
+Framework-agnostic: walks every framework declared in `iudex.FRAMEWORKS`,
+unioning each framework's `PARSERS` registry to tag run rows by parser
+kind via the `signature_field` (a config field unique to each parser
+dataclass).
+
+Assumes the sidecar conventions written by `iudex.common.training`
+(`config.json`, `best_model.json`, `best_model.pt`, `last.pt`). Frameworks
+that bypass those helpers won't show up here.
 """
 
 import argparse
+import importlib
 import json
 import os
 import sys
@@ -12,20 +22,37 @@ from datetime import datetime
 
 from rich.table import Table
 
+import iudex
 from iudex.common.log import console
 
-# Each parser dataclass has at least one field no other parser has, so we can
-# tag run rows by parser kind from the on-disk config.json alone.
-_PARSER_KIND_BY_SIGNATURE_FIELD = [
-    ("attention_type", "dmrst"),
-    ("ffn_hidden_size", "topdown_biaffine"),
-]
+
+def _all_parsers() -> dict:
+    """Merge `PARSERS` across every framework in `iudex.FRAMEWORKS`. Aborts
+    on a `signature_field` collision — each parser's signature_field must
+    be globally unique so `_infer_parser_kind` is well-defined.
+    """
+    merged: dict = {}
+    by_sig: dict[str, str] = {}
+    for fw_path in iudex.FRAMEWORKS:
+        fw = importlib.import_module(fw_path)
+        for name, spec in fw.PARSERS.items():
+            merged[name] = spec
+            owner = by_sig.get(spec.signature_field)
+            if owner is not None and owner != name:
+                sys.stderr.write(
+                    f"iudex.runs: parsers {owner!r} and {name!r} both claim "
+                    f"signature_field {spec.signature_field!r}. Pick a "
+                    f"field unique to one of them.\n"
+                )
+                sys.exit(2)
+            by_sig[spec.signature_field] = name
+    return merged
 
 
-def _infer_parser_kind(config: dict) -> str:
-    for key, kind in _PARSER_KIND_BY_SIGNATURE_FIELD:
-        if key in config:
-            return kind
+def _infer_parser_kind(config: dict, parsers: dict) -> str:
+    for name, spec in parsers.items():
+        if spec.signature_field in config:
+            return name
     return "?"
 
 
@@ -54,6 +81,7 @@ def list_runs(checkpoint_dir: str) -> None:
         console.print(f"[bold red]No such directory:[/bold red] [path]{checkpoint_dir}[/path]")
         sys.exit(1)
 
+    parsers = _all_parsers()
     rows: list[tuple[str, ...]] = []
     for entry in sorted(os.listdir(checkpoint_dir)):
         run_dir = os.path.join(checkpoint_dir, entry)
@@ -65,7 +93,7 @@ def list_runs(checkpoint_dir: str) -> None:
                 cfg = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-        kind = _infer_parser_kind(cfg)
+        kind = _infer_parser_kind(cfg, parsers)
         run_name = cfg.get("run_name") or "-"
         model_name = cfg.get("model_name", "?")
         train_dir = cfg.get("train_dir") or "?"

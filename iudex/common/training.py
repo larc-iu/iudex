@@ -1,9 +1,14 @@
-"""Training utilities for iudex RST parsers.
+"""Training utilities shared across iudex frameworks.
 
 A bag of helpers consumed by parser-specific training scripts (e.g.
-`iudex/rst/parsers/<name>/train_<name>.py`). There is no `Trainer` class —
-each `train_<name>.py` owns its own loop. Each utility takes its inputs
-explicitly and assumes only standard `nn.Module` interfaces.
+`iudex/<framework>/parsers/<name>/train_<name>.py`). There is no `Trainer`
+class — each `train_<name>.py` owns its own loop. Each utility takes its
+inputs explicitly and assumes only standard `nn.Module` interfaces.
+
+The sidecar conventions written by `save_checkpoint` and `write_run_config`
+(specifically `last.pt` / `last.json`, `best_model.pt` / `best_model.json`,
+`config.json`) are also the contract that `iudex.runs` reads. Frameworks
+that bypass these helpers will not show up in `iudex runs list`.
 """
 
 import hashlib
@@ -37,21 +42,22 @@ from iudex.common.log import console, dim, warn
 logger = logging.getLogger(__name__)
 
 
-# Fields stripped before hashing the config to compute `run_id`. Anything in
-# this list can change between runs without invalidating an existing
-# checkpoint.
+# Generic, framework-agnostic fields stripped before hashing the config to
+# compute `run_id`. Anything in this list can change between runs without
+# invalidating an existing checkpoint.
 #
 # Categories:
 #   - display:        run_name
-#   - inferred:       relation_types (populated post-hash from train/dev data;
-#                     would silently mismatch between train and predict)
 #   - storage:        checkpoint_dir (moving runs shouldn't reissue run_ids)
 #   - training-loop:  max_epochs, patience, validate_every, checkpoint_every,
 #                     log_every, val_metric_name (don't change the weights)
 #   - eval-only:      test_dir (read only at final eval)
+#
+# Frameworks add their own inferred-or-transient fields on top (e.g.
+# `iudex.rst.HASH_EXCLUDE` extends this with `relation_types`). Trainers
+# pass the framework's combined tuple via `hash_exclude=`.
 DEFAULT_HASH_EXCLUDE: tuple[str, ...] = (
     "run_name",
-    "relation_types",
     "checkpoint_dir",
     "max_epochs",
     "patience",
