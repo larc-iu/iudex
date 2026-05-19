@@ -183,6 +183,12 @@ class DMRSTParser(nn.Module):
                 for p in layer.parameters():
                     p.requires_grad = False
 
+        # Compile the encoder forward (not the module) so state_dict keys are
+        # unchanged and existing checkpoints still load. dynamic=True avoids
+        # per-shape recompiles on variable-length documents.
+        if torch.cuda.is_available():
+            self.encoder.forward = torch.compile(self.encoder.forward, dynamic=True)
+
         hidden_size = self.encoder.config.hidden_size
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.encoder_dropout = nn.Dropout(config.encoder_dropout)

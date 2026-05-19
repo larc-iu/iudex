@@ -64,6 +64,12 @@ class TopdownBiaffineParser(nn.Module):
         self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(config.model_name)
         self.hidden_size = self.encoder.config.hidden_size
 
+        # Compile the encoder forward (not the module) so state_dict keys are
+        # unchanged and existing checkpoints still load. dynamic=True avoids
+        # per-shape recompiles on variable-length documents.
+        if torch.cuda.is_available():
+            self.encoder.forward = torch.compile(self.encoder.forward, dynamic=True)
+
         self.split_biaffine = _DeepBiAffine(self.hidden_size, config.ffn_hidden_size, 1, config.dropout)
         self.label_biaffine = _DeepBiAffine(
             self.hidden_size, config.ffn_hidden_size, len(self.label_index), config.dropout

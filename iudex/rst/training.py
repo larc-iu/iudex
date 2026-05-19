@@ -76,10 +76,16 @@ def config_hash(obj: Any) -> str:
 
 
 def set_seeds(seed: int) -> None:
-    """Seed torch (and cuda, if present) plus the stdlib `random` module."""
+    """Seed torch (and cuda, if present) plus the stdlib `random` module.
+
+    Also opts into TF32 matmul on Ampere+ NVIDIA GPUs. No-op on hardware
+    without TF32 support (older NVIDIA, AMD, CPU-only), so it's safe to
+    call unconditionally.
+    """
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
+    torch.set_float32_matmul_precision("high")
 
 
 def install_abort_handler():
