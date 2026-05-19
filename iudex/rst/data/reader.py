@@ -87,7 +87,7 @@ def read_rst_file(
 ) -> RstTree:
     """Read an RS3 or RS4 file and return an RstTree. If `relation_map` is
     set, the tree applies it at its output boundary (e.g. `parsing_actions`,
-    `spans`, `relation_of`); edges retain raw labels so that structure-
+    `spans`, `relation_of`). Edges retain raw labels so that structure-
     inference logic that distinguishes multinuc-siblings from satellites by
     relation-name distinctness is not broken by fine→coarse collapses.
     """
@@ -122,7 +122,7 @@ def infer_relation_types(
 ) -> List[Tuple[str, str]]:
     """Scan RS3/RS4 files in `directories` and return the union of
     (relation, kind) pairs observed in their parsing actions. A given relation
-    may appear with both kinds — RST-DT, for example, has relations that are
+    may appear with both kinds. RST-DT, for example, has relations that are
     mononuclear in some contexts and multinuclear in others.
 
     When `relation_map` is set, observed relations are reported in the mapped

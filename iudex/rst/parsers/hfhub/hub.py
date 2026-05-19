@@ -1,7 +1,7 @@
 """HuggingFace Hub distribution for iudex RST parsers.
 
 On load, both the parser repo and the underlying encoder (e.g.
-`xlm-roberta-base`) are fetched and cached; the encoder weights are then
+`xlm-roberta-base`) are fetched and cached. The encoder weights are then
 immediately overwritten by `load_state_dict` (strict mode catches
 architecture drift).
 """
@@ -76,7 +76,7 @@ def load_parser_from_pretrained(
     """Load a parser from a Hub repo id, a local run directory, or a `.pt` file.
 
     Hub ids pull `best_model.pt` / `config.json` / `README.md` via
-    `snapshot_download`; directories look for `best_model.pt`; `.pt` paths
+    `snapshot_download`. Directories look for `best_model.pt`. `.pt` paths
     load as-is.
     """
     if _is_hub_id(repo_or_path):
@@ -125,8 +125,8 @@ def push_parser_to_hub(
         k: checkpoint.get(k) for k in ("best_val", "global_step", "epoch", "config_hash") if k in checkpoint
     }
 
-    # Pick up adjacent final_metrics.json if the train script wrote one — gives
-    # us dev + test corpus metrics keyed by split. Absence is fine.
+    # Pick up adjacent final_metrics.json if the train script wrote one. It
+    # gives us dev + test corpus metrics keyed by split. Absence is fine.
     run_dir = os.path.dirname(checkpoint_path)
     final_metrics_path = os.path.join(run_dir, "final_metrics.json")
     final_metrics: dict | None = None
@@ -255,7 +255,7 @@ def _render_data_section(
         parts.append("\n### Metrics\n\n")
         if isinstance(best_val, (int, float)) and best_val >= 0:
             parts.append(f"- **Dev {metric_name}**: {best_val:.4f}\n")
-            parts.append("- _(no `final_metrics.json` sidecar — test metric not recorded)_\n")
+            parts.append("- _(no `final_metrics.json` sidecar, test metric not recorded)_\n")
         else:
             parts.append("- _(no metrics recorded on this checkpoint)_\n")
 
@@ -282,7 +282,7 @@ def render_model_card(
     train_dir = config.get("train_dir") or ""
 
     # Any parser with a non-null `segmentation` sub-config exposes
-    # `predict_from_text`; otherwise predictions require pre-segmented
+    # `predict_from_text`. Otherwise predictions require pre-segmented
     # RS3/RS4 trees (the parser's `predict` takes an `RstTree`).
     if config.get("segmentation") is not None:
         predict_snippet = 'tree = parser.predict_from_text("Your document text here. Multiple sentences are fine.")'
@@ -354,7 +354,7 @@ And the IUDEX library:
 ```"""
     else:
         intro = (
-            f"A pretrained {meta['human_name']} — {meta['description']} — "
+            f"A pretrained {meta['human_name']} ({meta['description']}) "
             "developed and trained in [IUDEX](https://github.com/larc-iu/iudex)."
         )
         citation_block = """If you use this model, please cite the IUDEX library:

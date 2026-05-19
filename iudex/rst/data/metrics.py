@@ -1,4 +1,4 @@
-"""RST Parseval — per-tree counts, corpus aggregation, and Rich table renderer.
+"""RST Parseval. Per-tree counts, corpus aggregation, and Rich table renderer.
 
 Segmentation and end-to-end Parseval (which require different EDU sets between
 gold and predicted trees) live in `iudex.rst.data.seg_metrics`.
@@ -20,7 +20,7 @@ def f1(x, y):
 def _spans_to_ranges(tree: RstTree, coarse: bool = False):
     """Parent-keyed enumeration: one entry per binary action, keyed on the
     parent's (first_edu, last_edu). Yields `n-1` entries for a binary tree
-    with `n` EDUs — only the parser's actual split decisions are scored, and
+    with `n` EDUs. Only the parser's actual split decisions are scored, and
     leaf-EDU spans are not. This is the Morey/Muller/Asher (2017) "standard"
     Parseval that excludes trivially-correct leaf matches.
     """
@@ -33,8 +33,8 @@ def _spans_to_ranges(tree: RstTree, coarse: bool = False):
 
 
 def _spans_to_sibling_ranges(tree: RstTree, coarse: bool = False):
-    """Sibling-keyed enumeration: two entries per binary action — one per
-    child — keyed on the child's (first_edu, last_edu). Yields `2*(n-1)`
+    """Sibling-keyed enumeration: two entries per binary action (one per
+    child), keyed on the child's (first_edu, last_edu). Yields `2*(n-1)`
     entries for a binary tree with `n` EDUs, including every leaf-EDU span.
     Matches DMRST's `getEvalData` (their default, `use_org_Parseval=False`)
     and the original Marcu (2000) Parseval. When gold and predicted trees
@@ -42,8 +42,8 @@ def _spans_to_sibling_ranges(tree: RstTree, coarse: bool = False):
     span F1 by roughly 10-15 points relative to the parent-keyed form.
 
     Per-child labels follow the DMRST convention: the nucleus child carries
-    ("N", "span") as a placeholder; the satellite child carries ("S", rel);
-    multinuclear children both carry ("N", rel).
+    ("N", "span") as a placeholder, the satellite child carries ("S", rel),
+    and multinuclear children both carry ("N", rel).
     """
     result = set()
     for (left, right), nuc, rel in tree.spans():
@@ -77,7 +77,7 @@ def compute_parseval_metrics(
     entry per action). Set `original_parseval=True` to switch to the
     sibling-keyed form used by DMRST and the original Marcu (2000) Parseval,
     which counts each non-root constituent (including every leaf-EDU span)
-    separately — kept for direct comparison to numbers reported in papers
+    separately. Kept for direct comparison to numbers reported in papers
     using that convention. The two scales are not interchangeable: original
     Parseval typically reports ~10-15 points higher than standard.
     """
@@ -154,7 +154,7 @@ def compute_parseval_metrics(
 def evaluate_parseval(gold_trees: List[RstTree], gold_preds: List[RstTree]) -> Dict[str, float]:
     """Aggregate per-tree Parseval counts over a corpus into span/nuc/rel/full F1.
 
-    Both lists are indexed in lockstep — `gold_preds[i]` is the parser's
+    Both lists are indexed in lockstep: `gold_preds[i]` is the parser's
     same-EDU-set output for `gold_trees[i]`. Returns four `*_f1` keys.
     """
     if len(gold_trees) != len(gold_preds):

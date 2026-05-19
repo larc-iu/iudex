@@ -39,7 +39,7 @@ class DMRSTConfig(FromParams):
     dev_dir: str
     test_dir: str | None = None
 
-    # Inferred at training time from train_dir + dev_dir; persisted so
+    # Inferred at training time from train_dir + dev_dir. Persisted so
     # predict / from_pretrained know the label space.
     relation_types: list[tuple[str, str]] | None = None
 

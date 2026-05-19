@@ -29,7 +29,7 @@ class _DeepBiAffine(nn.Module):
     plus per-side linear terms (a.k.a. the deep biaffine of Dozat & Manning).
 
     Args:
-        h_left:  [num_candidates, input_dim]
+        h_left: [num_candidates, input_dim]
         h_right: [num_candidates, input_dim]
 
     Returns:
@@ -107,8 +107,8 @@ class TopdownBiaffineParser(nn.Module):
 
     def _encode_tree(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns:
-        embeddings:     [num_tokens, hidden_size]
-        edu_boundaries: [num_edus, 2] — (start_token, end_token_exclusive) per EDU
+        embeddings: [num_tokens, hidden_size]
+        edu_boundaries: [num_edus, 2], (start_token, end_token_exclusive) per EDU
         """
         input_ids, boundaries = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
         embeddings = encode_tokens_strided(
@@ -136,21 +136,21 @@ class TopdownBiaffineParser(nn.Module):
         splits in one batched pass.
 
         Args:
-            embeddings:     [num_tokens, hidden_size]
-            edu_boundaries: [num_edus, 2]  rows of (start_token, end_token_exclusive)
-            b, e:           EDU range of the span, exclusive at `e`
+            embeddings: [num_tokens, hidden_size]
+            edu_boundaries: [num_edus, 2], rows of (start_token, end_token_exclusive)
+            b, e: EDU range of the span, exclusive at `e`
 
         Returns:
             packed_l: [num_splits, hidden_size]  left sub-span repr per split
             packed_r: [num_splits, hidden_size]  right sub-span repr per split
         """
-        # The first token of the whole span is the first token of every LEFT sub-span;
-        # the last token of the whole span is the last token of every RIGHT sub-span.
+        # The first token of the whole span is the first token of every LEFT sub-span.
+        # The last token of the whole span is the last token of every RIGHT sub-span.
         span_first_h = embeddings[edu_boundaries[b, 0]]  # [hidden_size]
         span_last_h = embeddings[edu_boundaries[e - 1, 1] - 1]  # [hidden_size]
 
         # For each candidate split k ∈ [b+1, e):
-        #   - last token of the LEFT sub-span  = last token of EDU (k - 1)
+        #   - last token of the LEFT sub-span = last token of EDU (k - 1)
         #   - first token of the RIGHT sub-span = first token of EDU k
         ks = torch.arange(b + 1, e, device=embeddings.device)
         left_last_idx = edu_boundaries[ks - 1, 1] - 1  # remember -1 because end index is exclusive
@@ -168,7 +168,7 @@ class TopdownBiaffineParser(nn.Module):
         then recurse into the gold sub-spans, top-down.
 
         Returns:
-            {"loss": scalar tensor} — mean of (split_loss + label_loss) / 2
+            {"loss": scalar tensor}, mean of (split_loss + label_loss) / 2
         """
         num_edus = len(tree.edus)
         if num_edus < 2:
@@ -198,7 +198,7 @@ class TopdownBiaffineParser(nn.Module):
             gold_split_idx = gold_split - b - 1
             gold_label_idx = self.label_index.index(gold_label_str)
 
-            # 2-EDU spans have a single forced split — no choice, no split loss.
+            # 2-EDU spans have a single forced split, no choice, no split loss.
             if e - b > 2:
                 split_target = torch.tensor([gold_split_idx], device=self.device)
                 split_losses.append(F.cross_entropy(split_logits.unsqueeze(0), split_target))

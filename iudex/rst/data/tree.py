@@ -79,8 +79,8 @@ class RstTree:
 
         self._relation_types = relation_types
         # Applied at output boundary (parsing_actions, relation_of, etc.) so
-        # that binarization / multinuc-vs-satellite disambiguation — which key
-        # off relation-name distinctness — sees the raw labels.
+        # that binarization / multinuc-vs-satellite disambiguation (which keys
+        # off relation-name distinctness) sees the raw labels.
         self._relation_map = relation_map
 
         has_parent = set()
@@ -108,7 +108,7 @@ class RstTree:
 
     def _resolve_rel(self, rel: str) -> str:
         """Apply `relation_map` to a relation name leaving the tree. The
-        structural marker `"span"` passes through; any other label not in the
+        structural marker `"span"` passes through. Any other label not in the
         map raises (silent passthrough would hide annotation drift).
         """
         if self._relation_map is None or rel == "span":

@@ -1,6 +1,6 @@
 """Inspect and manage iudex training runs.
 
-Reads the sidecars written by `iudex.common.training`; walks every framework
+Reads the sidecars written by `iudex.common.training`. Walks every framework
 in `iudex.FRAMEWORKS` to tag rows by parser kind via `PARSERS[*].signature_field`.
 """
 
@@ -20,7 +20,7 @@ from rich.table import Table
 import iudex
 from iudex.common.log import console, dim, success
 
-# Last 12 hex chars of the run dir name are the config hash; everything
+# Last 12 hex chars of the run dir name are the config hash. Everything
 # before is the optional run_name.
 _HASH_SUFFIX_RE = re.compile(r"(?:^|-)([0-9a-f]{12})$")
 
@@ -65,7 +65,7 @@ def _list_run_dirs(checkpoint_dir: str) -> list[str]:
 
 
 def _resolve_run_id(checkpoint_dir: str, partial: str) -> str:
-    """Unique run dir starting with `partial`; exits with the candidate
+    """Unique run dir starting with `partial`. Exits with the candidate
     list on no/multi match."""
     matches = [e for e in _list_run_dirs(checkpoint_dir) if e.startswith(partial)]
     if not matches:
@@ -80,7 +80,7 @@ def _resolve_run_id(checkpoint_dir: str, partial: str) -> str:
 
 
 def _read_best_meta(run_dir: str) -> tuple[str, str]:
-    """(best_val_str, step_str) from `best_model.json`; ("-", "-") if absent
+    """(best_val_str, step_str) from `best_model.json`. ("-", "-") if absent
     or unreadable. "(no best)" if no `best_model.pt` exists at all."""
     sidecar = os.path.join(run_dir, "best_model.json")
     if not os.path.exists(sidecar):

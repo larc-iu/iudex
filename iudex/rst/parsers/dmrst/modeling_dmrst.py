@@ -18,15 +18,15 @@ class _PointerAttention(nn.Module):
     """Pointer attention for selecting a split position within a span.
 
     A span of n EDUs can be split at n - 1 different points (at least one
-    EDU on either side); position k scores the split just after EDU b + k.
+    EDU on either side). Position k scores the split just after EDU b + k.
 
     With e_k = encoder_outputs[k] and d = decoder_output:
-        biaffine:    logit_k = (W1 e_k)·d + w2·e_k
+        biaffine: logit_k = (W1 e_k)·d + w2·e_k
         dot_product: logit_k = e_k · d
 
     Args:
         encoder_outputs: [n - 1, hidden_size]
-        decoder_output:  [hidden_size]
+        decoder_output: [hidden_size]
 
     Returns:
         logits: [1, n - 1]  (leading dim is F.cross_entropy's batch convention)
@@ -62,7 +62,7 @@ class _LabelClassifier(nn.Module):
     per-side unary terms `linear_left`, `linear_right`.
 
     Args:
-        input_left:  [1, input_size]
+        input_left: [1, input_size]
         input_right: [1, input_size]
 
     Returns:
@@ -99,7 +99,7 @@ class _Segmenter(nn.Module):
 
     def loss(self, embeddings: torch.Tensor, edu_end_positions: list[int]) -> torch.Tensor:
         """Args:
-            embeddings:        [num_tokens, hidden_size]
+            embeddings: [num_tokens, hidden_size]
             edu_end_positions: token indices of EDU ends (inclusive)
 
         Returns:
@@ -151,7 +151,7 @@ class DMRSTParser(nn.Module):
 
     Training (`forward`) is teacher-forced and returns the split, label, and
     segmentation losses separately so the trainer can apply dynamic loss
-    weighting; `loss` is their unweighted sum.
+    weighting. `loss` is their unweighted sum.
     """
 
     def __init__(self, config: DMRSTConfig):
@@ -260,9 +260,9 @@ class DMRSTParser(nn.Module):
         the model is in train mode. Otherwise, returns a zero scalar.
 
         Returns:
-            edu_reprs:    [num_edus, hidden_size]
+            edu_reprs: [num_edus, hidden_size]
             decoder_init: [1, 1, hidden_size]
-            seg_loss:     scalar tensor (zero when joint segmentation is disabled)
+            seg_loss: scalar tensor (zero when joint segmentation is disabled)
         """
         input_ids, edu_mapping = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
         embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
@@ -293,17 +293,17 @@ class DMRSTParser(nn.Module):
         directions concatenated) hidden state.
 
         Args:
-            embeddings:  [num_tokens, hidden_size]
+            embeddings: [num_tokens, hidden_size]
             edu_mapping: list of (start_token, end_token_exclusive) per EDU
 
         Returns:
-            edu_reprs:    [num_edus, hidden_size]
+            edu_reprs: [num_edus, hidden_size]
             decoder_init: [1, 1, hidden_size]
         """
-        # [1, num_edus, hidden_size] — unsqueeze gives the batch dim the GRU expects.
+        # [1, num_edus, hidden_size]. Unsqueeze gives the batch dim the GRU expects.
         avg_edu_reprs = torch.stack([embeddings[b:e].mean(0) for b, e in edu_mapping]).unsqueeze(0)
 
-        # gru_out:    [1, num_edus, hidden_size]
+        # gru_out: [1, num_edus, hidden_size]
         # gru_hidden: [num_layers * num_directions, 1, hidden_size // 2]   (= [4, 1, H/2])
         gru_out, gru_hidden = self.doc_gru(avg_edu_reprs)
 
@@ -338,12 +338,12 @@ class DMRSTParser(nn.Module):
         to the edge form since both pooling modes collapse to picking the lone EDU.
 
         Args:
-            edu_reprs:   [num_edus, hidden_size]
-            b, e:        EDU range of the span (exclusive at `e`)
+            edu_reprs: [num_edus, hidden_size]
+            b, e: EDU range of the span (exclusive at `e`)
             split_point: gold/predicted split position
 
         Returns:
-            input_left:  [1, hidden_size]
+            input_left: [1, hidden_size]
             input_right: [1, hidden_size]
         """
         if e - b == 2 or self.label_input_pooling == "last_edu":
@@ -364,7 +364,7 @@ class DMRSTParser(nn.Module):
         by attending over the span's EDU representations.
 
         Per gold span (b, e):
-          1. Step the decoder on the span's mean EDU repr — output is the query.
+          1. Step the decoder on the span's mean EDU repr (output is the query).
           2. Pointer attention scores the gold split (cross-entropy loss).
           3. Bilinear classifier scores the gold (nuc, rel) label (CE loss).
 
@@ -394,7 +394,7 @@ class DMRSTParser(nn.Module):
             b, e = stack.pop()
 
             # One decoder step per span. The input (mean of the span's EDUs)
-            # grounds the GRU in "what I'm deciding about now"; the carried
+            # grounds the GRU in "what I'm deciding about now". The carried
             # hidden state grounds it in "what I've decided so far". The
             # output becomes the query for pointer attention below.
             decoder_input = edu_reprs[b:e].mean(0, keepdim=True).unsqueeze(0)
@@ -404,7 +404,7 @@ class DMRSTParser(nn.Module):
             gold_label_idx = self.label_index.index(gold_label_str)
 
             if e - b == 2:
-                # Only one possible split; skip pointer loss, use the two EDUs directly.
+                # Only one possible split. Skip pointer loss, use the two EDUs directly.
                 input_left = edu_reprs[b].unsqueeze(0)
                 input_right = edu_reprs[b + 1].unsqueeze(0)
             else:
@@ -416,7 +416,7 @@ class DMRSTParser(nn.Module):
 
                 input_left, input_right = self._build_label_inputs(edu_reprs, b, e, gold_split)
 
-                # Push right then left so left pops first — DFS left-first matches
+                # Push right then left so left pops first. DFS left-first matches
                 # the order in which the sequential decoder sees decisions.
                 if e - gold_split > 1:
                     stack.append((gold_split, e))
@@ -444,7 +444,7 @@ class DMRSTParser(nn.Module):
         """Greedy top-down decode given precomputed EDU reprs and decoder init.
 
         Args:
-            edu_reprs:      [num_edus, hidden_size]
+            edu_reprs: [num_edus, hidden_size]
             decoder_hidden: [num_layers, 1, hidden_size]
 
         Returns:

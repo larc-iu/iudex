@@ -10,8 +10,8 @@ PARSER_SCOPED_COMMANDS: dict[str, str] = {
 
 GLOBAL_COMMANDS: dict[str, str] = {}
 
-# RST adds `relation_types` (inferred post-hash from train/dev data; would
-# otherwise silently mismatch between train and predict).
+# RST adds `relation_types` (inferred post-hash from train/dev data, which
+# would otherwise silently mismatch between train and predict).
 HASH_EXCLUDE: tuple[str, ...] = DEFAULT_HASH_EXCLUDE + ("relation_types",)
 
 __all__ = ["PARSERS", "PARSER_SCOPED_COMMANDS", "GLOBAL_COMMANDS", "HASH_EXCLUDE"]

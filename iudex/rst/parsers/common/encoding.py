@@ -11,7 +11,7 @@ _TOKENIZER_MAX_LEN_SENTINEL = 1_000_000
 
 
 def load_encoder_and_tokenizer(model_name: str) -> tuple[torch.nn.Module, Any, int]:
-    """Load a BERT-style HF encoder + tokenizer; returns (encoder, tokenizer, max_length).
+    """Load a BERT-style HF encoder + tokenizer. Returns (encoder, tokenizer, max_length).
 
     Forces fp32: transformers>=5 honors the checkpoint dtype, and fp16
     checkpoints (e.g. SpanBERT) NaN immediately under AdamW. Raises if
@@ -39,7 +39,7 @@ def tokenize_edus(
     """Tokenize a sequence of EDUs into a flat token-id tensor + per-EDU boundaries.
 
     Returns:
-        input_ids:  [num_tokens]
+        input_ids: [num_tokens]
         boundaries: list of (start_token, end_token_exclusive) per EDU
     """
     all_ids: list[int] = []
@@ -62,7 +62,7 @@ def encode_tokens_strided(
     """Encode a flat token sequence with overlapping sliding windows.
 
     Long documents exceed the LM's positional budget, so we tile with windows
-    that overlap by `stride` tokens; overlapped positions keep the embedding
+    that overlap by `stride` tokens. Overlapped positions keep the embedding
     from the *earlier* window (more left context).
 
     Returns: [num_tokens, hidden_size]  (1:1 with input positions).
@@ -101,7 +101,7 @@ def encode_tokens_strided(
     hidden = encoder(input_ids=batch_ids, attention_mask=batch_mask).last_hidden_state
     # hidden: [num_chunks, max_chunk_len, hidden_size]
 
-    # Strip CLS/SEP; for chunks i > 0, also drop the first `stride` tokens
+    # Strip CLS/SEP. For chunks i > 0, also drop the first `stride` tokens
     # (which are duplicates of the previous chunk's tail).
     pieces = []
     for i, clen in enumerate(chunk_lens):

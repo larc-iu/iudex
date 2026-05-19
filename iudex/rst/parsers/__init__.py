@@ -1,6 +1,6 @@
-"""Registry of RST parsers — single source of truth for the dispatcher,
+"""Registry of RST parsers. Single source of truth for the dispatcher,
 the shared `push` / `predict` CLIs, and `runs list`. To add a parser, add
-one `ParserSpec` entry; module paths follow `<package>/{configuration,
+one `ParserSpec` entry. Module paths follow `<package>/{configuration,
 modeling,train,predict}_<name>.py` and class names follow `<Name>Config`
 / `<Name>Parser`.
 """

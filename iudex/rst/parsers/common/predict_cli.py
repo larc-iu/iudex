@@ -132,7 +132,7 @@ def _glob_or_single(path: str, patterns: tuple[str, ...]) -> list[str]:
 def _require_segmenter(model, flag: str) -> None:
     if model.segmenter is None:
         console.print(
-            f"[bold red]This model has no segmenter[/bold red] — train with "
+            f"[bold red]This model has no segmenter[/bold red]. Train with "
             f"a non-null `segmentation:` block in your jsonnet to use {flag}."
         )
         sys.exit(1)

@@ -2,7 +2,7 @@
 
 The on-disk layout written here (`last.pt`/`last.json`,
 `best_model.pt`/`best_model.json`, `config.json`) is the contract
-`iudex.runs` reads — frameworks that bypass these helpers don't show up
+`iudex.runs` reads. Frameworks that bypass these helpers don't show up
 in `iudex runs list`.
 """
 
@@ -70,7 +70,7 @@ def set_seeds(seed: int) -> None:
 
 
 def install_abort_handler():
-    """SIGINT soft-abort: first Ctrl-C sets `flag.value = True`; the
+    """SIGINT soft-abort. First Ctrl-C sets `flag.value = True`. The
     second restores the default handler so a hung cleanup path is still
     hard-killable. Returns the flag object."""
 
@@ -109,7 +109,7 @@ def derive_run_id(
     """Compute the run id ("{run_name}-{hash}" or just "{hash}") and hash.
 
     Fields named in `hash_exclude` are stripped before hashing so they don't
-    affect run identity (see `DEFAULT_HASH_EXCLUDE`). No I/O — safe to call
+    affect run identity (see `DEFAULT_HASH_EXCLUDE`). No I/O, so safe to call
     from inference paths. Returns (run_id, cfg_hash).
     """
     hashable = {k: v for k, v in config_dict.items() if k not in hash_exclude}
@@ -128,7 +128,7 @@ def prepare_run_dir(
     """`mkdir -p` the derived run dir and return (run_dir, cfg_hash). On
     first creation, hints at the closest sibling run (catches accidental
     field bumps that branched into a new hash). Does NOT write
-    `config.json` — callers do that after resolving inferred fields, so
+    `config.json`. Callers do that after resolving inferred fields, so
     the on-disk audit, embedded ckpt config, and Hub config.json all match.
     """
     run_id, cfg_hash = derive_run_id(config_dict, run_name, hash_exclude=hash_exclude)
@@ -196,7 +196,7 @@ def resume_or_init(
     scheduler,
     expected_hash: str,
 ) -> dict[str, Any]:
-    """Restore from `{run_dir}/last.pt` if hash matches; else fresh state.
+    """Restore from `{run_dir}/last.pt` if hash matches, else fresh state.
     Returns dict with keys: global_step, epoch, best_val, stale_validations.
     """
     ckpt = try_resume(os.path.join(run_dir, "last.pt"), expected_hash=expected_hash)
@@ -222,7 +222,7 @@ def build_optimizer(
 ) -> AdamW:
     """AdamW with no-decay on biases / norm weights, plus per-submodule LRs.
     Params in each `(submodule, sub_lr)` entry use `sub_lr` (first listed
-    wins on overlap); everything else uses `lr`.
+    wins on overlap). Everything else uses `lr`.
     """
 
     def _is_no_decay(name: str) -> bool:
@@ -282,7 +282,7 @@ def save_checkpoint(path: str, model: nn.Module, optimizer, scheduler, **extra) 
 
 
 def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | None:
-    """Checkpoint dict iff it exists and config_hash matches; else None.
+    """Checkpoint dict iff it exists and config_hash matches, else None.
     Mismatch warns loudly (hand-copied last.pt, or a previous hash scheme)
     so the user can stop us before overwriting.
     """
@@ -294,7 +294,7 @@ def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | 
         warn(
             f"Config hash mismatch on [path]{checkpoint_path}[/path] "
             f"(checkpoint={found_hash!r}, expected={expected_hash!r}). "
-            f"Starting fresh — this run will overwrite the existing last.pt."
+            f"Starting fresh. This run will overwrite the existing last.pt."
         )
         return None
     console.print(

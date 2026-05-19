@@ -1,7 +1,7 @@
 """iudex CLI dispatcher.
 
 `iudex <parser> <cmd>` or `iudex <cmd>` for globals. Routes by merging the
-registries declared by each framework in `iudex.FRAMEWORKS`; see
+registries declared by each framework in `iudex.FRAMEWORKS`. See
 `iudex/__init__.py` for the framework contract.
 """
 

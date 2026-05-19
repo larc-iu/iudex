@@ -22,7 +22,7 @@ def spans_to_token_ranges(
     """Mirror Parseval's parent-keyed span enumeration but map each
     constituent's `(first_edu, last_edu)` through `edu_mapping` to inclusive-
     token coordinates. Used for end-to-end Parseval where gold and predicted
-    trees can have different EDU sets — token-range matching sidesteps the
+    trees can have different EDU sets, so token-range matching sidesteps the
     EDU-index alignment problem.
 
     `edu_mapping` is `[(token_start, token_end_exclusive), ...]` per EDU.
@@ -41,7 +41,7 @@ def compute_seg_metrics(gold_ends: List[int], pred_ends: List[int]) -> Dict[str,
     """Position-level segmentation counts (Carlson/Marcu convention).
 
     `gold_ends` and `pred_ends` are inclusive token end indices, including
-    the forced terminal break — matches the original `Metric.py:getSegMeasure`.
+    the forced terminal break, matching the original `Metric.py:getSegMeasure`.
     The terminal token is always a gold end and always a predicted end,
     so it contributes a guaranteed +1 to `seg_correct` per document.
     """
@@ -60,10 +60,10 @@ def compute_e2e_parseval(
 ) -> Dict[str, int]:
     """End-to-end Parseval counts using token-range keys (gold and pred can
     have different EDU sets). Mirrors `compute_parseval_metrics`'s matching
-    logic exactly; only the key type changed.
+    logic exactly. Only the key type changed.
 
-    Returns counts only — caller micro-aggregates. Pred and gold span counts
-    can differ now, so per-tree P/R use different denominators; computing F1
+    Returns counts only, caller micro-aggregates. Pred and gold span counts
+    can differ now, so per-tree P/R use different denominators. Computing F1
     here would invite inconsistent aggregation.
     """
     gold_index = {s[0]: s[1:] for s in gold_tok_spans}

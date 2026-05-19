@@ -176,7 +176,7 @@ def train(cfg: DMRSTConfig) -> None:
         loaded_history = checkpoint.get("dlw_loss_history")
         loaded_weights = checkpoint.get("dlw_weights")
         if loaded_history is not None:
-            # Drop components that aren't active in this config; init missing ones empty.
+            # Drop components that aren't active in this config. Init missing ones empty.
             loss_history = {k: list(loaded_history.get(k, [])) for k in components}
         if loaded_weights is not None and isinstance(loaded_weights, dict):
             weights = {k: float(loaded_weights.get(k, 1.0)) for k in components}
@@ -275,8 +275,8 @@ def train(cfg: DMRSTConfig) -> None:
                 epoch_step += 1
 
                 # Dynamic loss weighting (paper §3.2, lagged ratio). Store this
-                # step's component losses, then — once we have at least 3
-                # stored — compute next step's weights from `r = list[-1] / list[-2]`.
+                # step's component losses, then (once we have at least 3
+                # stored) compute next step's weights from `r = list[-1] / list[-2]`.
                 # Adaptation effectively begins at step 4.
                 if cfg.dlw is not None:
                     window = cfg.dlw.window
@@ -284,7 +284,7 @@ def train(cfg: DMRSTConfig) -> None:
                         loss_history[k].append(curr_sums[k])
                         if len(loss_history[k]) > window + 1:
                             loss_history[k] = loss_history[k][-(window + 1) :]
-                    # Need `window + 1` stored before triggering — one warm-up
+                    # Need `window + 1` stored before triggering, one warm-up
                     # step beyond the window itself, matching the original code's
                     # `> 2` guard when `window == 2`.
                     if len(loss_history[components[0]]) > window:
@@ -292,7 +292,7 @@ def train(cfg: DMRSTConfig) -> None:
                         num_components = len(components)
                         # Compare mean of recent half vs mean of earlier half.
                         # For window=2: half=1, recent=history[-1], earlier=history[-2]
-                        #   — exactly the original paper's L(t-1)/L(t-2) ratio.
+                        # which is exactly the original paper's L(t-1)/L(t-2) ratio.
                         # For window=20: half=10, ten-step means each side.
                         half = max(window // 2, 1)
                         recent = {k: sum(loss_history[k][-half:]) / half for k in components}

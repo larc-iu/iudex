@@ -51,7 +51,7 @@ def _evaluate_on_dev(
     output_dir: str | None = None,
 ) -> dict[str, float]:
     """Run the model over `dev_pairs` and aggregate gold-EDU Parseval.
-    No segmentation — this parser assumes gold EDUs."""
+    No segmentation, this parser assumes gold EDUs."""
     gold_trees: list[RstTree] = []
     gold_preds: list[RstTree] = []
     for filepath, gold in dev_pairs:

@@ -1,7 +1,7 @@
 """Registry of known RST corpora for model-card rendering.
 
-Keys are directory prefixes — `lookup("data/rstdt/train")` returns the
-RST-DT entry. Fields beyond `name` are optional; missing ones are omitted
+Keys are directory prefixes. `lookup("data/rstdt/train")` returns the
+RST-DT entry. Fields beyond `name` are optional. Missing ones are omitted
 from the card.
 """
 
@@ -69,7 +69,7 @@ def lookup(path: str) -> dict | None:
     """Return the dataset entry whose directory-prefix key is a prefix of `path`.
 
     `path` is typically the value of `cfg.train_dir`. Longest match wins.
-    Returns None if nothing matches — callers should fall back to showing the
+    Returns None if nothing matches, so callers should fall back to showing the
     raw path.
     """
     if not path:
