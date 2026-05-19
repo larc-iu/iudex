@@ -166,7 +166,14 @@ class DMRSTParser(nn.Module):
             for p in self.encoder.embeddings.parameters():
                 p.requires_grad = False
         if config.freeze_encoder_layers > 0:
-            for layer in self.encoder.encoder.layer[: config.freeze_encoder_layers]:
+            # BERT/RoBERTa/XLM-R: encoder.encoder.layer; ModernBert/Ettin: encoder.layers
+            if hasattr(self.encoder, "encoder") and hasattr(self.encoder.encoder, "layer"):
+                layers = self.encoder.encoder.layer
+            elif hasattr(self.encoder, "layers"):
+                layers = self.encoder.layers
+            else:
+                raise ValueError(f"Don't know how to access transformer layers on {type(self.encoder).__name__}")
+            for layer in layers[: config.freeze_encoder_layers]:
                 for p in layer.parameters():
                     p.requires_grad = False
 
