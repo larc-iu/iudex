@@ -29,10 +29,13 @@ Note that the command you will invoke is `iudex`, not `larc-iudex`.
 
 Parse a sample document end-to-end with a pretrained DMRST model pulled from the HuggingFace Hub. From the command line:
 
-```
-$ iudex dmrst predict \
+```bash
+iudex dmrst predict \
     --hub-id larc-iu/dmrst-gum-12.1.0 \
     --text "Although the experiment was carefully designed, the results were inconclusive. We plan to repeat it tonight."
+```
+This yields the parsed tree in `.rs3` format printed to `stdout`:
+```xml
 <rst>
   <relations><!-- ... --></relations>
   <body>
@@ -45,8 +48,6 @@ $ iudex dmrst predict \
 </rst>
 ```
 
-The parsed RS4 tree is printed to stdout.
-
 The same flow from Python:
 
 ```python
@@ -58,20 +59,20 @@ tree = parser.predict_from_text(
     "We plan to repeat it tonight."
 )
 print(tree.to_rs4_string())
-# <rst>
-#   <relations><!-- ... --></relations>
-#   <body>
-#     <segment id="1" parent="2" relname="adversative-concession">Although the experiment was carefully # designed,</segment>
-#     <segment id="2" parent="4" relname="span">the results were inconclusive.</segment>
-#     <segment id="3" parent="5" relname="span">We plan to repeat it tonight.</segment>
-#     <group id="4" type="span" parent="3" relname="adversative-antithesis"/>
-#     <group id="5" type="span"/>
-#   </body>
-# </rst>
 ```
-
-`from_pretrained` accepts a Hub repo id, a local run directory, or a `.pt` path.
-Optional kwargs include `device`, `revision`, `cache_dir`, `token`.
+Yields:
+```xml
+<rst>
+  <relations><!-- ... --></relations>
+  <body>
+    <segment id="1" parent="2" relname="adversative-concession">Although the experiment was carefully # designed,</segment>
+    <segment id="2" parent="4" relname="span">the results were inconclusive.</segment>
+    <segment id="3" parent="5" relname="span">We plan to repeat it tonight.</segment>
+    <group id="4" type="span" parent="3" relname="adversative-antithesis"/>
+    <group id="5" type="span"/>
+  </body>
+</rst>
+```
 
 ### Other Ways to Run Inference
 
