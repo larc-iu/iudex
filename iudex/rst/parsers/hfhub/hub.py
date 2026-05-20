@@ -285,9 +285,21 @@ def render_model_card(
     # `predict_from_text`. Otherwise predictions require pre-segmented
     # RS3/RS4 trees (the parser's `predict` takes an `RstTree`).
     if config.get("segmentation") is not None:
-        predict_snippet = 'tree = parser.predict_from_text("Your document text here. Multiple sentences are fine.")'
+        predict_snippet = (
+            "tree = parser.predict_from_text(\n"
+            '    "Although the experiment was carefully designed, "\n'
+            '    "the results were inconclusive. "\n'
+            '    "We plan to repeat it tonight."\n'
+            ")"
+        )
         cli_snippet = (
-            f"python -m iudex {parser_kind} predict --hub-id {repo_id} --text-file <doc.txt> --output-dir out/"
+            f"iudex {parser_kind} predict \\\n"
+            f"    --hub-id {repo_id} \\\n"
+            '    --text "Although the experiment was carefully designed, '
+            'the results were inconclusive. We plan to repeat it tonight."'
+        )
+        cli_batch_note = (
+            "To parse a raw `.txt` file or a directory of them instead, use `--text-file <path> --output-dir out/`.\n"
         )
     else:
         predict_snippet = (
@@ -300,7 +312,13 @@ def render_model_card(
             ")\n"
             "tree = parser.predict(gold)"
         )
-        cli_snippet = f"python -m iudex {parser_kind} predict --hub-id {repo_id} --input <doc.rs3> --output-dir out/"
+        cli_snippet = (
+            f"iudex {parser_kind} predict \\\n"
+            f"    --hub-id {repo_id} \\\n"
+            "    --input <doc.rs3> \\\n"
+            "    --output-dir out/"
+        )
+        cli_batch_note = "`--input` also accepts a directory of `.rs3` / `.rs4` files.\n"
 
     extras_section = ""
     if extra:
@@ -377,19 +395,21 @@ This model uses [`{encoder}`](https://huggingface.co/{encoder}) as its underlyin
 {data_section}
 ## Usage
 
-Programmatic:
+### CLI
+
+```
+{cli_snippet}
+```
+
+{cli_batch_note}
+### Python
 
 ```python
 from {meta["module_path"]} import {meta["class_name"]}
 
 parser = {meta["class_name"]}.from_pretrained("{repo_id}")
 {predict_snippet}
-```
-
-CLI:
-
-```
-{cli_snippet}
+print(tree.to_rs4_string())
 ```
 
 ## Citation
