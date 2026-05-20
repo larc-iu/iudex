@@ -38,6 +38,7 @@ dependencies = [
     "rich",
     "sentencepiece",
     "tensorboard",
+    "setuptools<81",  # tensorboard 2.20 still imports pkg_resources, removed in setuptools 81+
 ]
 
 [project.urls]
