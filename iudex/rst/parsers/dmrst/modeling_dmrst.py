@@ -9,7 +9,7 @@ from iudex.rst.data.tree import RstTree
 from iudex.rst.parsers.common.encoding import (
     encode_tokens_strided,
     load_encoder_and_tokenizer,
-    tokenize_edus,
+    tokenize_document,
 )
 from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
 
@@ -271,7 +271,7 @@ class DMRSTParser(nn.Module):
             decoder_init: [1, 1, hidden_size]
             seg_loss: scalar tensor (zero when joint segmentation is disabled)
         """
-        input_ids, edu_mapping = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
+        input_ids, edu_mapping = tokenize_document(self.tokenizer, tree.edu_strings, self.device)
         embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(embeddings.float())  # [num_tokens, hidden_size]
 
@@ -556,7 +556,7 @@ class DMRSTParser(nn.Module):
             }
         """
         self.eval()
-        input_ids, gold_edu_mapping = tokenize_edus(self.tokenizer, tree.edu_strings, self.device)
+        input_ids, gold_edu_mapping = tokenize_document(self.tokenizer, tree.edu_strings, self.device)
         token_embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(token_embeddings.float())
         embeddings = self.encoder_dropout(normed)  # eval mode → identity

@@ -52,6 +52,65 @@ def tokenize_edus(
     return torch.tensor(all_ids, dtype=torch.long, device=device), boundaries
 
 
+def tokenize_document(
+    tokenizer: Any,
+    edu_strings: list[str],
+    device: torch.device,
+) -> tuple[torch.Tensor, list[tuple[int, int]]]:
+    """Tokenize EDUs as one continuous document, mapping gold EDU boundaries
+    onto the continuous token offsets. Same return contract as `tokenize_edus`.
+
+    Unlike `tokenize_edus` (which encodes each EDU in isolation), this joins the
+    EDUs with single spaces and encodes the whole string once. The difference
+    matters for joint segmenters: encoding an EDU in isolation strips the
+    leading-space marker (e.g. RoBERTa/ModernBert `Ġ`) from its first subword,
+    so every EDU-initial token looks word-initial. A segmenter trained that way
+    learns "no leading-space marker = boundary", a cue that is absent from real
+    continuous text and makes it predict zero breaks at inference (where
+    `predict_from_text` tokenizes the raw string continuously). Encoding
+    continuously here keeps train and inference tokenization identical.
+
+    SentencePiece encoders (e.g. XLM-R) prefix word starts with the same marker
+    in both modes, so they were unaffected, but this is correct for them too.
+
+    Requires a fast tokenizer (offset mapping).
+    """
+    if not getattr(tokenizer, "is_fast", False):
+        raise ValueError("tokenize_document requires a fast tokenizer (offset mapping unavailable)")
+
+    edus = [e.strip() for e in edu_strings]
+    doc = " ".join(edus)
+    enc = tokenizer(doc, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+
+    # Exclusive char-end of each EDU within the space-joined doc.
+    char_ends: list[int] = []
+    pos = 0
+    for i, edu in enumerate(edus):
+        if i > 0:
+            pos += 1  # the single joining space
+        pos += len(edu)
+        char_ends.append(pos)
+
+    # A token belongs to EDU i iff its char-end falls within EDU i's char span.
+    # The joining space forces a token break, so no token straddles a boundary.
+    boundaries: list[tuple[int, int]] = []
+    tok_idx, ntok = 0, len(offsets)
+    for end_char in char_ends:
+        start = tok_idx
+        while tok_idx < ntok and offsets[tok_idx][1] <= end_char:
+            tok_idx += 1
+        boundaries.append((start, tok_idx))
+    # Defensive: a token overrunning the last EDU end (shouldn't happen with
+    # space-joined EDUs) is folded into the final EDU rather than dropped.
+    if tok_idx < ntok and boundaries:
+        s, _ = boundaries[-1]
+        boundaries[-1] = (s, ntok)
+
+    input_ids = torch.tensor(enc["input_ids"], dtype=torch.long, device=device)
+    return input_ids, boundaries
+
+
 def encode_tokens_strided(
     encoder: torch.nn.Module,
     tokenizer: Any,
