@@ -32,6 +32,7 @@ from iudex.common.training import (
     save_checkpoint,
     schedule_panel,
     set_seeds,
+    TBLogger,
     try_resume,
     write_run_config,
 )
@@ -117,6 +118,7 @@ def train(cfg: DMRSTConfig) -> None:
     # embedded in the .pt, and uploaded to the Hub.
     cfg_dict = dataclasses.asdict(cfg)
     write_run_config(run_dir, cfg_dict)
+    tb = TBLogger(run_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DMRSTParser(cfg).to(device)
@@ -204,6 +206,7 @@ def train(cfg: DMRSTConfig) -> None:
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         model.eval()
         metrics = _evaluate_on_dev(model, dev_pairs, output_dir=pred_dir)
+        tb.log_scalars("dev", metrics, global_step)
         console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
         score = metrics[cfg.val_metric_name]
         if score > best_val:
@@ -323,6 +326,14 @@ def train(cfg: DMRSTConfig) -> None:
                 )
 
                 if epoch_step % cfg.log_every == 0:
+                    tb_train = {"loss": avg_loss, "lr": max(scheduler.get_last_lr()), "grad_norm": float(grad_norm)}
+                    if mem:
+                        tb_train["gpu_mem_gb"] = mem[1]
+                    if cfg.dlw is not None:
+                        for k in components:
+                            tb_train[f"loss_{k}"] = loss_history[k][-1]
+                            tb_train[f"weight_{k}"] = weights[k]
+                    tb.log_scalars("train", tb_train, global_step)
                     mem_log = f"  mem=[dim]{mem[1]:.1f}GB[/dim]" if mem else ""
                     w_log = (
                         "  w=[dim]" + "/".join(f"{weights[k]:.2f}" for k in components) + "[/dim]"
@@ -381,12 +392,14 @@ def train(cfg: DMRSTConfig) -> None:
             )
             console.print(metrics_table(test_m, title="Final Test Results"))
             final_metrics["test"] = test_m
+            tb.log_scalars("test", test_m, global_step)
         # Sidecar for downstream tools (e.g. hub.py model card) so they don't
         # need to torch.load the checkpoint just to read corpus-level numbers.
         with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
             json.dump(final_metrics, f, indent=2)
     else:
         success(f"Training complete. Best {cfg.val_metric_name}: {best_val:.4f}")
+    tb.close()
 
 
 def main():

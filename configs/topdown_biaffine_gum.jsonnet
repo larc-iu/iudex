@@ -1,5 +1,4 @@
-// topdown_biaffine trained on GUM 12.1 (English RST). Gold EDU segmentation —
-// this parser does not train a segmenter.
+// topdown_biaffine trained on GUM 12.1 (English RST).
 {
     relation_map: null,
 
@@ -17,13 +16,13 @@
     // Training
     lr: 2e-4,
     encoder_lr: 1e-5,
-    max_epochs: 30,
+    max_epochs: 50,
     grad_accum: 1,
     patience: 10,
     max_grad_norm: 1.0,
     weight_decay: 0.01,
     num_warmup_steps: 1000,
-    log_every: 50,
+    log_every: 1,
     validate_every: null,
     checkpoint_every: null,
     checkpoint_dir: "checkpoints",

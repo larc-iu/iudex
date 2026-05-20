@@ -31,6 +31,7 @@ from rich.progress import (
 from rich.table import Table
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.tensorboard import SummaryWriter
 
 from iudex.common.log import console, dim, warn
 
@@ -301,6 +302,23 @@ def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | 
         f"[bold cyan]Resuming[/bold cyan] from step {ckpt.get('global_step', '?')}, epoch {ckpt.get('epoch', '?')}"
     )
     return ckpt
+
+
+class TBLogger:
+    """Thin SummaryWriter wrapper writing to `{run_dir}/tb`. `log_scalars`
+    namespaces each value under `prefix/` so TensorBoard groups train/ vs dev/.
+    On resume a new event file is appended into the same dir; TensorBoard merges
+    by tag and step."""
+
+    def __init__(self, run_dir: str):
+        self.writer = SummaryWriter(log_dir=os.path.join(run_dir, "tb"))
+
+    def log_scalars(self, prefix: str, scalars: dict[str, float], step: int) -> None:
+        for name, value in scalars.items():
+            self.writer.add_scalar(f"{prefix}/{name}", value, step)
+
+    def close(self) -> None:
+        self.writer.close()
 
 
 def make_progress_bar() -> Progress:

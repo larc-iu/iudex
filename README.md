@@ -164,6 +164,14 @@ $ iudex runs list
 └──────────────┴──────────┴──────────────────┴──────────────────────────────┴───────────────────────┴───────────┴──────┴──────────────────┘
 ```
 
+### Monitoring with TensorBoard
+
+Every run writes TensorBoard scalars (train loss, learning rate, gradient norm, and dev metrics) to `<run_dir>/tb/`. Point TensorBoard at your checkpoints directory to watch any run live or compare runs:
+
+```
+tensorboard --logdir checkpoints/
+```
+
 ### Pushing Models to HF Hub
 You may host a trained model using each parser's `push` subcommand.
 Each uploads `best_model.pt`, `config.json`, and an auto-generated `README.md` in a single commit:

@@ -27,15 +27,16 @@
     dev_dir: "data/gum_12.1.0/dev",
     test_dir: "data/gum_12.1.0/test",
 
+    // Training
     lr: 1e-4,
     encoder_lr: 2e-5,
-    max_epochs: 30,
+    max_epochs: 50,
     grad_accum: 3,
     patience: 10,
     max_grad_norm: 5.0,
     weight_decay: 0.01,
     num_warmup_steps: 1000,
-    log_every: 50,
+    log_every: 1,
     validate_every: null,
     checkpoint_every: null,
     checkpoint_dir: "checkpoints",
