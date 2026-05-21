@@ -22,6 +22,10 @@
         start_loss: false,
     },
 
+    // Detokenize corpus EDU text to natural form so the segmenter trains on the
+    // same kind of text `predict_from_text` sees. Only applied with segmentation.
+    detokenizer: { type: "sacremoses", lang: "en" },
+
     // Data
     train_dir: "data/gum_12.1.0/train",
     dev_dir: "data/gum_12.1.0/dev",

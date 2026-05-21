@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from tonga import FromParams
 
 from iudex.rst.parsers.common.config import parse_config_dict
+from iudex.rst.parsers.common.detokenization import Detokenizer
 
 
 @dataclass
@@ -70,6 +71,11 @@ class DMRSTConfig(FromParams):
 
     # Joint EDU segmentation (paper §3.1.1). See `_SegmentationConfig`.
     segmentation: _SegmentationConfig | None = None
+
+    # Detokenizer for EDU text. Applied only when `segmentation` is non-null, so
+    # end-to-end-from-text models train on natural text matching the raw input
+    # `predict_from_text` receives. Registrable; see common.detokenization.
+    detokenizer: Detokenizer | None = None
 
     # Dynamic loss weighting (paper §3.2). See `_DLWConfig`.
     dlw: _DLWConfig | None = None

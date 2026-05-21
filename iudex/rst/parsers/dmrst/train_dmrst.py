@@ -11,7 +11,7 @@ from collections import deque
 import torch
 from tonga import Params
 
-from iudex.common.log import console, dim, rule, setup_logging, success, warn
+from iudex.common.log import console, dim, rule, setup_logging, success, warn, wrote
 from iudex.rst import HASH_EXCLUDE
 from iudex.rst.data.metrics import evaluate_parseval, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
@@ -89,6 +89,8 @@ def _evaluate_on_dev(
     metrics = evaluate_parseval(gold_trees, gold_preds)
     if seg_data is not None:
         metrics.update(evaluate_seg_and_e2e(gold_trees, seg_data))
+    if output_dir is not None:
+        console.print(f"[dim]Wrote {len(dev_pairs)} predictions under[/dim] [path]{os.path.abspath(output_dir)}[/path]")
     return metrics
 
 
@@ -395,8 +397,10 @@ def train(cfg: DMRSTConfig) -> None:
             tb.log_scalars("test", test_m, global_step)
         # Sidecar for downstream tools (e.g. hub.py model card) so they don't
         # need to torch.load the checkpoint just to read corpus-level numbers.
-        with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
+        metrics_path = os.path.join(run_dir, "final_metrics.json")
+        with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(final_metrics, f, indent=2)
+        wrote(metrics_path)
     else:
         success(f"Training complete. Best {cfg.val_metric_name}: {best_val:.4f}")
     tb.close()

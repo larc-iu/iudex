@@ -226,6 +226,11 @@ class DMRSTParser(nn.Module):
             else None
         )
 
+        # Detokenize EDU text only for end-to-end (segmenter) models, so training
+        # matches the raw text `predict_from_text` receives. Gold-EDU-only models
+        # consume corpus-tokenized RS3/RS4 directly, so they keep it verbatim.
+        self.detokenizer = config.detokenizer if self.segmenter is not None else None
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -271,7 +276,9 @@ class DMRSTParser(nn.Module):
             decoder_init: [1, 1, hidden_size]
             seg_loss: scalar tensor (zero when joint segmentation is disabled)
         """
-        input_ids, edu_mapping = tokenize_document(self.tokenizer, tree.edu_strings, self.device)
+        input_ids, edu_mapping = tokenize_document(
+            self.tokenizer, tree.edu_strings, self.device, detokenizer=self.detokenizer
+        )
         embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(embeddings.float())  # [num_tokens, hidden_size]
 
@@ -556,7 +563,9 @@ class DMRSTParser(nn.Module):
             }
         """
         self.eval()
-        input_ids, gold_edu_mapping = tokenize_document(self.tokenizer, tree.edu_strings, self.device)
+        input_ids, gold_edu_mapping = tokenize_document(
+            self.tokenizer, tree.edu_strings, self.device, detokenizer=self.detokenizer
+        )
         token_embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(token_embeddings.float())
         embeddings = self.encoder_dropout(normed)  # eval mode → identity

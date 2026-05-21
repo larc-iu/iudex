@@ -37,6 +37,7 @@ dependencies = [
     "lxml",
     "rich",
     "sentencepiece",
+    "sacremoses",
     "tensorboard",
     "setuptools<81",  # tensorboard 2.20 still imports pkg_resources, removed in setuptools 81+
 ]

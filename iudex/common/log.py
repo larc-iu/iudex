@@ -1,6 +1,7 @@
 """Rich-based logging and console helpers."""
 
 import logging
+import os
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -39,6 +40,11 @@ def dim(msg: str) -> None:
 
 def rule(title: str) -> None:
     console.rule(f"[bold magenta]{title}[/bold magenta]")
+
+
+def wrote(path: str) -> None:
+    """Announce a file the program just wrote, with its absolute path."""
+    console.print(f"[dim]Wrote[/dim] [path]{os.path.abspath(path)}[/path]")
 
 
 def setup_logging(level: int = logging.INFO) -> None:

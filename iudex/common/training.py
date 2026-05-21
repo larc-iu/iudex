@@ -33,7 +33,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
-from iudex.common.log import console, dim, warn
+from iudex.common.log import console, dim, warn, wrote
 
 logger = logging.getLogger(__name__)
 
@@ -145,8 +145,10 @@ def write_run_config(run_dir: str, config_dict: dict) -> None:
     """Write `{run_dir}/config.json` (overwrites). Call after resolving
     inferred fields so audit / embedded ckpt config / Hub config all match.
     """
-    with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
+    cfg_path = os.path.join(run_dir, "config.json")
+    with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(config_dict, f, indent=2)
+    wrote(cfg_path)
 
 
 def _hint_closest_sibling(
@@ -280,6 +282,8 @@ def save_checkpoint(path: str, model: nn.Module, optimizer, scheduler, **extra) 
     sidecar_path = (path[:-3] if path.endswith(".pt") else path) + ".json"
     with open(sidecar_path, "w", encoding="utf-8") as f:
         json.dump(sidecar, f, indent=2)
+    wrote(path)
+    wrote(sidecar_path)
 
 
 def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | None:

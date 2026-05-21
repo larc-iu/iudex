@@ -117,7 +117,10 @@ def run_predict(parser_name: str) -> None:
                 f.write(pred.to_rs4_string())
             progress.advance(task)
 
-    console.print(f"[bold green]Done![/bold green] Wrote {len(paths)} predictions to [path]{args.output_dir}[/path]")
+    console.print(
+        f"[bold green]Done![/bold green] Wrote {len(paths)} predictions to "
+        f"[path]{os.path.abspath(args.output_dir)}[/path]"
+    )
 
 
 def _glob_or_single(path: str, patterns: tuple[str, ...]) -> list[str]:

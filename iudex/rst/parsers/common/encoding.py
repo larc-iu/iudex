@@ -1,9 +1,12 @@
 """Shared token-encoding utilities for RST parsers which rely on BERT-like encoders."""
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from transformers import AutoModel, AutoTokenizer
+
+if TYPE_CHECKING:
+    from iudex.rst.parsers.common.detokenization import Detokenizer
 
 # Tokenizers report `model_max_length = int(1e30)` when they have no advertised
 # limit (e.g. SpanBERT). Treat anything above this sentinel as "unspecified".
@@ -56,9 +59,15 @@ def tokenize_document(
     tokenizer: Any,
     edu_strings: list[str],
     device: torch.device,
+    detokenizer: "Detokenizer | None" = None,
 ) -> tuple[torch.Tensor, list[tuple[int, int]]]:
     """Tokenize EDUs as one continuous document, mapping gold EDU boundaries
     onto the continuous token offsets. Same return contract as `tokenize_edus`.
+
+    When `detokenizer` is given, each EDU is detokenized to natural text before
+    joining, so the model trains on the same form `predict_from_text` receives
+    at inference (the corpus EDU strings are word-tokenized). See
+    `iudex.rst.parsers.common.detokenization`.
 
     Unlike `tokenize_edus` (which encodes each EDU in isolation), this joins the
     EDUs with single spaces and encodes the whole string once. The difference
@@ -78,7 +87,11 @@ def tokenize_document(
     if not getattr(tokenizer, "is_fast", False):
         raise ValueError("tokenize_document requires a fast tokenizer (offset mapping unavailable)")
 
-    edus = [e.strip() for e in edu_strings]
+    edus = (
+        [detokenizer.detokenize(e) for e in edu_strings]
+        if detokenizer is not None
+        else [e.strip() for e in edu_strings]
+    )
     doc = " ".join(edus)
     enc = tokenizer(doc, add_special_tokens=False, return_offsets_mapping=True)
     offsets = enc["offset_mapping"]
