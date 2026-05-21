@@ -24,12 +24,12 @@
 
     // Detokenize corpus EDU text to natural form so the segmenter trains on the
     // same kind of text `predict_from_text` sees. Only applied with segmentation.
-    detokenizer: { type: "sacremoses", lang: "en" },
+    detokenizer: null,
 
     // Data
-    train_dir: "data/gum_12.1.0/train",
-    dev_dir: "data/gum_12.1.0/dev",
-    test_dir: "data/gum_12.1.0/test",
+    train_dir: "data/gum_12.1.0_notok/train",
+    dev_dir: "data/gum_12.1.0_notok/dev",
+    test_dir: "data/gum_12.1.0_notok/test",
 
     // Training
     lr: 1e-4,

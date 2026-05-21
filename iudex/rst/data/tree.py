@@ -294,6 +294,14 @@ class RstTree:
     def edu_strings(self) -> List[str]:
         return [edu.text for edu in self.edus]
 
+    # TODO(LDG): remove once rs3/rs4 formats are updated
+    @property
+    def edu_prefixes(self) -> List[Optional[str]]:
+        """Per-EDU `prefix` markers, in document order, aligned with `edu_strings`.
+        `None` means the legacy single-space default; "" means glued. Only
+        detokenized corpora populate these (see scripts/build_gum_notok.py)."""
+        return [edu.prefix for edu in self.edus]
+
     @property
     def nonterminals(self) -> List[RstNode]:
         return [n for n in self._node_map.values() if not n.is_edu]

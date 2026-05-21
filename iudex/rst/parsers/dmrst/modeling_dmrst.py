@@ -227,10 +227,14 @@ class DMRSTParser(nn.Module):
             else None
         )
 
-        # Detokenize EDU text only for end-to-end (segmenter) models, so training
-        # matches the raw text `predict_from_text` receives. Gold-EDU-only models
-        # consume corpus-tokenized RS3/RS4 directly, so they keep it verbatim.
+        # Faithful text reconstruction for end-to-end (segmenter) models, so
+        # training matches the raw text `predict_from_text` receives. A
+        # detokenized corpus's exact inter-EDU `prefix` markers are preferred
+        # when present (see RstTree.edu_prefixes); the heuristic detokenizer is
+        # the fallback. Gold-EDU-only models consume corpus-tokenized RS3/RS4
+        # verbatim, so they get neither.
         self.detokenizer = config.detokenizer if self.segmenter is not None else None
+        self.use_edu_prefixes = self.segmenter is not None
 
     @property
     def device(self):
@@ -280,7 +284,11 @@ class DMRSTParser(nn.Module):
             seg_loss: scalar tensor (zero when joint segmentation is disabled)
         """
         input_ids, edu_mapping = tokenize_document(
-            self.tokenizer, tree.edu_strings, self.device, detokenizer=self.detokenizer
+            self.tokenizer,
+            tree.edu_strings,
+            self.device,
+            detokenizer=self.detokenizer,
+            prefixes=tree.edu_prefixes if self.use_edu_prefixes else None,
         )
         embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(embeddings.float())  # [num_tokens, hidden_size]
@@ -567,7 +575,11 @@ class DMRSTParser(nn.Module):
         """
         self.eval()
         input_ids, gold_edu_mapping = tokenize_document(
-            self.tokenizer, tree.edu_strings, self.device, detokenizer=self.detokenizer
+            self.tokenizer,
+            tree.edu_strings,
+            self.device,
+            detokenizer=self.detokenizer,
+            prefixes=tree.edu_prefixes if self.use_edu_prefixes else None,
         )
         token_embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
         normed = self.layer_norm(token_embeddings.float())

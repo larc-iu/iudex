@@ -60,62 +60,84 @@ def tokenize_document(
     edu_strings: list[str],
     device: torch.device,
     detokenizer: "Detokenizer | None" = None,
+    prefixes: "list[str | None] | None" = None,
 ) -> tuple[torch.Tensor, list[tuple[int, int]]]:
     """Tokenize EDUs as one continuous document, mapping gold EDU boundaries
     onto the continuous token offsets. Same return contract as `tokenize_edus`.
 
-    When `detokenizer` is given, each EDU is detokenized to natural text before
-    joining, so the model trains on the same form `predict_from_text` receives
-    at inference (the corpus EDU strings are word-tokenized). See
-    `iudex.rst.parsers.common.detokenization`.
+    Text reconstruction picks the most faithful source available:
 
-    Unlike `tokenize_edus` (which encodes each EDU in isolation), this joins the
-    EDUs with single spaces and encodes the whole string once. The difference
-    matters for joint segmenters: encoding an EDU in isolation strips the
-    leading-space marker (e.g. RoBERTa/ModernBert `Ġ`) from its first subword,
-    so every EDU-initial token looks word-initial. A segmenter trained that way
-    learns "no leading-space marker = boundary", a cue that is absent from real
-    continuous text and makes it predict zero breaks at inference (where
-    `predict_from_text` tokenizes the raw string continuously). Encoding
-    continuously here keeps train and inference tokenization identical.
+      - `prefixes` given (detokenized corpora, e.g. data/gum_12.1.0_notok): EDU
+        text is used verbatim and joined by its exact inter-EDU `prefix` string
+        (`None` -> single space, "" -> glued). This reproduces the raw document
+        byte-for-byte, so it supersedes `detokenizer` (which is ignored).
+      - else `detokenizer` given: each word-tokenized EDU is detokenized to
+        natural text and the EDUs are joined with single spaces.
+      - else: EDUs are stripped and joined with single spaces.
 
-    SentencePiece encoders (e.g. XLM-R) prefix word starts with the same marker
-    in both modes, so they were unaffected, but this is correct for them too.
+    All three encode the whole string once. Unlike `tokenize_edus` (which
+    encodes each EDU in isolation), this matters for joint segmenters: encoding
+    an EDU in isolation strips the leading-space marker (e.g. RoBERTa/ModernBert
+    `Ġ`) from its first subword, so every EDU-initial token looks word-initial.
+    A segmenter trained that way learns "no leading-space marker = boundary", a
+    cue absent from real continuous text, making it predict zero breaks at
+    inference (where `predict_from_text` tokenizes the raw string continuously).
+    Encoding continuously here keeps train and inference tokenization identical.
+    SentencePiece encoders (e.g. XLM-R) mark word starts the same way in both
+    modes, so they were unaffected, but this is correct for them too.
+
+    Glued (`prefix=""`) boundaries have no joining space, so an EDU boundary can
+    fall mid-token; the straddling token is then assigned to the later EDU. A
+    boundary landing strictly inside a single token that also spans the previous
+    boundary would empty out an EDU's token range, which we reject explicitly
+    rather than letting it NaN downstream.
 
     Requires a fast tokenizer (offset mapping).
     """
     if not getattr(tokenizer, "is_fast", False):
         raise ValueError("tokenize_document requires a fast tokenizer (offset mapping unavailable)")
 
-    edus = (
-        [detokenizer.detokenize(e) for e in edu_strings]
-        if detokenizer is not None
-        else [e.strip() for e in edu_strings]
-    )
-    doc = " ".join(edus)
+    use_prefix = prefixes is not None and any(p is not None for p in prefixes)
+    if use_prefix:
+        edus = list(edu_strings)
+        seps = ["" if i == 0 else (prefixes[i] if prefixes[i] is not None else " ") for i in range(len(edus))]
+    else:
+        edus = (
+            [detokenizer.detokenize(e) for e in edu_strings]
+            if detokenizer is not None
+            else [e.strip() for e in edu_strings]
+        )
+        seps = ["" if i == 0 else " " for i in range(len(edus))]
+
+    doc = "".join(seps[i] + edus[i] for i in range(len(edus)))
     enc = tokenizer(doc, add_special_tokens=False, return_offsets_mapping=True)
     offsets = enc["offset_mapping"]
 
-    # Exclusive char-end of each EDU within the space-joined doc.
+    # Exclusive char-end of each EDU within the reconstructed doc.
     char_ends: list[int] = []
     pos = 0
     for i, edu in enumerate(edus):
-        if i > 0:
-            pos += 1  # the single joining space
-        pos += len(edu)
+        pos += len(seps[i]) + len(edu)
         char_ends.append(pos)
 
     # A token belongs to EDU i iff its char-end falls within EDU i's char span.
-    # The joining space forces a token break, so no token straddles a boundary.
+    # A space-joined boundary always lands on a token break; a glued boundary
+    # may not, in which case the straddling token (char-end past this EDU's end)
+    # falls through to the next EDU.
     boundaries: list[tuple[int, int]] = []
     tok_idx, ntok = 0, len(offsets)
-    for end_char in char_ends:
+    for i, end_char in enumerate(char_ends):
         start = tok_idx
         while tok_idx < ntok and offsets[tok_idx][1] <= end_char:
             tok_idx += 1
+        if tok_idx == start:
+            raise ValueError(
+                f"EDU {i} ({edus[i]!r}) maps to an empty token span: its boundary "
+                f"falls inside a single token (a glued prefix with no token break)."
+            )
         boundaries.append((start, tok_idx))
-    # Defensive: a token overrunning the last EDU end (shouldn't happen with
-    # space-joined EDUs) is folded into the final EDU rather than dropped.
+    # Defensive: a token overrunning the last EDU end (shouldn't happen) is
+    # folded into the final EDU rather than dropped.
     if tok_idx < ntok and boundaries:
         s, _ = boundaries[-1]
         boundaries[-1] = (s, ntok)
