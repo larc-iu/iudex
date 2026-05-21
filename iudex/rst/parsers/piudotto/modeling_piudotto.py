@@ -303,8 +303,8 @@ def _tags_to_breaks(tags: list[int], scheme: str) -> list[int]:
     return sorted(set(breaks))
 
 
-class _SpanRepr(nn.Module):
-    """Per-EDU representation built from a span of token embeddings.
+class _SpanPooler(nn.Module):
+    """Pool a span of token embeddings into one per-EDU vector.
 
     "concat":    reduce(concat(first_token, last_token, mean(tokens))) → H. Endpoint
                  + mean pooling, the standard span representation for parsing over a
@@ -429,7 +429,7 @@ class PiudottoParser(nn.Module):
 
         H = self.encoder.config.hidden_size
         self.encoder_dropout = nn.Dropout(config.encoder_dropout)
-        self.span_repr = _SpanRepr(H, config.span_pooling, config.encoder_dropout)
+        self.span_pooler = _SpanPooler(H, config.span_pooling, config.encoder_dropout)
         self.split_scorer = _DeepBiAffine(
             H, config.classifier_hidden_size, 1, config.classifier_dropout, bias=config.classifier_use_bias
         )
@@ -533,7 +533,7 @@ class PiudottoParser(nn.Module):
         else:
             seg_loss = torch.zeros((), device=embeddings.device)
 
-        edu_reprs = self.span_repr(self.encoder_dropout(embeddings), edu_mapping)
+        edu_reprs = self.span_pooler(self.encoder_dropout(embeddings), edu_mapping)
         return edu_reprs, seg_loss
 
     # ─── Pooling helpers (used by per-node CE training) ────────────────────
@@ -807,7 +807,7 @@ class PiudottoParser(nn.Module):
         if len(edu_mapping) < 2:
             return RstTree.from_parsing_actions([], edu_texts, relation_types=self.config.relation_types)
 
-        edu_reprs = self.span_repr(self.encoder_dropout(embeddings), edu_mapping)  # eval mode → dropout identity
+        edu_reprs = self.span_pooler(self.encoder_dropout(embeddings), edu_mapping)  # eval mode → dropout identity
         actions = self._decode_actions(edu_reprs)
         return RstTree.from_parsing_actions(actions, edu_texts, relation_types=self.config.relation_types)
 
@@ -844,7 +844,7 @@ class PiudottoParser(nn.Module):
         if len(gold_edu_mapping) < 2:
             gold_pred = RstTree.from_parsing_actions([], tree.edus, relation_types=self.config.relation_types)
         else:
-            edu_reprs = self.span_repr(dropped, gold_edu_mapping)
+            edu_reprs = self.span_pooler(dropped, gold_edu_mapping)
             actions = self._decode_actions(edu_reprs)
             gold_pred = RstTree.from_parsing_actions(actions, tree.edus, relation_types=self.config.relation_types)
         gold_edu_ends = [end - 1 for _, end in gold_edu_mapping]
@@ -876,7 +876,7 @@ class PiudottoParser(nn.Module):
         if len(pred_edu_mapping) < 2:
             e2e_pred = RstTree.from_parsing_actions([], pred_edu_texts, relation_types=self.config.relation_types)
         else:
-            edu_reprs = self.span_repr(dropped, pred_edu_mapping)
+            edu_reprs = self.span_pooler(dropped, pred_edu_mapping)
             actions = self._decode_actions(edu_reprs)
             e2e_pred = RstTree.from_parsing_actions(actions, pred_edu_texts, relation_types=self.config.relation_types)
 
