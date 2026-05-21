@@ -13,7 +13,7 @@ To add a sibling framework, append its dotted path to `FRAMEWORKS` and
 give its `__init__.py` the three required attributes.
 """
 
-__version__ = "0.1.0a4"
+__version__ = "0.1.0a5"
 
 FRAMEWORKS: list[str] = ["iudex.rst"]
 

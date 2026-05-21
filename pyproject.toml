@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "larc-iudex"
-version = "0.1.0a4"
+version = "0.1.0a5"
 description = "A collection of discourse parsers and associated code focused on readability and usability."
 readme = "README.md"
 license = {text = "MIT"}
