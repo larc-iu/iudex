@@ -72,6 +72,7 @@ def load_parser_from_pretrained(
     revision: str | None = None,
     cache_dir: str | None = None,
     token: str | bool | None = None,
+    compile_encoder: bool = False,
 ) -> ParserT:
     """Load a parser from a Hub repo id, a local run directory, or a `.pt` file.
 
@@ -98,7 +99,7 @@ def load_parser_from_pretrained(
         checkpoint_path = repo_or_path
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(checkpoint_path)
-    return load_parser_from_checkpoint(checkpoint_path, device, config_cls, parser_cls)
+    return load_parser_from_checkpoint(checkpoint_path, device, config_cls, parser_cls, compile_encoder=compile_encoder)
 
 
 def push_parser_to_hub(

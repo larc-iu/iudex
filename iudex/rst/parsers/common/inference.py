@@ -53,11 +53,13 @@ def load_parser_from_checkpoint(
     device: torch.device,
     config_cls: type[ConfigT],
     parser_cls: type[ParserT],
+    *,
+    compile_encoder: bool = False,
 ) -> ParserT:
     """Rehydrate a parser from a `.pt` checkpoint into eval mode on `device`."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = config_cls.from_dict(checkpoint["config"])
-    model = parser_cls(cfg)
+    model = parser_cls(cfg, compile_encoder=compile_encoder)
     model.load_state_dict(checkpoint["model_state_dict"])
     return model.to(device).eval()
 

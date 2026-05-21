@@ -60,6 +60,13 @@ def run_predict(parser_name: str) -> None:
 
     argp.add_argument("--output-dir", help="Required unless --text is used")
     argp.add_argument("--device", default=None)
+    argp.add_argument(
+        "--compile-encoder",
+        dest="compile_encoder",
+        action="store_true",
+        help="torch.compile the encoder forward (CUDA only). Off by default for inference; "
+        "pays an initial compile cost to speed up bulk prediction.",
+    )
     args = argp.parse_args()
 
     # `text` / `text_file` only exist on parsers with supports_text=True.
@@ -72,9 +79,13 @@ def run_predict(parser_name: str) -> None:
     kind, source = resolve_source(args.config, args.checkpoint, args.hub_id, config_cls, parser_name)
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     if kind == "hub":
-        model = load_parser_from_pretrained(source, parser_cls=parser_cls, config_cls=config_cls, device=device)
+        model = load_parser_from_pretrained(
+            source, parser_cls=parser_cls, config_cls=config_cls, device=device, compile_encoder=args.compile_encoder
+        )
     else:
-        model = load_parser_from_checkpoint(source, device, config_cls, parser_cls)
+        model = load_parser_from_checkpoint(
+            source, device, config_cls, parser_cls, compile_encoder=args.compile_encoder
+        )
     console.print(f"[dim]Loaded model from[/dim] [path]{source}[/path]")
 
     if text_arg is not None:

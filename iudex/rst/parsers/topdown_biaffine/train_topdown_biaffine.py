@@ -89,7 +89,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
     tb = TBLogger(run_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TopdownBiaffineParser(cfg).to(device)
+    model = TopdownBiaffineParser(cfg, compile_encoder=True).to(device)
     train_trees = [
         t for _, t in read_rst_dir(cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
     ]

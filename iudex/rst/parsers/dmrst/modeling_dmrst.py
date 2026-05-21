@@ -154,7 +154,7 @@ class DMRSTParser(nn.Module):
     weighting. `loss` is their unweighted sum.
     """
 
-    def __init__(self, config: DMRSTConfig):
+    def __init__(self, config: DMRSTConfig, *, compile_encoder: bool = False):
         super().__init__()
         self.config = config
         self.label_index = determine_label_index(config.relation_types)
@@ -179,8 +179,9 @@ class DMRSTParser(nn.Module):
 
         # Compile the encoder forward (not the module) so state_dict keys are
         # unchanged and existing checkpoints still load. dynamic=True avoids
-        # per-shape recompiles on variable-length documents.
-        if torch.cuda.is_available():
+        # per-shape recompiles on variable-length documents. Off by default
+        # (inference); training opts in, predict opts in via --compile-encoder.
+        if compile_encoder and torch.cuda.is_available():
             self.encoder.forward = torch.compile(self.encoder.forward, dynamic=True)
 
         hidden_size = self.encoder.config.hidden_size
@@ -244,6 +245,7 @@ class DMRSTParser(nn.Module):
         revision: str | None = None,
         cache_dir: str | None = None,
         token: str | bool | None = None,
+        compile_encoder: bool = False,
     ) -> "DMRSTParser":
         """Load from a HuggingFace Hub repo id, a local run dir, or a `.pt` file.
 
@@ -263,6 +265,7 @@ class DMRSTParser(nn.Module):
             revision=revision,
             cache_dir=cache_dir,
             token=token,
+            compile_encoder=compile_encoder,
         )
 
     def _encode(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
