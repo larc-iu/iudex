@@ -12,14 +12,8 @@ import torch
 from tonga import Params
 
 from iudex.common.log import console, dim, rule, setup_logging, success, warn, wrote
-from iudex.rst import HASH_EXCLUDE
-from iudex.rst.data.metrics import evaluate_parseval, metrics_table
-from iudex.rst.data.reader import infer_relation_types, read_rst_dir
-from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
-from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
-from iudex.rst.parsers.dmrst.modeling_dmrst import DMRSTParser
 from iudex.common.training import (
+    TBLogger,
     build_optimizer,
     config_panel,
     device_panel,
@@ -32,10 +26,16 @@ from iudex.common.training import (
     save_checkpoint,
     schedule_panel,
     set_seeds,
-    TBLogger,
     try_resume,
     write_run_config,
 )
+from iudex.rst import HASH_EXCLUDE
+from iudex.rst.data.metrics import evaluate_parseval, metrics_table
+from iudex.rst.data.reader import infer_relation_types, read_rst_dir
+from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
+from iudex.rst.data.tree import RstTree
+from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
+from iudex.rst.parsers.dmrst.modeling_dmrst import DMRSTParser
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -123,6 +123,7 @@ def train(cfg: DMRSTConfig) -> None:
     tb = TBLogger(run_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_enabled = cfg.amp and device.type == "cuda"
     model = DMRSTParser(cfg, compile_encoder=True).to(device)
     train_trees = [
         t for _, t in read_rst_dir(cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
@@ -256,7 +257,8 @@ def train(cfg: DMRSTConfig) -> None:
             )
 
             for tree_idx, tree in enumerate(trees):
-                out = model(tree)
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+                    out = model(tree)
                 loss = sum(weights[k] * out[f"{k}_loss"] for k in components)
                 if cfg.grad_accum > 1:
                     loss = loss / cfg.grad_accum

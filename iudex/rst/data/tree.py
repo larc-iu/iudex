@@ -18,6 +18,12 @@ class RstNode:
     id: str
     type: str
     text: Optional[str] = None
+    # TODO(LDG): remove once rs3/rs4 formats are updated
+    # Detokenized corpora (e.g. data/gum_12.1.0_notok) record the exact string
+    # that precedes a segment's text but follows the previous segment. Absent
+    # (None) means the legacy default of a single space; "" means the segments
+    # are glued with no separator.
+    prefix: Optional[str] = None
 
     @property
     def is_edu(self):

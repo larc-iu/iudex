@@ -53,6 +53,15 @@ _PARSER_META: dict[str, dict[str, str]] = {
         "paper_venue": "Findings of EMNLP 2022",
         "paper_url": "https://aclanthology.org/2022.findings-emnlp.501/",
     },
+    # iudex original (no external paper): the `else` branch of render_model_card
+    # supplies the intro/citation, so no `paper_*` keys.
+    "piudotto": {
+        "human_name": "piudotto RST parser",
+        "module_path": "iudex.rst.parsers.piudotto.modeling_piudotto",
+        "class_name": "PiudottoParser",
+        "description": "an end-to-end span-based RST parser with joint EDU segmentation, biaffine span scoring, "
+        "and greedy or CKY decoding",
+    },
 }
 
 

@@ -85,6 +85,9 @@ class DMRSTConfig(FromParams):
     encoder_lr: float | None = 2e-5
     max_epochs: int = 50
     grad_accum: int = 3
+    # bf16 autocast on the training forward (CUDA only; bf16 needs no GradScaler).
+    # Set false for full-fp32 training. Inference is always fp32.
+    amp: bool = True
     patience: int = 10
     max_grad_norm: float = 5.0
     weight_decay: float = 0.01

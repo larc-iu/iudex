@@ -31,6 +31,9 @@ class TopdownBiaffineConfig(FromParams):
     encoder_lr: float | None = None  # if set, encoder params use this LR instead of `lr`
     max_epochs: int = 50
     grad_accum: int = 1
+    # bf16 autocast on the training forward (CUDA only; bf16 needs no GradScaler).
+    # Set false for full-fp32 training. Inference is always fp32.
+    amp: bool = True
     patience: int = 10
     max_grad_norm: float = 1.0
     weight_decay: float = 0.01
