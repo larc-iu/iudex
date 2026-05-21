@@ -140,7 +140,8 @@ def list_runs(checkpoint_dir: str) -> None:
         sys.exit(1)
 
     parsers = _all_parsers()
-    rows: list[tuple[str, ...]] = []
+    # (mtime, row); sorted most- to least-recently-touched below.
+    rows: list[tuple[float, tuple[str, ...]]] = []
     for entry in _list_run_dirs(checkpoint_dir):
         run_dir = os.path.join(checkpoint_dir, entry)
         try:
@@ -153,12 +154,15 @@ def list_runs(checkpoint_dir: str) -> None:
         model_name = cfg.get("model_name", "?")
         train_dir = cfg.get("train_dir") or "?"
         best_val_str, step_str = _read_best_meta(run_dir)
-        modified = datetime.fromtimestamp(_latest_mtime(run_dir)).strftime("%Y-%m-%d %H:%M")
-        rows.append((entry, run_name, kind, model_name, train_dir, best_val_str, step_str, modified))
+        mtime = _latest_mtime(run_dir)
+        modified = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+        rows.append((mtime, (entry, run_name, kind, model_name, train_dir, best_val_str, step_str, modified)))
 
     if not rows:
         console.print(f"[dim]No runs found in[/dim] [path]{checkpoint_dir}[/path]")
         return
+
+    rows.sort(key=lambda r: r[0], reverse=True)
 
     table = Table(title=f"Runs in {checkpoint_dir}", show_header=True, header_style="bold cyan", padding=(0, 1))
     table.add_column("run_id", style="bold")
@@ -169,7 +173,7 @@ def list_runs(checkpoint_dir: str) -> None:
     table.add_column("best_val", justify="right", style="bold green")
     table.add_column("step", justify="right", style="dim")
     table.add_column("modified", style="dim")
-    for row in rows:
+    for _, row in rows:
         table.add_row(*row)
     console.print(table)
 
