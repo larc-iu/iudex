@@ -1,3 +1,4 @@
+import copy
 import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -251,25 +252,78 @@ class RstTree:
             output.append((((left[0], left[-1] + 1), (right[0], right[-1] + 1)), nuclearity, relation))
         return output
 
+    def debinarize(self) -> "RstTree":
+        """Return a new tree with binary multinuclear chains flattened to n-ary.
+
+        A multinuc node nested directly under another multinuc, where the
+        attaching edge and all of the child's own edges share one relation, is a
+        binarization artifact (parsers can only emit binary splits, so an n-ary
+        multinuc comes out as nested same-relation multinucs). Such a child is
+        absorbed into its parent, recursively and regardless of branch shape
+        (right/left/balanced). Mononuclear structure and genuinely nested
+        *different*-relation multinucs (e.g. `List[A, Joint[B, C]]`) are left
+        intact, since the relation guard only fires when labels match through.
+
+        Non-mutating: `self` stays binary. The result is non-binary and so is
+        serialization-only. Do not call `spans()`/`parsing_actions()` on it.
+        """
+        nodes = [copy.copy(n) for n in self._nodes]
+        edges = [copy.copy(e) for e in self._edges]
+        node_map = {n.id: n for n in nodes}
+
+        def primary_out(node_id):
+            return [e for e in edges if not e.secondary and e.source == node_id]
+
+        merged = True
+        while merged:
+            merged = False
+            for e in [e for e in edges if not e.secondary]:
+                parent, child = node_map.get(e.source), node_map.get(e.target)
+                if parent is None or child is None:
+                    continue
+                if parent.type != "multinuc" or child.type != "multinuc":
+                    continue
+                # Raw `e.relation` (relation_map is applied later, in relation_of):
+                # merging on mapped labels could fuse two distinct fine relations.
+                grandchild_edges = primary_out(child.id)
+                if not grandchild_edges or any(ge.relation != e.relation for ge in grandchild_edges):
+                    continue
+                for ge in grandchild_edges:
+                    ge.source = parent.id
+                edges.remove(e)
+                nodes.remove(child)
+                del node_map[child.id]
+                merged = True
+                break
+
+        return RstTree(
+            nodes,
+            edges,
+            binarize=False,
+            relation_types=self._relation_types,
+            relation_map=self._relation_map,
+        )
+
     def to_rs4_string(self) -> str:
         from lxml import etree as ET
         from lxml.builder import E
 
-        relations = E("relations", *[E("rel", name=name, type=type) for name, type in self._relation_types])
+        tree = self.debinarize()
+        relations = E("relations", *[E("rel", name=name, type=type) for name, type in tree._relation_types])
         header = E("header", *[relations])
         body_children = []
-        for edu in self.edus:
-            parent = self.parent_of(edu.id)
-            relname = self.relation_of(edu.id)
+        for edu in tree.edus:
+            parent = tree.parent_of(edu.id)
+            relname = tree.relation_of(edu.id)
             # Omit parent/relname when None (single-EDU case, where the EDU is
             # itself the root): lxml's ElementMaker rejects None-valued attrs.
             if parent is not None:
                 body_children.append(E("segment", edu.text, id=edu.id, parent=parent, relname=relname))
             else:
                 body_children.append(E("segment", edu.text, id=edu.id))
-        for node in self.nonterminals:
-            parent = self.parent_of(node.id)
-            relname = self.relation_of(node.id)
+        for node in tree.nonterminals:
+            parent = tree.parent_of(node.id)
+            relname = tree.relation_of(node.id)
             if parent is not None:
                 body_children.append(
                     E(
