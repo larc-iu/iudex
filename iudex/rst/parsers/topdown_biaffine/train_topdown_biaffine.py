@@ -103,7 +103,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
 
     steps_per_epoch = max(1, len(train_trees) // cfg.grad_accum)
     total_steps = steps_per_epoch * cfg.max_epochs
-    warmup = cfg.num_warmup_steps if cfg.num_warmup_steps > 0 else steps_per_epoch
+    warmup = steps_per_epoch if cfg.num_warmup_steps is None else cfg.num_warmup_steps
 
     console.print(config_panel(cfg_dict))
     console.print(device_panel(device, seed=cfg.seed, checkpoint_dir=run_dir))

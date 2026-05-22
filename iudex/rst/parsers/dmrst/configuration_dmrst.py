@@ -91,7 +91,9 @@ class DMRSTConfig(FromParams):
     patience: int = 10
     max_grad_norm: float = 5.0
     weight_decay: float = 0.01
-    num_warmup_steps: int = 0
+    # Linear warmup before linear decay. None uses a 1-epoch warmup
+    # (steps_per_epoch). 0 means no warmup. Any positive int is taken literally.
+    num_warmup_steps: int | None = None
     log_every: int = 50
     validate_every: int | None = None
     checkpoint_every: int | None = None
