@@ -8,6 +8,10 @@
     dropout: 0.2,
     stride: 100,
 
+    // LoRA encoder fine-tuning (see _PeftConfig). Null = full fine-tuning.
+    // Enable with e.g. peft: { r: 16, alpha: 32, dropout: 0.05 } (and bump encoder_lr).
+    peft: null,
+
     // Data
     train_dir: "data/rstdt/train",
     dev_dir: "data/rstdt/dev",

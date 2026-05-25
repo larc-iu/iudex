@@ -16,6 +16,11 @@
     freeze_encoder_layers: 3,
     freeze_embeddings: true,
 
+    // LoRA encoder fine-tuning (see _PeftConfig). Null = full fine-tuning. To enable,
+    // also set freeze_encoder_layers: 0 and freeze_embeddings: false (peft rejects
+    // combining with them), then e.g. peft: { r: 16, alpha: 32, dropout: 0.05 }.
+    peft: null,
+
     // Joint EDU segmentation. Set to `null` to disable (lose `predict_from_text`).
     segmentation: {
         pos_weight: 10.0,
