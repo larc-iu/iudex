@@ -27,6 +27,7 @@ from iudex.common.training import (
     schedule_panel,
     set_seeds,
     try_resume,
+    weight_decay_panel,
     write_run_config,
 )
 from iudex.rst import HASH_EXCLUDE
@@ -158,6 +159,7 @@ def train(cfg: DMRSTConfig) -> None:
         cfg.weight_decay,
         submodule_lrs=[(model.encoder, cfg.encoder_lr)] if cfg.encoder_lr is not None else [],
     )
+    console.print(weight_decay_panel(model, optimizer))
     scheduler = make_scheduler(optimizer, warmup, total_steps)
 
     # DLW (paper §3.2): weights at step t are `r_k = L_k(t-1) / L_k(t-2)`,

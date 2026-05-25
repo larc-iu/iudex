@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 from collections.abc import Sequence
 from typing import Any
@@ -226,13 +227,18 @@ def build_optimizer(
     """AdamW with no-decay on biases / norm weights, plus per-submodule LRs.
     Params in each `(submodule, sub_lr)` entry use `sub_lr` (first listed
     wins on overlap). Everything else uses `lr`.
+
+    No-decay is shape-based (`ndim <= 1`): catches every bias and norm/scale
+    weight, including the fused 1-D parameters a name match misses (`nn.GRU`'s
+    `bias_*_l*`, `nn.MultiheadAttention`'s `in_proj_bias`, the CRF's per-tag
+    `start/end_transitions`). The CRF's 2-D `transitions` log-potential is
+    name-matched on top, since it's a structured score we don't want decayed.
     """
 
-    def _is_no_decay(name: str) -> bool:
-        if name.endswith(".bias"):
+    def _is_no_decay(name: str, p: nn.Parameter) -> bool:
+        if p.ndim <= 1:
             return True
-        parts = name.split(".")
-        return len(parts) >= 2 and "norm" in parts[-2].lower() and parts[-1] == "weight"
+        return name.rsplit(".", 1)[-1] == "transitions"
 
     id_to_lr: dict[int, float] = {}
     for submod, sub_lr in submodule_lrs:
@@ -242,7 +248,7 @@ def build_optimizer(
     buckets: dict[tuple[float, bool], list[nn.Parameter]] = {}
     for name, p in model.named_parameters():
         bucket_lr = id_to_lr.get(id(p), lr)
-        nd = _is_no_decay(name)
+        nd = _is_no_decay(name, p)
         buckets.setdefault((bucket_lr, nd), []).append(p)
 
     return AdamW(
@@ -376,6 +382,46 @@ def model_panel(model: nn.Module, *, num_train_trees: int, grad_accum: int) -> P
     dt.add_row("Training trees", f"[bold]{num_train_trees:,}[/bold]")
     dt.add_row("Grad accum", str(grad_accum))
     return Panel(dt, title="[bold cyan]Data & Model[/bold cyan]", border_style="cyan")
+
+
+def weight_decay_panel(model: nn.Module, optimizer: AdamW) -> Panel:
+    """Summarize which parameters AdamW decays vs. exempts.
+
+    Reads the per-group `weight_decay` straight off `optimizer`, so it reflects
+    what training will actually do (not a re-derivation of the rule). Names are
+    collapsed across numeric indices (`layers.0`/`layers.1` -> `layers.N`) so the
+    exempt carve-outs (biases, norm/scale weights, GRU/MHA fused biases, CRF
+    transitions) are eyeballable. Decayed params are the weight matrices, summed.
+    """
+    id_to_name = {id(p): n for n, p in model.named_parameters()}
+
+    decayed_tensors = decayed_params = 0
+    exempt_patterns: dict[str, list[int]] = {}
+    exempt_tensors = exempt_params = 0
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if group["weight_decay"] > 0:
+                decayed_tensors += 1
+                decayed_params += p.numel()
+            else:
+                name = re.sub(r"\d+", "N", id_to_name.get(id(p), "<unknown>"))
+                bucket = exempt_patterns.setdefault(name, [0, 0])
+                bucket[0] += 1
+                bucket[1] += p.numel()
+                exempt_tensors += 1
+                exempt_params += p.numel()
+
+    t = Table(show_header=False, padding=(0, 2), box=None)
+    t.add_column(style="bold cyan")
+    t.add_column()
+    t.add_row(
+        "Decayed", f"[bold]{decayed_tensors}[/bold] tensors ([bold]{decayed_params:,}[/bold] params), weight matrices"
+    )
+    t.add_row("Exempt", f"[bold]{exempt_tensors}[/bold] tensors ([bold]{exempt_params:,}[/bold] params)")
+    t.add_row("Exempt names", "")
+    for name, (cnt, _) in sorted(exempt_patterns.items()):
+        t.add_row("", f"[dim]{name}[/dim]" + (f" [yellow]×{cnt}[/yellow]" if cnt > 1 else ""))
+    return Panel(t, title="[bold green]Weight Decay[/bold green]", border_style="green")
 
 
 def schedule_panel(

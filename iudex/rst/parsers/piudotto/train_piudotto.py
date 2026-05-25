@@ -27,6 +27,7 @@ from iudex.common.training import (
     schedule_panel,
     set_seeds,
     try_resume,
+    weight_decay_panel,
     write_run_config,
 )
 from iudex.rst import HASH_EXCLUDE
@@ -161,6 +162,7 @@ def train(cfg: PiudottoConfig) -> None:
         cfg.weight_decay,
         submodule_lrs=[(model.encoder, cfg.encoder_lr)] if cfg.encoder_lr is not None else [],
     )
+    console.print(weight_decay_panel(model, optimizer))
     scheduler = make_scheduler(optimizer, warmup, total_steps)
 
     # EMA-based loss-weighting state. `ema_loss[k]` is a running per-component

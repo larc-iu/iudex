@@ -26,6 +26,7 @@ from iudex.common.training import (
     save_checkpoint,
     schedule_panel,
     set_seeds,
+    weight_decay_panel,
     write_run_config,
 )
 from iudex.rst import HASH_EXCLUDE
@@ -124,6 +125,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
         cfg.weight_decay,
         submodule_lrs=[(model.encoder, cfg.encoder_lr)] if cfg.encoder_lr is not None else [],
     )
+    console.print(weight_decay_panel(model, optimizer))
     scheduler = make_scheduler(optimizer, warmup, total_steps)
 
     state = resume_or_init(run_dir, model=model, optimizer=optimizer, scheduler=scheduler, expected_hash=cfg_hash)
