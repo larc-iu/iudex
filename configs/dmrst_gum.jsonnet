@@ -31,7 +31,7 @@
     segmentation: {
         scheme: 'BIE',
         loss: 'crf',
-        dropout: 0.5,
+        dropout: 0.3,
     },
     // original DMRST: no CRF
     // segmentation: {
@@ -50,11 +50,11 @@
 
     // Training
     lr: 2e-4,
-    encoder_lr: 2e-4,
+    encoder_lr: 2e-5,
     max_epochs: 100,
     grad_accum: 3,
     patience: 10,
-    max_grad_norm: 10.0,
+    max_grad_norm: 20.0,
     weight_decay: 0.01,
     num_warmup_steps: 100,
     log_every: 1,
