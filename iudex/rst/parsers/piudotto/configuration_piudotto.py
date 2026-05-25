@@ -81,16 +81,6 @@ class _PeftConfig(FromParams):
 
 
 @dataclass
-class _MarginObjectiveConfig(FromParams):
-    """Stern et al. 2017 max-margin objective. Runs CKY each step (~2x
-    slower than per-node CE) but optimizes a global tree-level signal.
-    Set `margin_training: null` for per-node CE.
-    """
-
-    margin: float = 1.0
-
-
-@dataclass
 class PiudottoConfig(FromParams):
     train_dir: str
     dev_dir: str
@@ -151,6 +141,22 @@ class PiudottoConfig(FromParams):
     edu_encoder_heads: int = 8
     edu_encoder_dropout: float = 0.2
 
+    # Autoregressive Transformer decoder over the top-down decision sequence,
+    # the non-RNN replacement for dmrst's recurrent pointer decoder. Causal
+    # self-attention over the DFS-ordered split decisions conditions each split
+    # on the decisions already committed (the parse history); cross-attention
+    # reads the EDU reprs. 0 layers disables it, recovering the history-free
+    # per-node deep-biaffine split scorer. When on, a pointer head replaces that
+    # biaffine for the split decision.
+    decoder_layers: int = 0
+    # Bottleneck width (down-project H->width, decode, up-project), like the EDU
+    # encoder; None runs at full width. Must be divisible by decoder_heads.
+    decoder_hidden_size: int | None = None
+    decoder_heads: int = 8
+    decoder_dropout: float = 0.2
+    # Pointer split head used by the decoder: "biaffine" or "dot_product".
+    pointer_attention_type: str = "biaffine"
+
     # Joint EDU segmentation. When non-null, training adds a per-token
     # segmenter over EDU boundaries and `predict_from_text` is available
     # for raw-text → tree inference.
@@ -160,16 +166,6 @@ class PiudottoConfig(FromParams):
     # end-to-end-from-text models train on natural text matching the raw input
     # `predict_from_text` receives. Registrable; see common.detokenization.
     detokenizer: Detokenizer | None = None
-
-    # Tree decoding strategy at inference time:
-    #   "greedy": top-down argmax at each level (default)
-    #   "cky":    O(n^3) chart fill, globally optimal binary tree
-    decoding: str = "greedy"
-
-    # Training objective: per-node teacher-forced CE by default. Set
-    # `margin_training: {margin: 1.0}` to switch to Stern-style max-margin
-    # against the cost-augmented best non-gold tree (CKY at train time).
-    margin_training: _MarginObjectiveConfig | None = None
 
     # Training
     lr: float = 1e-4

@@ -101,8 +101,6 @@ def train(cfg: PiudottoConfig) -> None:
     The trainer combines the model's `split_loss`, `label_loss` and (when
     `cfg.segmentation` is non-null) `seg_loss` with weights that adapt to each
     component's recent rate of decrease, recomputed at every optimizer step.
-    With `cfg.margin_training` set, `split_loss` carries the hinge loss and
-    `label_loss` is zero (margin couples the two decisions).
     """
     set_seeds(cfg.seed)
 
@@ -167,13 +165,7 @@ def train(cfg: PiudottoConfig) -> None:
 
     # EMA-based loss-weighting state. `ema_loss[k]` is a running per-component
     # mean (initialized to None and seeded from the first step's loss).
-    #
-    # In margin mode, `_forward_margin` returns label_loss=0 unconditionally —
-    # excluding "label" from the components prevents a constantly-zero ratio
-    # from stealing weight from the actually-trained hinge.
-    components = (["split"] if cfg.margin_training is not None else ["split", "label"]) + (
-        ["seg"] if cfg.segmentation is not None else []
-    )
+    components = ["split", "label"] + (["seg"] if cfg.segmentation is not None else [])
     ema_loss: dict[str, float | None] = {k: None for k in components}
     curr_sums = {k: 0.0 for k in components}
     weights = {k: 1.0 for k in components}

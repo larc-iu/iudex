@@ -14,10 +14,9 @@ from iudex.rst.parsers.common.encoding import (
     load_encoder_and_tokenizer,
     tokenize_document,
 )
+from iudex.rst.parsers.common.pointer import PointerAttention
 from iudex.rst.parsers.common.segmentation import Segmenter
 from iudex.rst.parsers.piudotto.configuration_piudotto import PiudottoConfig
-
-_NEG_INF = float("-inf")
 
 
 class _SpanPooler(nn.Module):
@@ -69,7 +68,7 @@ class _SpanPooler(nn.Module):
         first = embeddings[starts]  # [num_edus, H]
         last = embeddings[ends - 1]  # [num_edus, H]
         if self.pooling == "concat":
-            # Segment mean via prefix sums (same trick as `_score_chart`).
+            # Segment mean via prefix sums.
             prefix = torch.cat([embeddings.new_zeros(1, H), embeddings.cumsum(0)], dim=0)
             pooled = (prefix[ends] - prefix[starts]) / (ends - starts).unsqueeze(-1).to(embeddings.dtype)
         else:
@@ -197,15 +196,91 @@ class _EduEncoder(nn.Module):
         return edu_reprs + x if self.bottleneck else x
 
 
+class _TreeDecoder(nn.Module):
+    """Autoregressive Transformer decoder over the top-down decision sequence.
+
+    The non-RNN replacement for dmrst's recurrent pointer decoder. The
+    "sequence" is the tree's internal-node spans in left-first preorder DFS, the
+    order both the training pass and greedy decode visit them. Each step's input
+    token is the pooled repr of the span being decided (plus a sinusoidal
+    positional encoding over the decision-step index, since attention is
+    order-agnostic and DFS order is the history signal). Causal self-attention
+    over the prefix conditions each split decision on the decisions already
+    committed (query t attends only to tokens 1..t); cross-attention reads the
+    EDU representations. The per-step output is the pointer query.
+
+    `inner_size`, when smaller than `hidden_size`, runs the decoder in a narrow
+    bottleneck (down-project H->inner, decode, up-project inner->H) the same way
+    `_EduEncoder` does, the main regularization knob on small treebanks. The
+    cross-attention memory is projected to the same width.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+        inner_size: int | None = None,
+    ):
+        super().__init__()
+        d = inner_size or hidden_size
+        if d % num_heads != 0:
+            raise ValueError(f"decoder_heads ({num_heads}) must divide the decoder width ({d})")
+        self.bottleneck = d != hidden_size
+        self.in_proj = nn.Linear(hidden_size, d) if self.bottleneck else nn.Identity()
+        self.mem_proj = nn.Linear(hidden_size, d) if self.bottleneck else nn.Identity()
+        self.out_proj = nn.Linear(d, hidden_size) if self.bottleneck else nn.Identity()
+        layer = nn.TransformerDecoderLayer(
+            d_model=d,
+            nhead=num_heads,
+            dim_feedforward=2 * d,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
+        self.dropout = nn.Dropout(dropout)
+        # Normalize the output query so the pointer's dot products start at a sane
+        # scale (the pooled EDU reprs are un-normalized and large-magnitude; see
+        # `_split_logits`). norm_first layers leave the residual stream un-normed.
+        self.query_norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, span_tokens: torch.Tensor, edu_reprs: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            span_tokens: [num_decisions, H]  pooled span reprs in DFS order
+            edu_reprs:   [num_edus, H]       cross-attention memory
+
+        Returns:
+            queries: [num_decisions, H]  one (layer-normed) pointer query per decision
+        """
+        m = span_tokens.size(0)
+        x = self.in_proj(span_tokens)
+        x = self.dropout(x + _sinusoidal_pe(m, x.size(1), x.device, x.dtype))
+        memory = self.mem_proj(edu_reprs)
+        # Boolean upper-triangular mask: True (= disallowed) above the diagonal,
+        # so position t attends only to 1..t. dtype-agnostic, unlike a float mask
+        # (avoids a query/mask dtype mismatch under bf16 autocast).
+        causal = torch.triu(torch.ones(m, m, dtype=torch.bool, device=x.device), diagonal=1)
+        h = self.decoder(x.unsqueeze(0), memory.unsqueeze(0), tgt_mask=causal).squeeze(0)
+        return self.query_norm(self.out_proj(h))
+
+
 class PiudottoParser(nn.Module):
     """End-to-end RST parser with span-based biaffine scoring.
 
     Training (`forward`) is teacher-forced and returns split/label/seg losses
-    separately so the trainer can apply EMA loss weighting. With
-    `cfg.margin_training` set (non-null), training instead minimizes a Stern
-    et al. 2017 max-margin objective against the cost-augmented CKY tree.
-    Decoding is greedy by default; set `cfg.decoding = "cky"` for the globally
-    optimal binary tree.
+    separately so the trainer can apply EMA loss weighting. Decoding is greedy
+    top-down.
+
+    Split scoring has two modes, gated by `cfg.decoder_layers`:
+      0 (default): the history-free per-node deep biaffine over pooled left/right
+        halves (`split_scorer`). Every span is scored independently.
+      >0: an autoregressive Transformer decoder (`tree_decoder`) over the DFS
+        decision sequence, with a pointer split head conditioned on the decode
+        history (the non-RNN analog of dmrst's recurrent pointer decoder).
     """
 
     def __init__(self, config: PiudottoConfig, *, compile_encoder: bool = False):
@@ -219,8 +294,6 @@ class PiudottoParser(nn.Module):
             raise ValueError(f"Unknown span_pooling: {config.span_pooling!r}")
         if config.label_input_pooling not in ("mean", "last_edu"):
             raise ValueError(f"Unknown label_input_pooling: {config.label_input_pooling!r}")
-        if config.decoding not in ("cky", "greedy"):
-            raise ValueError(f"Unknown decoding: {config.decoding!r}")
 
         self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(
             config.model_name, peft_config=config.peft
@@ -236,9 +309,6 @@ class PiudottoParser(nn.Module):
         H = self.encoder.config.hidden_size
         self.encoder_dropout = nn.Dropout(config.encoder_dropout)
         self.span_pooler = _SpanPooler(H, config.span_pooling, config.encoder_dropout)
-        self.split_scorer = _DeepBiAffine(
-            H, config.classifier_hidden_size, 1, config.classifier_dropout, bias=config.classifier_use_bias
-        )
         self.label_scorer = _DeepBiAffine(
             H,
             config.classifier_hidden_size,
@@ -246,6 +316,31 @@ class PiudottoParser(nn.Module):
             config.classifier_dropout,
             bias=config.classifier_use_bias,
         )
+
+        # Split scoring. With the decoder off, score every span independently with
+        # a deep biaffine over pooled halves. With the decoder on, the pointer
+        # head (query = decoder output) replaces it, so only one of the two is
+        # ever built (keeps the checkpoint to the params the config actually uses).
+        if config.decoder_layers > 0:
+            if config.pointer_attention_type not in ("biaffine", "dot_product"):
+                raise ValueError(f"Unknown pointer_attention_type: {config.pointer_attention_type!r}")
+            self.split_scorer = None
+            self.tree_decoder = _TreeDecoder(
+                H,
+                config.decoder_layers,
+                config.decoder_heads,
+                config.decoder_dropout,
+                inner_size=config.decoder_hidden_size,
+            )
+            self.pointer = PointerAttention(config.pointer_attention_type, H)
+            self.pointer_key_norm = nn.LayerNorm(H)
+            self._pointer_scale = H**0.5
+        else:
+            self.split_scorer = _DeepBiAffine(
+                H, config.classifier_hidden_size, 1, config.classifier_dropout, bias=config.classifier_use_bias
+            )
+            self.tree_decoder = None
+            self.pointer = None
 
         # Optional EDU-level Transformer over the pooled per-EDU vectors. None
         # disables it (the original pure encoder-pooled design).
@@ -262,9 +357,6 @@ class PiudottoParser(nn.Module):
         )
 
         self.label_input_pooling = config.label_input_pooling
-        self.decoding = config.decoding
-        # None → per-node CE; non-None → margin objective.
-        self.margin = config.margin_training.margin if config.margin_training is not None else None
 
         self.segmenter = (
             Segmenter(
@@ -372,119 +464,33 @@ class PiudottoParser(nn.Module):
             return edu_reprs[b:e].mean(0, keepdim=True)
         return edu_reprs[e - 1].unsqueeze(0)  # last_edu
 
-    # ─── Full-chart scoring (used by CKY decoding and margin training) ─────
+    def _split_logits(self, edu_reprs: torch.Tensor, b: int, e: int, query: torch.Tensor) -> torch.Tensor:
+        """Scaled pointer split logits over candidate splits k ∈ (b, e).
 
-    def _score_chart(self, edu_reprs: torch.Tensor, return_label_logits: bool = False) -> dict[str, Any]:
-        """Score every valid (b, k, e) triple, chunked by span width to bound memory.
-
-        For all 0 ≤ b < k < e ≤ n, build pooled left = pool(edu_reprs[b:k]) and
-        right = pool(edu_reprs[k:e]) per `label_input_pooling`, then score the
-        split (1-D) and label (C-D) biaffines on the batched pools.
-
-        Chunking: triples are enumerated in groups of constant span width
-        e − b. Within a width w there are O(n · w) triples — total O(n²) at the
-        widest tier — so peak `[num_triples_in_chunk, H]` memory is O(n² · H)
-        instead of the O(n³ · H) you'd get from materializing all triples at
-        once. The reduced charts `split_chart` / `best_label_*_chart` are
-        O(n³) of scalars/longs, which is fine even at n ≈ 250.
-
-        Args:
-            edu_reprs:           [num_edus, H]
-            return_label_logits: only `_forward_margin` needs the per-triple
-                                 label_logits + triple_index lookup. Default
-                                 False so CKY decoding and per-node CE training
-                                 don't pay the O(n³ · C) storage cost.
-
-        Returns a dict with:
-            split_chart            [n+1, n+1, n+1]   (-inf at invalid positions)
-            best_label_score_chart [n+1, n+1, n+1]   (max over C)
-            best_label_idx_chart   [n+1, n+1, n+1]   (argmax over C)
-            label_logits           [num_triples, C]  (only if return_label_logits)
-            triple_index           {(b, k, e): position in label_logits}
+        Scaled dot-product attention done right: LayerNorm the key EDU reprs (the
+        query is already normed by the decoder) and divide by √H, so logits start
+        at O(1) despite the un-normalized, large-magnitude pooled EDU reprs. dmrst
+        gets the same effect for free from its `layer_norm` plus bounded GRU
+        outputs; piudotto's pooled reprs have neither, so without this the pointer
+        saturates its softmax at init (huge split loss and gradients).
         """
-        # Chart fill (CKY / margin gold + augmented scores) sums many terms, so do
-        # it in fp32 for stability under bf16 autocast (a no-op outside autocast).
-        edu_reprs = edu_reprs.float()
-        n = edu_reprs.size(0)
-        device = edu_reprs.device
-        H = edu_reprs.size(1)
-        score_dtype = edu_reprs.dtype
-
-        split_chart = torch.full((n + 1, n + 1, n + 1), _NEG_INF, device=device, dtype=score_dtype)
-        best_label_score_chart = torch.full((n + 1, n + 1, n + 1), _NEG_INF, device=device, dtype=score_dtype)
-        best_label_idx_chart = torch.zeros((n + 1, n + 1, n + 1), dtype=torch.long, device=device)
-
-        if self.label_input_pooling == "mean":
-            # Prefix-sum trick: P[i] = sum(edu_reprs[:i]); mean(edu_reprs[a:b]) = (P[b] - P[a]) / (b - a).
-            prefix = torch.cat([torch.zeros(1, H, device=device, dtype=score_dtype), edu_reprs.cumsum(0)], dim=0)
-
-        all_label_logits: list[torch.Tensor] = []
-        triple_index: dict[tuple[int, int, int], int] = {}
-        running_offset = 0
-
-        for width in range(2, n + 1):
-            # All (b, k, e) with e − b = width: b ∈ [0, n − width], k ∈ (b, e).
-            num_b = n - width + 1
-            ks_local = torch.arange(1, width, device=device)
-            bs_t = torch.arange(num_b, device=device).repeat_interleave(width - 1)
-            ks_t = bs_t + ks_local.repeat(num_b)
-            es_t = bs_t + width
-
-            if self.label_input_pooling == "mean":
-                lefts = (prefix[ks_t] - prefix[bs_t]) / (ks_t - bs_t).unsqueeze(-1).to(score_dtype)
-                rights = (prefix[es_t] - prefix[ks_t]) / (es_t - ks_t).unsqueeze(-1).to(score_dtype)
-            else:  # last_edu
-                lefts = edu_reprs[ks_t - 1]
-                rights = edu_reprs[es_t - 1]
-
-            split_logits = self.split_scorer(lefts, rights).squeeze(-1).float()
-            label_logits = self.label_scorer(lefts, rights).float()
-
-            split_chart[bs_t, ks_t, es_t] = split_logits
-            best_label_score, best_label_idx = label_logits.max(-1)
-            best_label_score_chart[bs_t, ks_t, es_t] = best_label_score
-            best_label_idx_chart[bs_t, ks_t, es_t] = best_label_idx
-
-            if return_label_logits:
-                all_label_logits.append(label_logits)
-                bs_list = bs_t.tolist()
-                ks_list = ks_t.tolist()
-                es_list = es_t.tolist()
-                for off, (b, k, e) in enumerate(zip(bs_list, ks_list, es_list, strict=True)):
-                    triple_index[(b, k, e)] = running_offset + off
-                running_offset += len(bs_list)
-
-        out: dict[str, Any] = {
-            "split_chart": split_chart,
-            "best_label_score_chart": best_label_score_chart,
-            "best_label_idx_chart": best_label_idx_chart,
-        }
-        if return_label_logits:
-            out["label_logits"] = (
-                torch.cat(all_label_logits, dim=0)
-                if all_label_logits
-                else torch.empty(0, len(self.label_index), device=device, dtype=score_dtype)
-            )
-            out["triple_index"] = triple_index
-        return out
+        keys = self.pointer_key_norm(edu_reprs[b : e - 1])  # [e-b-1, H]
+        return self.pointer(keys, query) / self._pointer_scale  # [1, e-b-1]
 
     # ─── Training ──────────────────────────────────────────────────────────
 
     def forward(self, tree: RstTree) -> dict[str, torch.Tensor]:
-        """Teacher-forced loss for one gold tree.
+        """Teacher-forced per-gold-span CE on splits and labels.
 
-        With `cfg.margin_training` null (default), accumulates per-gold-span CE
-        on splits and labels (cheap; no full chart). When set, computes the
-        gold tree score and the cost-augmented CKY tree score, returning the
-        margin hinge loss.
+        With the decoder off, every span is scored independently
+        (`_forward_per_node_ce`). With the decoder on, the gold spans are scored
+        in one masked decoder pass over the DFS decision sequence
+        (`_forward_with_decoder`); the loss decomposition is identical.
 
         Returns:
             {
-                "loss":       (weighted) sum of split + label + seg losses,
-                "split_loss": scalar (broken out for the trainer's EMA-weighting
-                              machinery; "margin" mode reports the hinge under
-                              "split_loss" with `label_loss=0` since the two
-                              objectives can't be cleanly separated),
+                "loss":       sum of split + label + seg losses,
+                "split_loss": scalar (broken out for the trainer's EMA weighting),
                 "label_loss": scalar,
                 "seg_loss":   scalar (zero when joint segmentation is disabled),
             }
@@ -500,10 +506,10 @@ class PiudottoParser(nn.Module):
         for (left_range, right_range), nuc, rel in tree.spans_with_ranges():
             gold_decisions[(left_range[0], right_range[1])] = (right_range[0], f"{nuc}_{rel}")
 
-        if self.margin is None:
-            split_loss, label_loss = self._forward_per_node_ce(edu_reprs, gold_decisions)
+        if self.tree_decoder is not None:
+            split_loss, label_loss = self._forward_with_decoder(edu_reprs, gold_decisions, num_edus)
         else:
-            split_loss, label_loss = self._forward_margin(edu_reprs, gold_decisions)
+            split_loss, label_loss = self._forward_per_node_ce(edu_reprs, gold_decisions)
 
         return {
             "loss": split_loss + label_loss + seg_loss,
@@ -511,6 +517,67 @@ class PiudottoParser(nn.Module):
             "label_loss": label_loss,
             "seg_loss": seg_loss,
         }
+
+    @staticmethod
+    def _dfs_spans(
+        gold_decisions: dict[tuple[int, int], tuple[int, str]],
+        num_edus: int,
+    ) -> list[tuple[int, int]]:
+        """The tree's internal-node spans in left-first preorder DFS.
+
+        This is the order the decoder lays out its decision tokens at training and
+        the order greedy decode visits spans at inference. They must match, or the
+        causal/positional structure won't correspond.
+        """
+        order: list[tuple[int, int]] = []
+        stack = [(0, num_edus)]
+        while stack:
+            b, e = stack.pop()
+            order.append((b, e))
+            gold_k, _ = gold_decisions[(b, e)]
+            if e - gold_k > 1:
+                stack.append((gold_k, e))
+            if gold_k - b > 1:
+                stack.append((b, gold_k))
+        return order
+
+    def _forward_with_decoder(
+        self,
+        edu_reprs: torch.Tensor,
+        gold_decisions: dict[tuple[int, int], tuple[int, str]],
+        num_edus: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-gold-span CE with split scores from the AR decoder + pointer head.
+
+        One masked decoder pass produces every per-decision query; the causal
+        mask guarantees query t saw only tokens 1..t (the parse history up to that
+        decision), so this matches the left-to-right flow of inference while being
+        a single parallel forward.
+        """
+        spans = self._dfs_spans(gold_decisions, num_edus)
+        span_tokens = torch.stack([edu_reprs[b:e].mean(0) for b, e in spans])  # [m, H]
+        queries = self.tree_decoder(span_tokens, edu_reprs)  # [m, H]
+
+        split_losses: list[torch.Tensor] = []
+        label_losses: list[torch.Tensor] = []
+        for t, (b, e) in enumerate(spans):
+            gold_k, gold_label_str = gold_decisions[(b, e)]
+            gold_label_idx = self.label_index.index(gold_label_str)
+
+            if e - b > 2:
+                split_logits = self._split_logits(edu_reprs, b, e, queries[t])  # [1, e-b-1]
+                split_target = torch.tensor([gold_k - b - 1], device=self.device)
+                split_losses.append(F.cross_entropy(split_logits, split_target))
+
+            left = self._pool_span(edu_reprs, b, gold_k)
+            right = self._pool_span(edu_reprs, gold_k, e)
+            label_logits = self.label_scorer(left, right)  # [1, C]
+            label_target = torch.tensor([gold_label_idx], device=self.device)
+            label_losses.append(F.cross_entropy(label_logits, label_target))
+
+        split_loss = sum(split_losses) / len(split_losses) if split_losses else torch.zeros((), device=self.device)
+        label_loss = sum(label_losses) / len(label_losses)
+        return split_loss, label_loss
 
     def _forward_per_node_ce(
         self,
@@ -539,58 +606,6 @@ class PiudottoParser(nn.Module):
         split_loss = sum(split_losses) / len(split_losses) if split_losses else torch.zeros((), device=self.device)
         label_loss = sum(label_losses) / len(label_losses)
         return split_loss, label_loss
-
-    def _forward_margin(
-        self,
-        edu_reprs: torch.Tensor,
-        gold_decisions: dict[tuple[int, int], tuple[int, str]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stern et al. 2017 max-margin loss against the cost-augmented CKY tree.
-
-        Cost is per-decision Hamming over (b, k, e, label): every CKY-chosen
-        decision that doesn't match the gold decision at its (b, e) span adds
-        `self.margin` to the augmented score. The optimizer is driven to push
-        the gold tree's score above the most-violated tree's score by a margin.
-
-        Returns the hinge loss under `split_loss` and zero under `label_loss`
-        (so the trainer's loss-weighting machinery sees a single scalar even
-        though the margin couples the two decisions).
-        """
-        chart = self._score_chart(edu_reprs, return_label_logits=True)
-        split_chart = chart["split_chart"]
-        best_label_score_chart = chart["best_label_score_chart"]
-        best_label_idx_chart = chart["best_label_idx_chart"]
-        label_logits = chart["label_logits"]
-        triple_index = chart["triple_index"]
-
-        n = edu_reprs.size(0)
-
-        # Score the gold tree from the same chart.
-        gold_score = torch.zeros((), device=edu_reprs.device, dtype=label_logits.dtype)
-        for (b, e), (gold_k, gold_label_str) in gold_decisions.items():
-            gold_label_idx = self.label_index.index(gold_label_str)
-            t_idx = triple_index[(b, gold_k, e)]
-            gold_score = gold_score + split_chart[b, gold_k, e] + label_logits[t_idx, gold_label_idx]
-
-        # Cost-augment label scores: every triple gets +margin (anything you pick
-        # there is a non-gold decision), then for each gold (b, gold_k, e) re-score
-        # so picking the gold label costs zero and picking any other label costs +margin.
-        aug_label_score = best_label_score_chart + self.margin
-        aug_label_idx = best_label_idx_chart.clone()
-        for (b, e), (gold_k, gold_label_str) in gold_decisions.items():
-            gold_label_idx = self.label_index.index(gold_label_str)
-            t_idx = triple_index[(b, gold_k, e)]
-            per_label = label_logits[t_idx].clone()
-            per_label = per_label + self.margin
-            per_label[gold_label_idx] = per_label[gold_label_idx] - self.margin
-            best = per_label.max()
-            best_arg = per_label.argmax()
-            aug_label_score[b, gold_k, e] = best
-            aug_label_idx[b, gold_k, e] = best_arg
-
-        pred_score, _ = _cky_fill(split_chart, aug_label_score, aug_label_idx, n)
-        hinge = torch.clamp(pred_score - gold_score, min=0.0)
-        return hinge, torch.zeros((), device=edu_reprs.device)
 
     # ─── Inference ─────────────────────────────────────────────────────────
 
@@ -714,30 +729,53 @@ class PiudottoParser(nn.Module):
         return out
 
     def _decode_actions(self, edu_reprs: torch.Tensor) -> list[tuple[int, str, str]]:
-        """Dispatch decoding per `self.decoding`.
+        """Greedy top-down decode, dispatched on whether the AR decoder is on."""
+        if self.tree_decoder is not None:
+            return self._decode_with_decoder(edu_reprs)
+        return self._greedy_actions(edu_reprs)
 
-        Greedy scores only the spans it visits (`_greedy_actions`); CKY needs the
-        full chart for the global optimum.
+    def _decode_with_decoder(self, edu_reprs: torch.Tensor) -> list[tuple[int, str, str]]:
+        """Autoregressive greedy decode with the Transformer decoder + pointer head.
+
+        Visits spans in left-first preorder DFS (the order the decoder was trained
+        on). Each step appends the current span's token, re-runs the decoder over
+        the prefix, and uses the last query to pick the split + label. Re-running
+        the whole prefix per step is the simple, obviously-correct route (it's the
+        same function as training on a prefix); RST trees are small enough that the
+        O(n) extra passes don't matter, and a KV-cache is a later optimization.
         """
-        if self.decoding == "greedy":
-            return self._greedy_actions(edu_reprs)
         n = edu_reprs.size(0)
-        chart = self._score_chart(edu_reprs)
-        return cky_decode(
-            chart["split_chart"],
-            chart["best_label_score_chart"],
-            chart["best_label_idx_chart"],
-            n,
-            self.label_index,
-        )
+        if n < 2:
+            return []
+        actions: list[tuple[int, str, str]] = []
+        tokens: list[torch.Tensor] = []
+        stack: list[tuple[int, int]] = [(0, n)]
+        while stack:
+            b, e = stack.pop()
+            tokens.append(edu_reprs[b:e].mean(0))
+            query = self.tree_decoder(torch.stack(tokens), edu_reprs)[-1]  # [H]
+            if e - b == 2:
+                k = b + 1
+            else:
+                split_logits = self._split_logits(edu_reprs, b, e, query)  # [1, e-b-1]
+                k = b + 1 + int(split_logits.argmax(-1).item())
+            left = self._pool_span(edu_reprs, b, k)
+            right = self._pool_span(edu_reprs, k, e)
+            label_logits = self.label_scorer(left, right)
+            nuc, rel = self.label_index[int(label_logits.argmax(-1).item())].split("_", 1)
+            actions.append((k, nuc, rel))
+            if e - k > 1:
+                stack.append((k, e))
+            if k - b > 1:
+                stack.append((b, k))
+        return actions
 
     def _greedy_actions(self, edu_reprs: torch.Tensor) -> list[tuple[int, str, str]]:
-        """Greedy top-down decode that scores only the spans it visits.
+        """Greedy top-down decode that scores only the spans it visits (the
+        history-free path, used when the AR decoder is off).
 
         At each span (b, e) pick the argmax (split, label) with no lookahead, then
-        recurse into the two children. This touches O(n) spans rather than the full
-        O(n^3) chart `_score_chart` builds, so it's the cheap path for the default
-        decoder. Scoring per span mirrors `_forward_per_node_ce`.
+        recurse into the two children. Scoring per span mirrors `_forward_per_node_ce`.
         """
         n = edu_reprs.size(0)
         if n < 2:
@@ -762,75 +800,3 @@ class PiudottoParser(nn.Module):
             if k - b > 1:
                 stack.append((b, k))
         return actions
-
-
-# ─── Decoders (top-level helpers, not methods) ─────────────────────────────
-
-
-def _cky_fill(
-    split_chart: torch.Tensor,
-    label_score_chart: torch.Tensor,
-    label_idx_chart: torch.Tensor,
-    num_edus: int,
-) -> tuple[torch.Tensor, dict[tuple[int, int], tuple[int, int]]]:
-    """Inner CKY fill. Returns (root_score, back-pointers).
-
-    back-pointers: {(b, e): (best_k, best_label_idx)} for every non-leaf span
-    along the optimal tree (and along every other span that ever got filled).
-    """
-    n = num_edus
-    device = split_chart.device
-    chart = torch.zeros((n + 1, n + 1), device=device, dtype=split_chart.dtype)
-    back: dict[tuple[int, int], tuple[int, int]] = {}
-    for width in range(2, n + 1):
-        for b in range(n - width + 1):
-            e = b + width
-            # Vectorize over k ∈ (b, e).
-            split_vals = split_chart[b, b + 1 : e, e]  # [width-1]
-            label_score_vals = label_score_chart[b, b + 1 : e, e]
-            left_vals = chart[b, b + 1 : e]
-            right_vals = chart[b + 1 : e, e]
-            total = split_vals + label_score_vals + left_vals + right_vals
-            best_k_idx = int(total.argmax().item())
-            chart[b, e] = total[best_k_idx]
-            best_k = b + 1 + best_k_idx
-            back[(b, e)] = (best_k, int(label_idx_chart[b, best_k, e].item()))
-    return chart[0, n], back
-
-
-def cky_decode(
-    split_chart: torch.Tensor,
-    best_label_score_chart: torch.Tensor,
-    best_label_idx_chart: torch.Tensor,
-    num_edus: int,
-    label_index: list[str],
-) -> list[tuple[int, str, str]]:
-    """Globally-optimal binary tree via CKY over EDU spans. O(n^3) fill + O(n) backtrace.
-
-    Returns parsing actions in DFS order ready for `RstTree.from_parsing_actions`.
-    """
-    if num_edus < 2:
-        return []
-    _, back = _cky_fill(split_chart, best_label_score_chart, best_label_idx_chart, num_edus)
-    return _backtrace(back, num_edus, label_index)
-
-
-def _backtrace(
-    back: dict[tuple[int, int], tuple[int, int]],
-    num_edus: int,
-    label_index: list[str],
-) -> list[tuple[int, str, str]]:
-    actions: list[tuple[int, str, str]] = []
-    stack: list[tuple[int, int]] = [(0, num_edus)]
-    while stack:
-        b, e = stack.pop()
-        if e - b < 2:
-            continue
-        k, label_idx = back[(b, e)]
-        nuc, rel = label_index[label_idx].split("_", 1)
-        actions.append((k, nuc, rel))
-        if e - k > 1:
-            stack.append((k, e))
-        if k - b > 1:
-            stack.append((b, k))
-    return actions

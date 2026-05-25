@@ -57,6 +57,6 @@ PARSERS: dict[str, ParserSpec] = {
         config_cls="PiudottoConfig",
         parser_cls="PiudottoParser",
         supports_text=True,
-        signature_field="decoding",
+        signature_field="span_pooling",
     ),
 }

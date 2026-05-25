@@ -60,7 +60,7 @@ _PARSER_META: dict[str, dict[str, str]] = {
         "module_path": "iudex.rst.parsers.piudotto.modeling_piudotto",
         "class_name": "PiudottoParser",
         "description": "an end-to-end span-based RST parser with joint EDU segmentation, biaffine span scoring, "
-        "and greedy or CKY decoding",
+        "and an optional Transformer pointer decoder, greedy top-down decoding",
     },
 }
 
