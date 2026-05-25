@@ -60,6 +60,27 @@ class _EMAConfig(FromParams):
 
 
 @dataclass
+class _PeftConfig(FromParams):
+    """LoRA fine-tuning of the encoder. Null (default) = full fine-tuning.
+    When set, the base encoder is frozen and only the low-rank adapters train,
+    so a higher `encoder_lr` (~1e-4) is appropriate.
+    """
+
+    r: int = 16
+    alpha: int = 32
+    dropout: float = 0.05
+    # Which encoder submodules get adapters. "all-linear" (attention + FFN) suits
+    # tasks far from the MLM pretraining objective, like discourse parsing; pass an
+    # explicit list (e.g. ["query", "value"]) for the classic attention-only LoRA.
+    target_modules: str | list[str] = "all-linear"
+    bias: str = "none"
+
+    def __post_init__(self):
+        if self.r < 1:
+            raise ValueError(f"_PeftConfig.r must be >= 1 (got {self.r})")
+
+
+@dataclass
 class _MarginObjectiveConfig(FromParams):
     """Stern et al. 2017 max-margin objective. Runs CKY each step (~2x
     slower than per-node CE) but optimizes a global tree-level signal.
@@ -87,8 +108,10 @@ class PiudottoConfig(FromParams):
     # `relation_types` and the model's label space are in the mapped space.
     relation_map: dict[str, str] | None = None
 
-    # Encoder. Fully fine-tuned (no layer freezing) with a smaller `encoder_lr`.
+    # Encoder. Fully fine-tuned (no layer freezing) with a smaller `encoder_lr`,
+    # unless `peft` is set (LoRA adapters only). See `_PeftConfig`.
     model_name: str = "jhu-clsp/ettin-encoder-150m"
+    peft: _PeftConfig | None = None
     # Docs longer than the model's context length require strided encoding, but a
     # modern long-context encoder will outrun pretty much any RST doc.
     stride: int = 100
@@ -113,6 +136,20 @@ class PiudottoConfig(FromParams):
     #   "mean":     average of all EDU representations in the child
     #   "last_edu": the last EDU representation in the child
     label_input_pooling: str = "mean"
+
+    # Optional EDU-level Transformer encoder over the pooled per-EDU vectors,
+    # run before span scoring so EDUs contextualize against each other (the role
+    # dmrst's document-level BiGRU plays). Randomly initialized. 0 layers
+    # disables it.
+    edu_encoder_layers: int = 0
+    # Bottleneck width for the EDU encoder. None runs it at the full encoder
+    # hidden size; set it smaller (e.g. 256/128) to down-project H→width,
+    # contextualize, up-project back with a residual, squeezing the contextual
+    # update through a low-capacity channel (regularization). Must be divisible
+    # by `edu_encoder_heads`.
+    edu_encoder_hidden_size: int | None = None
+    edu_encoder_heads: int = 8
+    edu_encoder_dropout: float = 0.2
 
     # Joint EDU segmentation. When non-null, training adds a per-token
     # segmenter over EDU boundaries and `predict_from_text` is available

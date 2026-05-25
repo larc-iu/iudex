@@ -13,12 +13,21 @@ if TYPE_CHECKING:
 _TOKENIZER_MAX_LEN_SENTINEL = 1_000_000
 
 
-def load_encoder_and_tokenizer(model_name: str) -> tuple[torch.nn.Module, Any, int]:
+def load_encoder_and_tokenizer(model_name: str, peft_config: Any | None = None) -> tuple[torch.nn.Module, Any, int]:
     """Load a BERT-style HF encoder + tokenizer. Returns (encoder, tokenizer, max_length).
 
     Forces fp32: transformers>=5 honors the checkpoint dtype, and fp16
     checkpoints (e.g. SpanBERT) NaN immediately under AdamW. Raises if
     CLS/SEP are missing (the striding encoder needs both).
+
+    When `peft_config` is non-null the encoder is wrapped in a LoRA `PeftModel`
+    (base weights frozen, low-rank adapters trainable). The wrapper forwards
+    attribute access (`.config`, `.embeddings`, `.encoder.layer`, `.forward`)
+    and its `state_dict` keeps the full base weights plus adapters, so callers
+    need no other changes. Because loads reconstruct the model via `Parser(cfg)`
+    then `load_state_dict(strict=True)`, `peft_config` MUST live on the parser
+    config so the identical wrapping is rebuilt at load time. `peft_config` is
+    duck-typed: any object with `r`, `alpha`, `dropout`, `target_modules`, `bias`.
     """
     encoder = AutoModel.from_pretrained(model_name).float()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -31,7 +40,25 @@ def load_encoder_and_tokenizer(model_name: str) -> tuple[torch.nn.Module, Any, i
     max_length = tokenizer.model_max_length
     if max_length > _TOKENIZER_MAX_LEN_SENTINEL:
         max_length = encoder.config.max_position_embeddings
+
+    if peft_config is not None:
+        encoder = _wrap_lora(encoder, peft_config)
     return encoder, tokenizer, max_length
+
+
+def _wrap_lora(encoder: torch.nn.Module, peft_config: Any) -> torch.nn.Module:
+    """Wrap `encoder` in a LoRA `PeftModel` (feature-extraction task)."""
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    lora_config = LoraConfig(
+        r=peft_config.r,
+        lora_alpha=peft_config.alpha,
+        lora_dropout=peft_config.dropout,
+        target_modules=peft_config.target_modules,
+        bias=peft_config.bias,
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+    return get_peft_model(encoder, lora_config)
 
 
 def tokenize_edus(

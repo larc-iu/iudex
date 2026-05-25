@@ -11,6 +11,7 @@ from iudex.rst.parsers.common.encoding import (
     load_encoder_and_tokenizer,
     tokenize_document,
 )
+from iudex.rst.parsers.common.segmentation import Segmenter
 from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
 
 
@@ -97,16 +98,18 @@ class _Segmenter(nn.Module):
         self.start_linear = nn.Linear(hidden_size, 2) if start_loss else None
         self.register_buffer("class_weight", torch.tensor([1.0, pos_weight]))
 
-    def loss(self, embeddings: torch.Tensor, edu_end_positions: list[int]) -> torch.Tensor:
+    def loss(self, embeddings: torch.Tensor, edu_mapping: list[tuple[int, int]]) -> torch.Tensor:
         """Args:
             embeddings: [num_tokens, hidden_size]
-            edu_end_positions: token indices of EDU ends (inclusive)
+            edu_mapping: list of (start, end_exclusive) per EDU (same contract as
+                the shared scheme segmenter, so callers can use either uniformly)
 
         Returns:
             scalar loss
         """
         num_tokens = embeddings.size(0)
         device = embeddings.device
+        edu_end_positions = [end - 1 for _, end in edu_mapping]  # inclusive EDU ends
         end_target = torch.zeros(num_tokens, dtype=torch.long, device=device)
         end_target[edu_end_positions] = 1
         logits = self.linear(self.dropout(embeddings))
@@ -160,22 +163,32 @@ class DMRSTParser(nn.Module):
         self.label_index = determine_label_index(config.relation_types)
         self.stride = config.stride
 
-        self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(config.model_name)
+        self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(
+            config.model_name, peft_config=config.peft
+        )
 
-        if config.freeze_embeddings:
-            for p in self.encoder.embeddings.parameters():
-                p.requires_grad = False
-        if config.freeze_encoder_layers > 0:
-            # BERT/RoBERTa/XLM-R: encoder.encoder.layer; ModernBert/Ettin: encoder.layers
-            if hasattr(self.encoder, "encoder") and hasattr(self.encoder.encoder, "layer"):
-                layers = self.encoder.encoder.layer
-            elif hasattr(self.encoder, "layers"):
-                layers = self.encoder.layers
-            else:
-                raise ValueError(f"Don't know how to access transformer layers on {type(self.encoder).__name__}")
-            for layer in layers[: config.freeze_encoder_layers]:
-                for p in layer.parameters():
+        if config.peft is not None:
+            if config.freeze_embeddings or config.freeze_encoder_layers > 0:
+                raise ValueError(
+                    "peft (LoRA) already freezes the base encoder; combining it with "
+                    "freeze_embeddings / freeze_encoder_layers is contradictory. Set "
+                    "freeze_embeddings: false and freeze_encoder_layers: 0 to use peft."
+                )
+        else:
+            if config.freeze_embeddings:
+                for p in self.encoder.embeddings.parameters():
                     p.requires_grad = False
+            if config.freeze_encoder_layers > 0:
+                # BERT/RoBERTa/XLM-R: encoder.encoder.layer; ModernBert/Ettin: encoder.layers
+                if hasattr(self.encoder, "encoder") and hasattr(self.encoder.encoder, "layer"):
+                    layers = self.encoder.encoder.layer
+                elif hasattr(self.encoder, "layers"):
+                    layers = self.encoder.layers
+                else:
+                    raise ValueError(f"Don't know how to access transformer layers on {type(self.encoder).__name__}")
+                for layer in layers[: config.freeze_encoder_layers]:
+                    for p in layer.parameters():
+                        p.requires_grad = False
 
         # Compile the encoder forward (not the module) so state_dict keys are
         # unchanged and existing checkpoints still load. dynamic=True avoids
@@ -216,16 +229,25 @@ class DMRSTParser(nn.Module):
             raise ValueError(f"Unknown label_input_pooling: {config.label_input_pooling!r}")
         self.label_input_pooling = config.label_input_pooling
 
-        self.segmenter = (
-            _Segmenter(
+        # The paper's binary end-tagger by default; the shared scheme-based
+        # segmenter (BIE/BO/EO, crf/ce) when `segmentation.scheme` is set.
+        if config.segmentation is None:
+            self.segmenter = None
+        elif config.segmentation.scheme is not None:
+            self.segmenter = Segmenter(
+                hidden_size,
+                scheme=config.segmentation.scheme,
+                loss=config.segmentation.loss,
+                pos_weight=config.segmentation.pos_weight,
+                dropout=config.segmentation.dropout,
+            )
+        else:
+            self.segmenter = _Segmenter(
                 hidden_size,
                 pos_weight=config.segmentation.pos_weight,
                 dropout=config.encoder_dropout,
                 start_loss=config.segmentation.start_loss,
             )
-            if config.segmentation is not None
-            else None
-        )
 
         # Faithful text reconstruction for end-to-end (segmenter) models, so
         # training matches the raw text `predict_from_text` receives. A
@@ -294,10 +316,9 @@ class DMRSTParser(nn.Module):
         normed = self.layer_norm(embeddings.float())  # [num_tokens, hidden_size]
 
         if self.segmenter is not None and self.training:
-            # End token (inclusive) of each gold EDU. Segmenter operates on the
-            # layer-normed embeddings BEFORE dropout.
-            edu_ends = [end - 1 for _, end in edu_mapping]
-            seg_loss = self.segmenter.loss(normed, edu_ends)
+            # Segmenter operates on the layer-normed embeddings BEFORE dropout.
+            # Both the binary and the shared scheme segmenter take `edu_mapping`.
+            seg_loss = self.segmenter.loss(normed, edu_mapping)
         else:
             seg_loss = torch.zeros((), device=normed.device)
 

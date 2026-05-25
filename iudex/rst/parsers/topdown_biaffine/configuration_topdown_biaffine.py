@@ -6,6 +6,27 @@ from iudex.rst.parsers.common.config import parse_config_dict
 
 
 @dataclass
+class _PeftConfig(FromParams):
+    """LoRA fine-tuning of the encoder. Null (default) = full fine-tuning.
+    When set, the base encoder is frozen and only the low-rank adapters train,
+    so a higher `encoder_lr` (~1e-4) is appropriate.
+    """
+
+    r: int = 16
+    alpha: int = 32
+    dropout: float = 0.05
+    # Which encoder submodules get adapters. "all-linear" (attention + FFN) suits
+    # tasks far from the MLM pretraining objective, like discourse parsing; pass an
+    # explicit list (e.g. ["query", "value"]) for the classic attention-only LoRA.
+    target_modules: str | list[str] = "all-linear"
+    bias: str = "none"
+
+    def __post_init__(self):
+        if self.r < 1:
+            raise ValueError(f"_PeftConfig.r must be >= 1 (got {self.r})")
+
+
+@dataclass
 class TopdownBiaffineConfig(FromParams):
     train_dir: str
     dev_dir: str
@@ -25,6 +46,9 @@ class TopdownBiaffineConfig(FromParams):
     ffn_hidden_size: int = 512
     dropout: float = 0.2
     stride: int = 100
+
+    # LoRA encoder fine-tuning. See `_PeftConfig`. Null (default) = full fine-tuning.
+    peft: _PeftConfig | None = None
 
     # Training
     lr: float = 2e-4

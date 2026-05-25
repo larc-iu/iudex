@@ -57,7 +57,9 @@ class TopdownBiaffineParser(nn.Module):
         self.label_index = determine_label_index(config.relation_types)
         self.stride = config.stride
 
-        self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(config.model_name)
+        self.encoder, self.tokenizer, self.max_length = load_encoder_and_tokenizer(
+            config.model_name, peft_config=config.peft
+        )
         self.hidden_size = self.encoder.config.hidden_size
 
         # Compile the encoder forward (not the module) so state_dict keys are
