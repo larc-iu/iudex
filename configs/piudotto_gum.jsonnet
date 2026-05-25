@@ -28,6 +28,17 @@
     edu_encoder_heads: 8,
     edu_encoder_dropout: 0.2,
 
+    // Autoregressive Transformer pointer decoder over the top-down decision
+    // sequence (the non-RNN replacement for dmrst's GRU decoder). 0 disables it
+    // (history-free per-node biaffine split scoring).
+    decoder_layers: 2,
+    decoder_hidden_size: 768,
+    decoder_heads: 8,
+    decoder_dropout: 0.5,
+    // dot_product to match dmrst_gum's pointer (isolates "Transformer vs GRU
+    // history"); "biaffine" is the more expressive alternative.
+    pointer_attention_type: "biaffine",
+
     // Joint EDU segmentation. Linear-chain CRF over the BIE scheme by default;
     // set `loss: "ce"` for the lighter per-token CE + constrained Viterbi. Set
     // the whole block to `null` to train a gold-EDU-only parser.
@@ -41,13 +52,6 @@
     // Detokenize corpus EDU text to natural form so the segmenter trains on the
     // same kind of text `predict_from_text` sees. Only applied with segmentation.
     detokenizer: null,
-
-    // Tree decoding: "greedy" by default. Switch to "cky" for the global optimum.
-    decoding: "greedy",
-
-    // Training objective: per-node CE by default. Set `margin_training: {margin: 1.0}`
-    // for Stern et al. 2017 max-margin (CKY at train time, ~2x slower).
-    margin_training: null,
 
     // Data
     train_dir: "data/gum_12.1.0_notok/train",
