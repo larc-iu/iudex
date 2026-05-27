@@ -340,6 +340,102 @@ class RstTree:
         root = E("rst", *[header, body])
         return ET.tostring(root, encoding="utf-8", pretty_print=True).decode("utf-8")
 
+    def _build_binary_tree(self):
+        """Replay `parsing_actions` into a nested-tuple binary tree:
+        leaves are `("edu", edu_text)`; internal nodes are
+        `("node", nuclearity, relation, left, right)`, with children in text
+        order. Multi-satellite span nodes (1 nucleus, N>1 satellites) come out
+        as N nested binary splits, matching how `parsing_actions` decomposes
+        them. Relations are already passed through `_resolve_rel`.
+        """
+        actions = self.parsing_actions()
+        coverage: list = [("edu", t) for t in self.edu_strings]
+        for right_index, nuc, rel in reversed(actions):
+            left = coverage[right_index - 1]
+            right = coverage[right_index]
+            merged = ("node", nuc, rel, left, right)
+            for i in range(len(coverage)):
+                if coverage[i] is left or coverage[i] is right:
+                    coverage[i] = merged
+        return coverage[0]
+
+    def to_sexp(self, format: str = "iudex", invert_escaping: bool = False) -> str:
+        """Serialize as an S-expression. Internal nodes always render as
+        `(NUC:relation child1 child2)` with NUC in {NS, SN, NN}; `format`
+        selects how EDU leaves render:
+          - "iudex" (default): `(EDU text)`. Literal parens in EDU text are
+            escaped to `-LRB-`/`-RRB-` (PTB convention) when
+            `invert_escaping=False`; when `invert_escaping=True`, EDU text
+            keeps literal parens as-is.
+          - "dis": `(text _!...!_)` — RST-DT `.dis` style. The `_!..._!` fence
+            removes the need for paren escaping, so EDU text is emitted
+            verbatim regardless of `invert_escaping`.
+          - "index": leaves are bare 0-based EDU indices into `self.edus`
+            (e.g. `(NS:elab 0 1)`); the tree captures structure only, pair
+            with `edu_strings` to recover content.
+        `invert_escaping` always controls structural bracketing: with `True`,
+        `(`/`)` are replaced by `-LRB-`/`-RRB-` everywhere outside leaf text.
+        """
+        if not self.is_binary:
+            raise NotImplementedError("Non-binary trees are not currently supported for this operation.")
+        if format not in ("iudex", "dis", "index"):
+            raise ValueError(f"Unknown format {format!r}; expected one of: iudex, dis, index")
+
+        if invert_escaping:
+            lpar, rpar = "-LRB-", "-RRB-"
+
+            def escape(s: str) -> str:
+                return s
+        else:
+            lpar, rpar = "(", ")"
+
+            def escape(s: str) -> str:
+                return s.replace("(", "-LRB-").replace(")", "-RRB-")
+
+        counter = 0
+
+        def render(node) -> str:
+            nonlocal counter
+            if node[0] == "edu":
+                text = node[1]
+                if format == "iudex":
+                    return f"{lpar}EDU {escape(text)}{rpar}"
+                if format == "dis":
+                    return f"{lpar}text _!{text}_!{rpar}"
+                idx = counter
+                counter += 1
+                return str(idx)
+            _, nuc, rel, left, right = node
+            return f"{lpar}{nuc}:{rel} {render(left)} {render(right)}{rpar}"
+
+        return render(self._build_binary_tree())
+
+    def to_shift_reduce(self, ltr: bool = True) -> List[Tuple[str, ...]]:
+        """Serialize as a chain of shift/reduce actions. Each action is either
+        `("S",)` (shift the next EDU) or `("R", nuclearity, relation)` (combine
+        the top two stack items, with `nuclearity` in {NS, SN, NN}). With
+        `ltr=True` (default) EDUs are shifted in text order; with `ltr=False`
+        they are shifted right-to-left. Nuclearity labels always describe text
+        order, so a right-to-left consumer must swap children when applying
+        each reduce.
+        """
+        if not self.is_binary:
+            raise NotImplementedError("Non-binary trees are not currently supported for this operation.")
+
+        output: List[Tuple[str, ...]] = []
+
+        def walk(node) -> None:
+            if node[0] == "edu":
+                output.append(("S",))
+                return
+            _, nuc, rel, left, right = node
+            for c in [left, right] if ltr else [right, left]:
+                walk(c)
+            output.append(("R", nuc, rel))
+
+        walk(self._build_binary_tree())
+        return output
+
     @property
     def edus(self) -> List[RstNode]:
         return [n for n in self._node_map.values() if n.is_edu]
