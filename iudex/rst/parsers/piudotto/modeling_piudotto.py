@@ -1,6 +1,7 @@
 """Span-based end-to-end RST parser (piudotto)."""
 
 import math
+from collections import deque
 from typing import Any
 
 import torch
@@ -200,14 +201,15 @@ class _TreeDecoder(nn.Module):
     """Autoregressive Transformer decoder over the top-down decision sequence.
 
     The non-RNN replacement for dmrst's recurrent pointer decoder. The
-    "sequence" is the tree's internal-node spans in left-first preorder DFS, the
-    order both the training pass and greedy decode visit them. Each step's input
-    token is the pooled repr of the span being decided (plus a sinusoidal
-    positional encoding over the decision-step index, since attention is
-    order-agnostic and DFS order is the history signal). Causal self-attention
-    over the prefix conditions each split decision on the decisions already
-    committed (query t attends only to tokens 1..t); cross-attention reads the
-    EDU representations. The per-step output is the pointer query.
+    "sequence" is the tree's internal-node spans in the parser's `decoder_order`
+    (DFS preorder or BFS level order); training and greedy decode share the
+    visitation order. Each step's input token is the pooled repr of the span
+    being decided plus a sinusoidal positional encoding over the decision-step
+    index (the history signal, since attention is order-agnostic). Causal
+    self-attention over the prefix conditions each split decision on the
+    decisions already committed (query t attends only to tokens 1..t);
+    cross-attention reads the EDU representations. The per-step output is the
+    pointer query.
 
     `inner_size`, when smaller than `hidden_size`, runs the decoder in a narrow
     bottleneck (down-project H->inner, decode, up-project inner->H) the same way
@@ -250,7 +252,7 @@ class _TreeDecoder(nn.Module):
     def forward(self, span_tokens: torch.Tensor, edu_reprs: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            span_tokens: [num_decisions, H]  pooled span reprs in DFS order
+            span_tokens: [num_decisions, H]  pooled span reprs in visitation order
             edu_reprs:   [num_edus, H]       cross-attention memory
 
         Returns:
@@ -357,6 +359,9 @@ class PiudottoParser(nn.Module):
         )
 
         self.label_input_pooling = config.label_input_pooling
+        if config.decoder_order not in ("dfs", "bfs"):
+            raise ValueError(f"Unknown decoder_order: {config.decoder_order!r}")
+        self.decoder_order = config.decoder_order
 
         self.segmenter = (
             Segmenter(
@@ -518,28 +523,36 @@ class PiudottoParser(nn.Module):
             "seg_loss": seg_loss,
         }
 
-    @staticmethod
-    def _dfs_spans(
+    def _push_children(self, frontier: deque, b: int, k: int, e: int) -> None:
+        """Push a split's non-leaf children onto the frontier per `decoder_order`.
+
+        DFS uses the frontier as a stack (pop right), so push right-then-left to
+        expand the left child next; BFS uses it as a queue (pop left), so push
+        left-then-right. Training and decode share this discipline so the
+        causal/positional structure of the decoder matches at both ends.
+        """
+        left = (b, k) if k - b > 1 else None
+        right = (k, e) if e - k > 1 else None
+        ordered = (right, left) if self.decoder_order == "dfs" else (left, right)
+        for child in ordered:
+            if child is not None:
+                frontier.append(child)
+
+    def _decision_spans(
+        self,
         gold_decisions: dict[tuple[int, int], tuple[int, str]],
         num_edus: int,
     ) -> list[tuple[int, int]]:
-        """The tree's internal-node spans in left-first preorder DFS.
-
-        This is the order the decoder lays out its decision tokens at training and
-        the order greedy decode visits spans at inference. They must match, or the
-        causal/positional structure won't correspond.
-        """
-        order: list[tuple[int, int]] = []
-        stack = [(0, num_edus)]
-        while stack:
-            b, e = stack.pop()
-            order.append((b, e))
+        """Internal-node spans in `decoder_order`, the order the decoder lays
+        out its decision tokens."""
+        spans: list[tuple[int, int]] = []
+        frontier: deque[tuple[int, int]] = deque([(0, num_edus)])
+        while frontier:
+            b, e = frontier.pop() if self.decoder_order == "dfs" else frontier.popleft()
+            spans.append((b, e))
             gold_k, _ = gold_decisions[(b, e)]
-            if e - gold_k > 1:
-                stack.append((gold_k, e))
-            if gold_k - b > 1:
-                stack.append((b, gold_k))
-        return order
+            self._push_children(frontier, b, gold_k, e)
+        return spans
 
     def _forward_with_decoder(
         self,
@@ -554,7 +567,7 @@ class PiudottoParser(nn.Module):
         decision), so this matches the left-to-right flow of inference while being
         a single parallel forward.
         """
-        spans = self._dfs_spans(gold_decisions, num_edus)
+        spans = self._decision_spans(gold_decisions, num_edus)
         span_tokens = torch.stack([edu_reprs[b:e].mean(0) for b, e in spans])  # [m, H]
         queries = self.tree_decoder(span_tokens, edu_reprs)  # [m, H]
 
@@ -737,21 +750,22 @@ class PiudottoParser(nn.Module):
     def _decode_with_decoder(self, edu_reprs: torch.Tensor) -> list[tuple[int, str, str]]:
         """Autoregressive greedy decode with the Transformer decoder + pointer head.
 
-        Visits spans in left-first preorder DFS (the order the decoder was trained
-        on). Each step appends the current span's token, re-runs the decoder over
-        the prefix, and uses the last query to pick the split + label. Re-running
-        the whole prefix per step is the simple, obviously-correct route (it's the
-        same function as training on a prefix); RST trees are small enough that the
-        O(n) extra passes don't matter, and a KV-cache is a later optimization.
+        Visits spans in `decoder_order` (the order the decoder was trained on, via
+        the same `_push_children` frontier discipline). Each step appends the
+        current span's token, re-runs the decoder over the prefix, and uses the
+        last query to pick the split + label. Re-running the whole prefix per step
+        is the simple, obviously-correct route (it's the same function as training
+        on a prefix); RST trees are small enough that the O(n) extra passes don't
+        matter, and a KV-cache is a later optimization.
         """
         n = edu_reprs.size(0)
         if n < 2:
             return []
         actions: list[tuple[int, str, str]] = []
         tokens: list[torch.Tensor] = []
-        stack: list[tuple[int, int]] = [(0, n)]
-        while stack:
-            b, e = stack.pop()
+        frontier: deque[tuple[int, int]] = deque([(0, n)])
+        while frontier:
+            b, e = frontier.pop() if self.decoder_order == "dfs" else frontier.popleft()
             tokens.append(edu_reprs[b:e].mean(0))
             query = self.tree_decoder(torch.stack(tokens), edu_reprs)[-1]  # [H]
             if e - b == 2:
@@ -764,10 +778,7 @@ class PiudottoParser(nn.Module):
             label_logits = self.label_scorer(left, right)
             nuc, rel = self.label_index[int(label_logits.argmax(-1).item())].split("_", 1)
             actions.append((k, nuc, rel))
-            if e - k > 1:
-                stack.append((k, e))
-            if k - b > 1:
-                stack.append((b, k))
+            self._push_children(frontier, b, k, e)
         return actions
 
     def _greedy_actions(self, edu_reprs: torch.Tensor) -> list[tuple[int, str, str]]:

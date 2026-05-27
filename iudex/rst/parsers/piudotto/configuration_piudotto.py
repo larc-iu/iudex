@@ -74,6 +74,10 @@ class _PeftConfig(FromParams):
     # explicit list (e.g. ["query", "value"]) for the classic attention-only LoRA.
     target_modules: str | list[str] = "all-linear"
     bias: str = "none"
+    # DoRA (Liu et al. 2024): decompose each adapted weight into magnitude +
+    # direction; only direction passes through the low-rank decomposition while
+    # magnitude is a separate per-output-dim trainable vector.
+    dora: bool = False
 
     def __post_init__(self):
         if self.r < 1:
@@ -156,6 +160,11 @@ class PiudottoConfig(FromParams):
     decoder_dropout: float = 0.2
     # Pointer split head used by the decoder: "biaffine" or "dot_product".
     pointer_attention_type: str = "biaffine"
+    # Order the decoder visits internal nodes (the decision sequence its causal
+    # self-attention runs over). Only meaningful with decoder_layers > 0.
+    #   "dfs": left-first preorder (matches dmrst's GRU thread).
+    #   "bfs": level order (coarse-to-fine).
+    decoder_order: str = "dfs"
 
     # Joint EDU segmentation. When non-null, training adds a per-token
     # segmenter over EDU boundaries and `predict_from_text` is available

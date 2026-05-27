@@ -37,6 +37,10 @@ class _PeftConfig(FromParams):
     # explicit list (e.g. ["query", "value"]) for the classic attention-only LoRA.
     target_modules: str | list[str] = "all-linear"
     bias: str = "none"
+    # DoRA (Liu et al. 2024): decompose each adapted weight into magnitude +
+    # direction; only direction passes through the low-rank decomposition while
+    # magnitude is a separate per-output-dim trainable vector.
+    dora: bool = False
 
     def __post_init__(self):
         if self.r < 1:

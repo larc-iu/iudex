@@ -27,7 +27,7 @@ def load_encoder_and_tokenizer(model_name: str, peft_config: Any | None = None) 
     need no other changes. Because loads reconstruct the model via `Parser(cfg)`
     then `load_state_dict(strict=True)`, `peft_config` MUST live on the parser
     config so the identical wrapping is rebuilt at load time. `peft_config` is
-    duck-typed: any object with `r`, `alpha`, `dropout`, `target_modules`, `bias`.
+    duck-typed: any object with `r`, `alpha`, `dropout`, `target_modules`, `bias`, `dora`.
     """
     encoder = AutoModel.from_pretrained(model_name).float()
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -56,6 +56,7 @@ def _wrap_lora(encoder: torch.nn.Module, peft_config: Any) -> torch.nn.Module:
         lora_dropout=peft_config.dropout,
         target_modules=peft_config.target_modules,
         bias=peft_config.bias,
+        use_dora=peft_config.dora,
         task_type=TaskType.FEATURE_EXTRACTION,
     )
     return get_peft_model(encoder, lora_config)
