@@ -201,4 +201,13 @@ def metrics_table(metrics: Dict[str, float], title: str) -> Table:
         table.add_row("[bold]End-to-End Parseval[/bold]", "")
         for name in ("span", "nuc", "rel", "full"):
             table.add_row(f"  {name.upper()}", f"{metrics[f'e2e_{name}_f1']:.4f}")
+
+    # Distinct from `span_f1` (true gold-EDU mode where the parser consumes
+    # gold EDUs): `gold_edu_*_f1` is the e2e parser evaluated under forced
+    # gold segmentation. Same Parseval, different setup.
+    if "gold_edu_span_f1" in metrics:
+        table.add_section()
+        table.add_row("[bold]Gold-EDU (forced) Parseval[/bold]", "")
+        for name in ("span", "nuc", "rel", "full"):
+            table.add_row(f"  {name.upper()}", f"{metrics[f'gold_edu_{name}_f1']:.4f}")
     return table

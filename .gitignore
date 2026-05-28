@@ -2,6 +2,7 @@ __pycache__
 .idea
 /checkpoints
 /data
+/icl_pilot
 *.swp
 *.pyc
 scratch.py

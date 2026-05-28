@@ -1,13 +1,13 @@
-// seq2seq_sr trained on GUM 12.1 (fine relations). Canonical config:
-// every field on `Seq2SeqSRConfig` is set explicitly, even if at the
-// dataclass default, so the file is self-documenting.
+// seq2seq_sr trained on RST-DT with the 18 coarse Carlson & Marcu classes.
+// Canonical config: every field on `Seq2SeqSRConfig` is set explicitly,
+// even if at the dataclass default, so the file is self-documenting.
 {
     // Data
-    train_dir: 'data/gum_12.1.0_notok/train',
-    dev_dir: 'data/gum_12.1.0_notok/dev',
-    test_dir: 'data/gum_12.1.0_notok/test',
-    relation_types: null,   // inferred at train time from train_dir+dev_dir
-    relation_map: null,     // GUM uses its native fine relation set
+    train_dir: 'data/rstdt/train',
+    dev_dir: 'data/rstdt/dev',
+    test_dir: 'data/rstdt/test',
+    relation_types: null,
+    relation_map: import 'lib/rstdt_coarse_map.libsonnet',
 
     // Model
     model_name: 'google/t5gemma-2-1b-1b',
@@ -56,7 +56,7 @@
     label_smoothing: 0.1,
 
     // Dev eval
-    dev_max_docs: null,    // null = full dev set every epoch
+    dev_max_docs: null,
     dev_batch_size: 8,
 
     // Decoding

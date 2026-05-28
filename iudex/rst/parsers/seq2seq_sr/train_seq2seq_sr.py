@@ -31,7 +31,7 @@ from iudex.common.training import (
     write_run_config,
 )
 from iudex.rst import HASH_EXCLUDE
-from iudex.rst.data.metrics import metrics_table
+from iudex.rst.data.metrics import compute_parseval_metrics, f1, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
 from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
 from iudex.rst.data.tree import RstTree
@@ -200,6 +200,49 @@ def _write_rs4(tree: RstTree, output_dir: str, basename: str) -> None:
 
 
 @torch.no_grad()
+def _evaluate_gold_edu(
+    model: Seq2SeqSRParser,
+    dev_pairs: list[tuple[str, RstTree]],
+) -> dict[str, float]:
+    """Run the gold-EDU-forced predict path over every dev pair and
+    aggregate Parseval. Per-tree shifts equal gold EDU counts by
+    construction (forced segmentation), so `compute_parseval_metrics`
+    sees aligned span counts. Trees where the alignment still drifts
+    (e.g. severe input truncation drops gold EDUs) are skipped with a
+    warning rather than aborting the whole pass.
+
+    Output keys: `gold_edu_{span,nuc,rel,full}_f1`.
+    """
+    totals = {f"{m}_{x}_count": 0 for m in ("span", "nuc", "rel", "full") for x in ("p", "r")}
+    totals["num_spans"] = 0
+    skipped = 0
+    eval_t0 = time.monotonic()
+    for filepath, gold in dev_pairs:
+        pred = model.predict_with_gold_edus(gold)
+        if len(pred.edus) != len(gold.edus):
+            skipped += 1
+            continue
+        try:
+            per_tree = compute_parseval_metrics(gold, pred)
+        except ValueError:
+            skipped += 1
+            continue
+        for k in totals:
+            totals[k] += per_tree[k]
+    dim(
+        f"  gold-EDU eval: {time.monotonic() - eval_t0:.1f}s over {len(dev_pairs)} docs"
+        + (f" ({skipped} skipped for EDU-count drift)" if skipped else "")
+    )
+    num_spans = totals["num_spans"]
+    if num_spans == 0:
+        return {f"gold_edu_{m}_f1": 0.0 for m in ("span", "nuc", "rel", "full")}
+    return {
+        f"gold_edu_{m}_f1": f1(totals[f"{m}_p_count"] / num_spans, totals[f"{m}_r_count"] / num_spans)
+        for m in ("span", "nuc", "rel", "full")
+    }
+
+
+@torch.no_grad()
 def _evaluate_on_dev(
     model: Seq2SeqSRParser,
     dev_pairs: list[tuple[str, RstTree]],
@@ -207,6 +250,7 @@ def _evaluate_on_dev(
     num_beams: int | None = None,
     batch_size: int = 1,
     output_dir: str | None = None,
+    eval_gold_edu: bool = False,
 ) -> dict[str, float]:
     """End-to-end Parseval + segmentation F1. No gold-EDU Parseval here:
     this parser always uses its own segmentation, so EDU counts can differ
@@ -258,7 +302,10 @@ def _evaluate_on_dev(
     dim(f"  dev eval total: {time.monotonic() - eval_t0:.1f}s over {len(dev_pairs)} documents")
     if output_dir is not None:
         dim(f"  Wrote {len(dev_pairs)} predictions to {os.path.abspath(output_dir)}")
-    return evaluate_seg_and_e2e(gold_trees, seg_data)
+    metrics = evaluate_seg_and_e2e(gold_trees, seg_data)
+    if eval_gold_edu:
+        metrics.update(_evaluate_gold_edu(model, dev_pairs))
+    return metrics
 
 
 def train(cfg: Seq2SeqSRConfig) -> None:
@@ -376,6 +423,7 @@ def train(cfg: Seq2SeqSRConfig) -> None:
             num_beams=dev_beams,
             batch_size=cfg.dev_batch_size,
             output_dir=pred_dir,
+            eval_gold_edu=cfg.eval_gold_edu,
         )
         tb.log_scalars("dev", metrics, global_step)
         console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
@@ -523,6 +571,7 @@ def train(cfg: Seq2SeqSRConfig) -> None:
             num_beams=cfg.num_beams,
             batch_size=cfg.dev_batch_size,
             output_dir=os.path.join(run_dir, "dev_predictions", "final"),
+            eval_gold_edu=cfg.eval_gold_edu,
         )
         console.print(metrics_table(dev_m, title="Final Dev Results"))
         final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
@@ -533,6 +582,7 @@ def train(cfg: Seq2SeqSRConfig) -> None:
                 num_beams=cfg.num_beams,
                 batch_size=cfg.dev_batch_size,
                 output_dir=os.path.join(run_dir, "test_predictions", "final"),
+                eval_gold_edu=cfg.eval_gold_edu,
             )
             console.print(metrics_table(test_m, title="Final Test Results"))
             final_metrics["test"] = test_m

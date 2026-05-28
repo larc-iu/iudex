@@ -1264,6 +1264,174 @@ class Seq2SeqSRParser(nn.Module):
         return tree
 
     @torch.no_grad()
+    def predict_with_gold_edus(self, tree: RstTree) -> RstTree:
+        """Greedy decode with gold EDU boundaries forced at the copy/shift
+        positions. The model still freely chooses every `<reduce_*>`, so
+        binarization + labeling stay model-driven; only segmentation is
+        supplied. Used by training-time eval when `cfg.eval_gold_edu`."""
+        return self._predict_one_gold_edu(tree)
+
+    @torch.no_grad()
+    def _predict_one_gold_edu(self, tree: RstTree) -> RstTree:
+        self.eval()
+        device = next(self.parameters()).device
+
+        text = _reconstruct_text(tree)
+        # Re-derive the gold EDU spans in source-id space from the same
+        # whole-doc tokenization the encoder will see. Duplicates the small
+        # helper in train_seq2seq_sr.py rather than importing across files
+        # (and keeps this path runnable without the trainer being loaded).
+        gold_ranges = _gold_edu_source_ranges(self.tokenizer, tree)
+
+        enc = self.tokenizer(
+            text,
+            max_length=self.config.max_input_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        ).to(device)
+
+        pad_id = self.tokenizer.pad_token_id
+        eos_id = self.tokenizer.eos_token_id
+        bos_id = self.tokenizer.bos_token_id
+
+        ids = enc["input_ids"][0].tolist()
+        while ids and ids[-1] == pad_id:
+            ids.pop()
+        if ids and ids[-1] == eos_id:
+            ids.pop()
+        if bos_id is not None and ids and ids[0] == bos_id:
+            ids = ids[1:]
+        source_ids = ids
+        source_len = len(source_ids)
+        if not source_ids:
+            return _empty_tree(self.config.relation_types)
+
+        # Clamp gold ranges to the (possibly truncated) source length. An EDU
+        # whose start fell beyond truncation is dropped; one straddling the
+        # boundary gets shortened.
+        clamped_ranges: list[tuple[int, int]] = []
+        for s, e in gold_ranges:
+            if s >= source_len:
+                break
+            clamped_ranges.append((s, min(e, source_len)))
+        if not clamped_ranges:
+            return _empty_tree(self.config.relation_types)
+        edu_ends = [end for _, end in clamped_ranges]  # exclusive ends
+        n_edus = len(edu_ends)
+
+        gc_active = self.config.gradient_checkpointing
+        if gc_active:
+            self._set_grad_checkpointing(False)
+        try:
+            encoder = self.model.get_encoder()
+            enc_out = encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], return_dict=True)
+
+            decoder_start = self.decoder_start_token_id
+            cursor = 0
+            stack = 0
+            edu_idx = 0
+            in_edu_buffer = 0  # copies since last shift (or start)
+            action_seq: list[int] = []
+            pred_edu_ranges: list[tuple[int, int]] = []
+            edu_start = 0
+            done = False
+            hit_max_len = False
+
+            decoder_input_ids = torch.full((1, 1), decoder_start, device=device, dtype=torch.long)
+            past_key_values = None
+
+            for step in range(self.config.max_output_length):
+                if done:
+                    break
+                step_input = decoder_input_ids[:, -1:] if past_key_values is not None else decoder_input_ids
+                out = self.model(
+                    encoder_outputs=enc_out,
+                    attention_mask=enc["attention_mask"],
+                    decoder_input_ids=step_input,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past_key_values = out.past_key_values
+                logits = out.logits[0, -1, :]  # [head_vocab_size]
+
+                masked = torch.full_like(logits, float("-inf"))
+                more_edus = edu_idx < n_edus
+                current_end = edu_ends[edu_idx] if more_edus else source_len
+
+                if more_edus and cursor < current_end:
+                    # Inside the current gold EDU: force COPY.
+                    masked[self.copy_head_idx] = logits[self.copy_head_idx]
+                elif more_edus and cursor == current_end and in_edu_buffer > 0:
+                    # Reached the boundary with content buffered: force SHIFT.
+                    masked[self.shift_head_idx] = logits[self.shift_head_idx]
+                else:
+                    # Between EDUs (just shifted, buffer empty) or all EDUs
+                    # exhausted. The model freely chooses REDUCE vs the next
+                    # structural step.
+                    if stack >= 2:
+                        masked[self._reduce_head_ids_buf] = logits[self._reduce_head_ids_buf]
+                    if more_edus:
+                        # Start of the next EDU: only COPY moves forward.
+                        masked[self.copy_head_idx] = logits[self.copy_head_idx]
+                    else:
+                        if stack == 1:
+                            masked[self.eos_head_idx] = logits[self.eos_head_idx]
+
+                head_idx = int(masked.argmax(-1).item())
+                full_id = self.full_id_for_head_idx[head_idx]
+                action_seq.append(full_id)
+
+                if full_id == eos_id:
+                    done = True
+                    next_input = pad_id
+                elif full_id == self.copy_token_id:
+                    if cursor < source_len:
+                        next_input = source_ids[cursor]
+                        cursor += 1
+                        in_edu_buffer += 1
+                    else:
+                        done = True
+                        next_input = pad_id
+                elif full_id == self.shift_token_id:
+                    stack += 1
+                    pred_edu_ranges.append((edu_start, cursor))
+                    edu_start = cursor
+                    in_edu_buffer = 0
+                    edu_idx += 1
+                    next_input = full_id
+                elif full_id in self.reduce_token_ids:
+                    stack -= 1
+                    next_input = full_id
+                else:
+                    done = True
+                    next_input = pad_id
+
+                if done:
+                    break
+                new_step = torch.tensor([[next_input]], device=device, dtype=torch.long)
+                decoder_input_ids = torch.cat([decoder_input_ids, new_step], dim=1)
+            else:
+                hit_max_len = not done
+        finally:
+            if gc_active:
+                self._set_grad_checkpointing(True)
+
+        if hit_max_len:
+            warn(
+                f"Output truncated at inference (gold-edu): generation hit "
+                f"max_output_length={self.config.max_output_length} without EOS. "
+                f"Tree closed by best-effort repair."
+            )
+        if cursor > edu_start:
+            pred_edu_ranges.append((edu_start, cursor))
+        tree_out = self._tree_from_action_sequence(action_seq, source_ids)
+        tree_out._pred_edu_source_ranges = pred_edu_ranges  # type: ignore[attr-defined]
+        tree_out._source_ids = source_ids  # type: ignore[attr-defined]
+        return tree_out
+
+    @torch.no_grad()
     def predict(self, tree: RstTree, *, num_beams: int | None = None) -> RstTree:
         """Reconstruct document text from the gold tree's EDUs, then parse
         end-to-end. The parser does not consume gold EDU boundaries."""
@@ -1391,6 +1559,38 @@ def _reconstruct_text(tree: RstTree) -> str:
         prefix = edu.prefix if edu.prefix is not None else " "
         parts.append(prefix + edu.text)
     return "".join(parts)
+
+
+def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
+    """Per-EDU `(start, end_exclusive)` token-position ranges in the encoder's
+    whole-doc tokenization space. Mirrors `_gold_edu_token_mapping` in
+    train_seq2seq_sr.py — duplicated so the predict path doesn't pull the
+    trainer into module-load."""
+    text = _reconstruct_text(tree)
+    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+    mapping: list[tuple[int, int]] = []
+    char_cursor = 0
+    for i, edu in enumerate(tree.edus):
+        if i > 0:
+            prefix = edu.prefix if edu.prefix is not None else " "
+            char_cursor += len(prefix)
+        char_start = char_cursor
+        char_cursor += len(edu.text)
+        char_end = char_cursor
+        first: int | None = None
+        last: int | None = None
+        for j, (tok_cs, tok_ce) in enumerate(offsets):
+            if tok_cs < char_end and tok_ce > char_start:
+                if first is None:
+                    first = j
+                last = j
+        if first is None or last is None:
+            anchor = first if first is not None else max(0, len(offsets) - 1)
+            mapping.append((anchor, anchor))
+            continue
+        mapping.append((first, last + 1))
+    return mapping
 
 
 def _empty_tree(relation_types, text: str = "") -> RstTree:
