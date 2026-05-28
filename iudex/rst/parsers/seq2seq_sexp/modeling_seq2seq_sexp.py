@@ -1,0 +1,1330 @@
+"""End-to-end RST parser via a fine-tuned encoder-decoder LM that emits
+a nested s-expression serialization of the binary RST tree, with source
+tokens substituted via `<copy>` (use_copy=True) or interleaved verbatim
+(use_copy=False). Sibling of `seq2seq_sr`, sharing its training/decoding
+recipe but swapping flat shift-reduce for nested s-expressions.
+
+Action vocabulary (use_copy=True):
+    {<sexp_open>, <sexp_close>, <eos>} U {<reduce_ns_*>, <reduce_sn_*>,
+    <reduce_nn_*>} U {<copy>}
+
+In use_copy=False mode the `<copy>` token is dropped from the head and
+the source subwords appear in-stream as their actual tokenizer IDs; the
+small action head still emits structural tokens, but source positions
+are predicted by the (untouched) backbone's lm_head over its full input
+vocab. Since we replace the lm_head with a small Linear, we expand the
+head's output dim to cover ALL source subwords seen during training, OR
+we constrain ourselves to the full vocab. Implementation choice: the
+head projects to {<sexp_open>, <sexp_close>, <eos>, labels} (no copy)
+PLUS the full input vocabulary, in head-index space. For practicality
+we keep `use_copy=True` as the canonical / well-tested path; the
+`use_copy=False` branch is supported in `encode_target` and decoding
+but uses the full backbone lm_head (no head replacement) so the source
+vocab is naturally available. This trades the memory benefit of the
+small head for keeping source-token prediction working without
+enumerating the source vocab at init.
+"""
+
+import logging
+from typing import List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+from iudex.common.log import warn
+from iudex.rst.data.tree import Reduce, RstTree, Shift
+from iudex.rst.parsers.common.sexp_constraints import SexpDecodingState
+from iudex.rst.parsers.seq2seq_sexp.configuration_seq2seq_sexp import Seq2SeqSexpConfig
+
+logger = logging.getLogger(__name__)
+
+
+# Structural special tokens added to the tokenizer. New, not SentencePiece
+# `(` / `)`, to avoid the family's whitespace/escape quirks around bare
+# punctuation.
+SEXP_OPEN_TOKEN = "<sexp_open>"
+SEXP_CLOSE_TOKEN = "<sexp_close>"
+COPY_TOKEN = "<copy>"
+
+
+def _reduce_token_to_label(token: str) -> str:
+    """Map a `<reduce_<nuc>_<rel>>` token string to the s-expression
+    label `NUC:rel`. Inverse of the (nuc, rel) -> reduce-token mapping
+    in `Reduce.to_token`."""
+    # `<reduce_ns_elaboration>` -> nuc="NS", rel="elaboration"
+    inner = token[len("<reduce_") : -1]
+    nuc_low, _, rel = inner.partition("_")
+    return f"{nuc_low.upper()}:{rel}"
+
+
+class Seq2SeqSexpParser(nn.Module):
+    def __init__(self, config: Seq2SeqSexpConfig, *, compile_encoder: bool = False):
+        super().__init__()
+        self.config = config
+        del compile_encoder
+
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        torch_dtype = torch.bfloat16 if config.amp else torch.float32
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, torch_dtype=torch_dtype)
+
+        self.action_token_ids: dict[str, int] = {}
+        self.reduce_token_ids: set[int] = set()
+        self.reduce_token_map: dict[str, Tuple[str, str]] = {}
+        if config.relation_types is not None:
+            self._install_action_vocab()
+
+        if config.peft is not None:
+            self._install_peft(config.peft)
+
+        if config.relation_types is not None:
+            self._install_action_head()
+            if config.peft is not None and getattr(config.peft, "train_only_new_embedding_rows", True):
+                self._mask_old_embedding_gradients()
+
+        if config.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+            self.model.config.use_cache = False
+            if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "config"):
+                self.model.base_model.config.use_cache = False
+
+    # -----------------------------------------------------------------
+    # Action vocabulary installation
+    # -----------------------------------------------------------------
+
+    def _build_action_vocab(self) -> List[str]:
+        """Specials + per-(rel, kind) reduces (same `<reduce_*>` tokens as
+        seq2seq_sr) + optional copy token."""
+        assert self.config.relation_types is not None
+        reduces: list[str] = []
+        self.reduce_token_map = {}
+        for rel, kind in self.config.relation_types:
+            nucs = ("NN",) if kind == "multinuc" else ("NS", "SN")
+            for nuc in nucs:
+                token = Reduce(nuc=nuc, rel=rel).to_token()
+                reduces.append(token)
+                self.reduce_token_map[token] = (nuc, rel)
+        tokens = [SEXP_OPEN_TOKEN, SEXP_CLOSE_TOKEN] + reduces
+        if self.config.use_copy:
+            tokens.append(COPY_TOKEN)
+        return tokens
+
+    def _install_peft(self, peft_cfg) -> None:
+        from peft import LoraConfig, TaskType, get_peft_model
+
+        existing_module_names = {name.rsplit(".", 1)[-1] for name, _ in self.model.named_modules()}
+        missing = [m for m in peft_cfg.modules_to_save if m not in existing_module_names]
+        if missing:
+            raise ValueError(
+                f"peft.modules_to_save references modules not found on {self.config.model_name!r}: "
+                f"{missing}. Available leaf names include: "
+                f"{sorted(n for n in existing_module_names if 'embed' in n.lower() or 'head' in n.lower() or 'shared' in n.lower() or 'proj' in n.lower())}"
+            )
+        lora_cfg = LoraConfig(
+            task_type=TaskType.SEQ_2_SEQ_LM,
+            r=peft_cfg.r,
+            lora_alpha=peft_cfg.alpha,
+            lora_dropout=peft_cfg.dropout,
+            target_modules=peft_cfg.target_modules,
+            bias=peft_cfg.bias,
+            use_dora=peft_cfg.dora,
+            modules_to_save=peft_cfg.modules_to_save,
+        )
+        self.model = get_peft_model(self.model, lora_cfg)
+        self._retie_modules_to_save()
+
+    def _set_grad_checkpointing(self, enabled: bool) -> None:
+        method = "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
+        fn = getattr(self.model, method, None)
+        if callable(fn):
+            fn()
+            return
+        for mod in self.model.modules():
+            if hasattr(mod, "gradient_checkpointing"):
+                mod.gradient_checkpointing = enabled
+
+    def _retie_modules_to_save(self) -> None:
+        by_ptr: dict[int, list[tuple[str, nn.Module]]] = {}
+        for name, mod in self.model.named_modules():
+            if type(mod).__name__ != "ModulesToSaveWrapper":
+                continue
+            original = getattr(mod, "original_module", None)
+            trainable_dict = getattr(mod, "modules_to_save", None)
+            if original is None or trainable_dict is None or "default" not in trainable_dict:
+                continue
+            trainable = trainable_dict["default"]
+            ow = getattr(original, "weight", None)
+            tw = getattr(trainable, "weight", None)
+            if not (isinstance(ow, nn.Parameter) and isinstance(tw, nn.Parameter)):
+                continue
+            by_ptr.setdefault(ow.data_ptr(), []).append((name, trainable))
+
+        retied_groups: list[list[str]] = []
+        for group in by_ptr.values():
+            if len(group) < 2:
+                continue
+            _, canonical = group[0]
+            for _, trainable in group[1:]:
+                trainable.weight = canonical.weight
+            retied_groups.append([name for name, _ in group])
+        if retied_groups:
+            logger.info(f"Re-tied trainable weight Parameters across modules_to_save groups: {retied_groups}")
+
+    def _resolve_decoder_start_token_id(self) -> int:
+        for src in (
+            getattr(self.model, "generation_config", None),
+            getattr(self.model, "config", None),
+        ):
+            if src is None:
+                continue
+            tok = getattr(src, "decoder_start_token_id", None)
+            if tok is not None:
+                return int(tok)
+        prepare = getattr(self.model, "prepare_decoder_input_ids_from_labels", None)
+        if prepare is not None:
+            stub = torch.zeros((1, 1), dtype=torch.long, device=next(self.model.parameters()).device)
+            shifted = prepare(labels=stub) if "labels" in prepare.__code__.co_varnames else prepare(stub)
+            return int(shifted[0, 0].item())
+        for src in (
+            getattr(self.model, "generation_config", None),
+            getattr(self.model, "config", None),
+        ):
+            bos = getattr(src, "bos_token_id", None) if src is not None else None
+            if bos is not None:
+                return int(bos)
+        return int(self.tokenizer.pad_token_id)
+
+    def _install_action_vocab(self) -> None:
+        action_vocab = self._build_action_vocab()
+        self._original_vocab_size = len(self.tokenizer)
+        existing = set(self.tokenizer.get_vocab().keys())
+        new_tokens = [t for t in action_vocab if t not in existing]
+        if new_tokens:
+            self.tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
+            self.model.resize_token_embeddings(len(self.tokenizer))
+
+        self.action_token_ids = {t: self.tokenizer.convert_tokens_to_ids(t) for t in action_vocab}
+        self.open_token_id = self.action_token_ids[SEXP_OPEN_TOKEN]
+        self.close_token_id = self.action_token_ids[SEXP_CLOSE_TOKEN]
+        self.copy_token_id = self.action_token_ids[COPY_TOKEN] if self.config.use_copy else None
+        self.decoder_start_token_id = self._resolve_decoder_start_token_id()
+        self.reduce_token_ids = {
+            tok_id
+            for token_str, tok_id in self.action_token_ids.items()
+            if token_str not in (SEXP_OPEN_TOKEN, SEXP_CLOSE_TOKEN, COPY_TOKEN)
+        }
+
+        eos_id = int(self.tokenizer.eos_token_id)
+        # Small action head ordering:
+        #   [<sexp_open>, <sexp_close>, sorted REDUCE-*, eos, (<copy> if use_copy)]
+        # use_copy=False also keeps the head small here; source-subword
+        # IDs are NOT predicted by this head (they're predicted by the
+        # full backbone lm_head bypass — see `forward` / decoding paths).
+        head_ids: list[int] = [self.open_token_id, self.close_token_id, *sorted(self.reduce_token_ids), eos_id]
+        if self.config.use_copy:
+            assert self.copy_token_id is not None
+            head_ids.append(self.copy_token_id)
+        self.full_id_for_head_idx: list[int] = head_ids
+        self.head_idx_for_full_id: dict[int, int] = {fid: i for i, fid in enumerate(self.full_id_for_head_idx)}
+        self.head_vocab_size = len(self.full_id_for_head_idx)
+        self.open_head_idx = self.head_idx_for_full_id[self.open_token_id]
+        self.close_head_idx = self.head_idx_for_full_id[self.close_token_id]
+        self.eos_head_idx = self.head_idx_for_full_id[eos_id]
+        self.copy_head_idx = self.head_idx_for_full_id[self.copy_token_id] if self.config.use_copy else None
+        self.reduce_head_indices = {self.head_idx_for_full_id[fid] for fid in self.reduce_token_ids}
+
+        structural_head_ids = sorted(self.reduce_head_indices | {self.open_head_idx, self.close_head_idx})
+        self.register_buffer(
+            "_structural_token_ids_buf",
+            torch.tensor(structural_head_ids, dtype=torch.long),
+            persistent=False,
+        )
+        max_full_id = max(self.full_id_for_head_idx) + 1
+        lookup = torch.full((max_full_id,), -100, dtype=torch.long)
+        for fid, hi in self.head_idx_for_full_id.items():
+            lookup[fid] = hi
+        self.register_buffer("_label_to_head_lookup", lookup, persistent=False)
+        self.register_buffer(
+            "_reduce_head_ids_buf",
+            torch.tensor(sorted(self.reduce_head_indices), dtype=torch.long),
+            persistent=False,
+        )
+
+    def _install_action_head(self) -> None:
+        base = self._underlying_model()
+
+        def _warm_init(new_linear: nn.Linear) -> None:
+            with torch.no_grad():
+                embed_weight = self._underlying_model().get_input_embeddings().weight
+                for hi, full_id in enumerate(self.full_id_for_head_idx):
+                    src = embed_weight[full_id].to(dtype=new_linear.weight.dtype, device=new_linear.weight.device)
+                    new_linear.weight[hi].copy_(src)
+
+        if (
+            hasattr(base, "lm_head")
+            and hasattr(base.lm_head, "out_proj")
+            and isinstance(base.lm_head.out_proj, nn.Linear)
+        ):
+            old = base.lm_head.out_proj
+            hidden = old.in_features
+            new = nn.Linear(hidden, self.head_vocab_size, bias=False).to(
+                dtype=old.weight.dtype, device=old.weight.device
+            )
+            _warm_init(new)
+            base.lm_head.out_proj = new
+        elif hasattr(base, "lm_head") and isinstance(base.lm_head, nn.Linear):
+            old = base.lm_head
+            hidden = old.in_features
+            new = nn.Linear(hidden, self.head_vocab_size, bias=False).to(
+                dtype=old.weight.dtype, device=old.weight.device
+            )
+            _warm_init(new)
+            base.lm_head = new
+        else:
+            raise RuntimeError(
+                f"Don't know how to replace lm_head on {type(base).__name__}; expected "
+                f"`lm_head` as Linear or `lm_head.out_proj` as Linear."
+            )
+        logger.info(f"Replaced lm_head with fresh Linear(hidden={hidden}, head_vocab_size={self.head_vocab_size}).")
+
+    def _underlying_model(self):
+        m = self.model
+        if hasattr(m, "base_model"):
+            m = m.base_model
+        if hasattr(m, "model") and not isinstance(m, nn.ModuleList):
+            m = m.model
+        return m
+
+    def _mask_old_embedding_gradients(self) -> None:
+        n_old = int(self._original_vocab_size)
+
+        def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
+            out = grad.clone()
+            out[:n_old].zero_()
+            return out
+
+        hooked: dict[int, tuple[str, nn.Parameter]] = {}
+        for name, mod in self.model.named_modules():
+            if type(mod).__name__ != "ModulesToSaveWrapper":
+                continue
+            trainable_dict = getattr(mod, "modules_to_save", None)
+            if trainable_dict is None or "default" not in trainable_dict:
+                continue
+            trainable = trainable_dict["default"]
+            if not isinstance(trainable, nn.Embedding):
+                continue
+            ptr = trainable.weight.data_ptr()
+            if ptr in hooked:
+                continue
+            trainable.weight.register_hook(_zero_old_rows)
+            hooked[ptr] = (name, trainable.weight)
+        if not hooked:
+            logger.info("_mask_old_embedding_gradients: no trainable embed_tokens Parameter found.")
+            return
+        if len(hooked) == 1:
+            name, weight = next(iter(hooked.values()))
+            logger.info(f"Embed gradient mask: rows [0, {n_old}) frozen; only [{n_old}, {weight.shape[0]}) update.")
+
+    @property
+    def segmenter(self):
+        # Truthy: this parser always segments by construction.
+        return self
+
+    # -----------------------------------------------------------------
+    # from_pretrained
+    # -----------------------------------------------------------------
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        repo_or_path: str,
+        *,
+        device: str | torch.device | None = None,
+        revision: str | None = None,
+        cache_dir: str | None = None,
+        token: str | bool | None = None,
+        compile_encoder: bool = False,
+    ) -> "Seq2SeqSexpParser":
+        from iudex.rst.parsers.hfhub import load_parser_from_pretrained
+
+        dev = (
+            torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        return load_parser_from_pretrained(
+            repo_or_path,
+            parser_cls=cls,
+            config_cls=Seq2SeqSexpConfig,
+            device=dev,
+            revision=revision,
+            cache_dir=cache_dir,
+            token=token,
+            compile_encoder=compile_encoder,
+        )
+
+    # -----------------------------------------------------------------
+    # Training forward (batched)
+    # -----------------------------------------------------------------
+
+    def forward(self, batch: dict) -> dict:
+        out = self.model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            decoder_input_ids=batch["decoder_input_ids"],
+            return_dict=True,
+        )
+        logits = out.logits  # [B, T, head_vocab_size]
+
+        labels = batch["labels"]
+        labels_flat = labels.reshape(-1)
+        max_id = self._label_to_head_lookup.size(0) - 1
+        in_range = (labels_flat >= 0) & (labels_flat <= max_id)
+        clamped = labels_flat.clamp(min=0, max=max_id)
+        head_labels_flat = torch.where(
+            in_range,
+            self._label_to_head_lookup[clamped],
+            torch.full_like(labels_flat, -100),
+        )
+
+        base_loss = F.cross_entropy(
+            logits.reshape(-1, self.head_vocab_size).float(),
+            head_labels_flat,
+            ignore_index=-100,
+            label_smoothing=self.config.label_smoothing,
+        )
+        metrics: dict[str, torch.Tensor] = {"loss": base_loss}
+
+        if self._structural_token_ids_buf.numel() == 0:
+            return metrics
+
+        valid_mask = head_labels_flat != -100
+        is_structural = torch.isin(head_labels_flat, self._structural_token_ids_buf) & valid_mask
+        n_total = int(valid_mask.sum().item())
+        n_structural = int(is_structural.sum().item())
+        n_copy = n_total - n_structural
+        if n_structural == 0 or n_copy == 0:
+            return metrics
+
+        structural_idx = is_structural.nonzero(as_tuple=True)[0]
+        logits_flat = logits.reshape(-1, self.head_vocab_size)
+        structural_logits = logits_flat.index_select(0, structural_idx).float()
+        structural_labels = head_labels_flat.index_select(0, structural_idx)
+        action_loss = F.cross_entropy(structural_logits, structural_labels, label_smoothing=self.config.label_smoothing)
+
+        with torch.no_grad():
+            copy_loss = (base_loss.detach() * n_total - action_loss.detach() * n_structural) / max(n_copy, 1)
+
+        metrics["action_loss"] = action_loss.detach()
+        metrics["copy_loss"] = copy_loss
+        metrics["n_action_tokens"] = torch.tensor(n_structural, dtype=torch.long)
+
+        w = self.config.action_loss_weight
+        if w != 1.0 and n_total > 0:
+            alpha = (w - 1.0) * n_structural / n_total
+            metrics["loss"] = base_loss + alpha * action_loss
+
+        return metrics
+
+    # -----------------------------------------------------------------
+    # Action-aware tokenization
+    # -----------------------------------------------------------------
+
+    def encode_input(self, text: str) -> dict[str, list[int]]:
+        full_len = len(self.tokenizer(text, add_special_tokens=False).input_ids)
+        enc = self.tokenizer(
+            text,
+            max_length=self.config.max_input_length,
+            truncation=True,
+            add_special_tokens=True,
+        )
+        if full_len > self.config.max_input_length - 1:
+            warn(f"Input truncated: {full_len} -> {self.config.max_input_length} subwords. Bump max_input_length.")
+        return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}
+
+    def _edu_subword_ids(self, tree: RstTree) -> tuple[str, list[list[int]]]:
+        """Per-EDU subword IDs in the encoder's whole-doc tokenization space."""
+        text = _reconstruct_text(tree)
+        enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        full_input_ids = enc["input_ids"]
+        offsets = enc["offset_mapping"]
+        edu_subword_ids: list[list[int]] = []
+        char_cursor = 0
+        for i, edu in enumerate(tree.edus):
+            if i > 0:
+                prefix = edu.prefix if edu.prefix is not None else " "
+                char_cursor += len(prefix)
+            char_start = char_cursor
+            char_cursor += len(edu.text)
+            char_end = char_cursor
+            first: int | None = None
+            last: int | None = None
+            for j, (tok_cs, tok_ce) in enumerate(offsets):
+                if tok_cs < char_end and tok_ce > char_start:
+                    if first is None:
+                        first = j
+                    last = j
+            if first is None or last is None:
+                edu_subword_ids.append([])
+            else:
+                edu_subword_ids.append(list(full_input_ids[first : last + 1]))
+        return text, edu_subword_ids
+
+    def encode_target(self, tree: RstTree) -> tuple[list[int], list[int]] | None:
+        """Build `(labels, decoder_input_ids)` by walking the tree's sexp
+        serialization. Both streams are length-aligned; `decoder_input_ids`
+        is the shift-right of the substituted "seen" stream.
+
+        - `<sexp_open>` / `<sexp_close>` and relation labels are predicted
+          tokens AND seen tokens.
+        - Each EDU's subwords appear, in encoder order, between the leaf
+          `<sexp_open>` and `<sexp_close>`. With `use_copy=True`, the
+          label at those positions is `<copy>` and the seen stream
+          carries the actual source subword id (mirroring seq2seq_sr's
+          training-time substitution). With `use_copy=False`, label and
+          seen alike carry the actual source subword id.
+        - EOS terminates both streams.
+        """
+        if not self.action_token_ids:
+            raise RuntimeError("encode_target called before action vocab was installed; set cfg.relation_types first.")
+        actions = tree.parsing_actions()
+        if not actions and len(tree.edus) != 1:
+            return None
+        _text, edu_subwords = self._edu_subword_ids(tree)
+
+        label_ids: list[int] = []
+        seen_ids: list[int] = []
+
+        def emit_open():
+            label_ids.append(self.open_token_id)
+            seen_ids.append(self.open_token_id)
+
+        def emit_close():
+            label_ids.append(self.close_token_id)
+            seen_ids.append(self.close_token_id)
+
+        def emit_label(nuc: str, rel: str):
+            token = Reduce(nuc=nuc, rel=rel).to_token()
+            if token not in self.action_token_ids:
+                raise ValueError(f"encode_target: label token {token!r} missing from vocab; check cfg.relation_types.")
+            tid = self.action_token_ids[token]
+            label_ids.append(tid)
+            seen_ids.append(tid)
+
+        def emit_leaf(edu_idx: int):
+            emit_open()
+            for src_id in edu_subwords[edu_idx]:
+                if self.config.use_copy:
+                    label_ids.append(self.copy_token_id)
+                    seen_ids.append(src_id)
+                else:
+                    label_ids.append(src_id)
+                    seen_ids.append(src_id)
+            emit_close()
+
+        # Build binarized internal-node list. `parsing_actions` is DFS
+        # pre-order over the split index (each entry: (split, nuc, rel)).
+        # Translate to a list of (lo, hi, nuc, rel) spans by replaying the
+        # split decisions. The same helper logic is the inverse path used
+        # by `from_parsing_actions`.
+        spans = self._spans_from_parsing_actions(actions, n_edus=len(tree.edus))
+
+        # Render in the chosen traversal order. spans are keyed by
+        # (lo, hi) where lo, hi are EDU indices (inclusive lo, exclusive hi).
+        span_by_lohi: dict[tuple[int, int], tuple[int, str, str]] = {
+            (lo, hi): (split, nuc, rel) for lo, hi, split, nuc, rel in spans
+        }
+
+        def walk(lo: int, hi: int):
+            # [lo, hi). hi - lo == 1 -> leaf. Else internal: emit accordingly.
+            if hi - lo == 1:
+                emit_leaf(lo)
+                return
+            key = (lo, hi)
+            if key not in span_by_lohi:
+                raise ValueError(f"encode_target: no parsing action for span {key}")
+            split, nuc, rel = span_by_lohi[key]
+            if self.config.traversal_order == "preorder":
+                emit_open()
+                emit_label(nuc, rel)
+                walk(lo, split)
+                walk(split, hi)
+                emit_close()
+            else:
+                emit_open()
+                walk(lo, split)
+                walk(split, hi)
+                emit_label(nuc, rel)
+                emit_close()
+
+        if len(tree.edus) == 1:
+            emit_leaf(0)
+        else:
+            walk(0, len(tree.edus))
+        label_ids.append(self.tokenizer.eos_token_id)
+        seen_ids.append(self.tokenizer.eos_token_id)
+        decoder_input_ids = [self.decoder_start_token_id] + seen_ids[:-1]
+
+        if len(label_ids) > self.config.max_output_length:
+            warn(
+                f"Target truncated: {len(label_ids)} > max_output_length={self.config.max_output_length} "
+                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED."
+            )
+            return None
+        return label_ids, decoder_input_ids
+
+    @staticmethod
+    def _spans_from_parsing_actions(actions, n_edus):
+        """Replay the (split, nuc, rel) DFS list to extract every internal
+        span's `(lo, hi, split, nuc, rel)`. `parsing_actions` is pre-order
+        over splits: process root first, recurse left, recurse right."""
+        spans: list[tuple[int, int, int, str, str]] = []
+        if n_edus <= 1:
+            return spans
+        i = [0]
+
+        def rec(lo: int, hi: int):
+            if hi - lo == 1:
+                return
+            split, nuc, rel = actions[i[0]]
+            i[0] += 1
+            spans.append((lo, hi, split, nuc, rel))
+            rec(lo, split)
+            rec(split, hi)
+
+        rec(0, n_edus)
+        return spans
+
+    # -----------------------------------------------------------------
+    # Inference helpers
+    # -----------------------------------------------------------------
+
+    def _strip_specials(self, ids: list[int]) -> list[int]:
+        """Strip a leading BOS and trailing EOS / pad from an encoded id list."""
+        pad_id = self.tokenizer.pad_token_id
+        eos_id = self.tokenizer.eos_token_id
+        bos_id = self.tokenizer.bos_token_id
+        while ids and ids[-1] == pad_id:
+            ids.pop()
+        if ids and ids[-1] == eos_id:
+            ids.pop()
+        if bos_id is not None and ids and ids[0] == bos_id:
+            ids = ids[1:]
+        return ids
+
+    def _initial_state(self, source_ids: list[int]) -> SexpDecodingState:
+        return SexpDecodingState(
+            source_len=len(source_ids),
+            traversal_order=self.config.traversal_order,
+            use_copy=self.config.use_copy,
+            open_id=self.open_token_id,
+            close_id=self.close_token_id,
+            eos_id=int(self.tokenizer.eos_token_id),
+            label_ids=frozenset(int(x) for x in self.reduce_token_ids),
+            copy_id=self.copy_token_id if self.config.use_copy else None,
+            source_ids=tuple(source_ids) if not self.config.use_copy else (),
+        )
+
+    def _full_ids_to_head_mask(self, state: SexpDecodingState, head_V: int) -> torch.Tensor:
+        """Boolean mask over the HEAD vocabulary of legal actions at this
+        state. Source-content tokens (when `use_copy=False`) live OUTSIDE
+        the head vocab, so this mask only covers structural slots; the
+        decoder loop handles source-token slots separately.
+        """
+        legal = state.legal_actions()
+        mask = torch.zeros(head_V, dtype=torch.bool)
+        for full_id in legal:
+            hi = self.head_idx_for_full_id.get(int(full_id))
+            if hi is not None:
+                mask[hi] = True
+        return mask
+
+    # -----------------------------------------------------------------
+    # Greedy decoding (per-doc)
+    # -----------------------------------------------------------------
+
+    @torch.no_grad()
+    def predict_from_text(self, text: str, *, num_beams: int | None = None) -> RstTree:
+        return self.predict_batch_from_texts([text], num_beams=num_beams)[0]
+
+    @torch.no_grad()
+    def predict_batch_from_texts(self, texts: list[str], *, num_beams: int | None = None) -> list[RstTree]:
+        if not texts:
+            return []
+        effective_beams = int(num_beams if num_beams is not None else self.config.num_beams)
+        if effective_beams <= 1:
+            return [self._predict_one_greedy(t) for t in texts]
+        return [self._predict_one_beam(t, effective_beams) for t in texts]
+
+    @torch.no_grad()
+    def _predict_one_greedy(self, text: str) -> RstTree:
+        self.eval()
+        device = next(self.parameters()).device
+
+        enc = self.tokenizer(
+            text,
+            max_length=self.config.max_input_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        ).to(device)
+        ids = enc["input_ids"][0].tolist()
+        source_ids = self._strip_specials(ids)
+        if not source_ids:
+            return _empty_tree(self.config.relation_types)
+
+        gc_active = self.config.gradient_checkpointing
+        if gc_active:
+            self._set_grad_checkpointing(False)
+        try:
+            encoder = self.model.get_encoder()
+            enc_out = encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], return_dict=True)
+
+            state = self._initial_state(source_ids)
+            action_seq: list[int] = []  # full-vocab IDs in emission order
+            edu_starts: list[int] = []
+            edu_ends: list[int] = []
+            current_edu_start: int | None = None
+
+            decoder_input_ids = torch.full((1, 1), self.decoder_start_token_id, device=device, dtype=torch.long)
+            past_key_values = None
+            done = False
+            hit_max_len = False
+
+            for _step in range(self.config.max_output_length):
+                if done:
+                    break
+                step_input = decoder_input_ids[:, -1:] if past_key_values is not None else decoder_input_ids
+                out = self.model(
+                    encoder_outputs=enc_out,
+                    attention_mask=enc["attention_mask"],
+                    decoder_input_ids=step_input,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past_key_values = out.past_key_values
+                logits = out.logits[0, -1, :]  # [head_V]
+
+                if self.config.use_validity_constraints:
+                    mask = self._full_ids_to_head_mask(state, self.head_vocab_size).to(device)
+                    masked = torch.where(mask, logits, torch.full_like(logits, float("-inf")))
+                else:
+                    masked = logits
+                head_idx = int(masked.argmax(-1).item())
+                full_id = self.full_id_for_head_idx[head_idx]
+                action_seq.append(full_id)
+
+                # Track EDU boundaries via state transitions (in_edu_leaf flips).
+                pre_in_leaf = state.in_edu_leaf
+                try:
+                    state = state.step(full_id)
+                except ValueError:
+                    done = True
+                    break
+                post_in_leaf = state.in_edu_leaf
+                if not pre_in_leaf and post_in_leaf:
+                    current_edu_start = state.cursor - (1 if state.cursor > 0 else 0)
+                    # `state.cursor` already advanced if the token was content;
+                    # initial open is structural (cursor unchanged). The first
+                    # content emission inside a leaf sets cursor to start+1, so
+                    # the leaf actually started at cursor-1 in the source IDs
+                    # only if a content token transitioned us. We rely on the
+                    # cleaner post-pass below instead.
+                if pre_in_leaf and not post_in_leaf:
+                    # Close of leaf: record (start, cursor).
+                    if current_edu_start is not None:
+                        edu_starts.append(current_edu_start)
+                        edu_ends.append(state.cursor)
+                        current_edu_start = None
+
+                next_input = full_id
+                if self.config.use_copy and full_id == self.copy_token_id:
+                    # Replace `<copy>` in decoder input with the actual source
+                    # subword the cursor just advanced past.
+                    src_pos = state.cursor - 1
+                    if 0 <= src_pos < len(source_ids):
+                        next_input = source_ids[src_pos]
+                if full_id == self.tokenizer.eos_token_id:
+                    done = True
+                    break
+
+                new_step = torch.tensor([[next_input]], device=device, dtype=torch.long)
+                decoder_input_ids = torch.cat([decoder_input_ids, new_step], dim=1)
+            else:
+                hit_max_len = not done
+        finally:
+            if gc_active:
+                self._set_grad_checkpointing(True)
+
+        if hit_max_len:
+            warn(f"Output truncated at inference: max_output_length={self.config.max_output_length} without EOS.")
+
+        # Recompute edu_ranges from the action sequence to handle any
+        # mid-leaf truncation cleanly.
+        edu_ranges = _edu_ranges_from_actions(
+            action_seq,
+            source_ids,
+            self,
+        )
+        tree = self._tree_from_action_sequence(action_seq, source_ids)
+        tree._pred_edu_source_ranges = edu_ranges  # type: ignore[attr-defined]
+        tree._source_ids = source_ids  # type: ignore[attr-defined]
+        return tree
+
+    @torch.no_grad()
+    def _predict_one_beam(self, text: str, num_beams: int) -> RstTree:
+        self.eval()
+        device = next(self.parameters()).device
+        K = int(num_beams)
+        head_V = self.head_vocab_size
+
+        enc = self.tokenizer(
+            text,
+            max_length=self.config.max_input_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        ).to(device)
+        ids = enc["input_ids"][0].tolist()
+        source_ids = self._strip_specials(ids)
+        if not source_ids:
+            return _empty_tree(self.config.relation_types)
+
+        gc_active = self.config.gradient_checkpointing
+        if gc_active:
+            self._set_grad_checkpointing(False)
+        try:
+            encoder = self.model.get_encoder()
+            enc_out = encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], return_dict=True)
+
+            from transformers.modeling_outputs import BaseModelOutput
+
+            expanded_hidden = enc_out.last_hidden_state.expand(K, -1, -1).contiguous()
+            expanded_attn = enc["attention_mask"].expand(K, -1).contiguous()
+            enc_out_K = BaseModelOutput(last_hidden_state=expanded_hidden)
+
+            states: list[SexpDecodingState] = [self._initial_state(source_ids) for _ in range(K)]
+            action_seqs: list[list[int]] = [[] for _ in range(K)]
+            done = [False] * K
+            beam_scores = torch.full((K,), float("-inf"), device=device)
+            beam_scores[0] = 0.0
+            decoder_input_ids = torch.full((K, 1), self.decoder_start_token_id, device=device, dtype=torch.long)
+            past_key_values = None
+            finished: list[dict] = []
+
+            for _step in range(self.config.max_output_length):
+                if all(done):
+                    break
+                step_input = decoder_input_ids[:, -1:] if past_key_values is not None else decoder_input_ids
+                out = self.model(
+                    encoder_outputs=enc_out_K,
+                    attention_mask=expanded_attn,
+                    decoder_input_ids=step_input,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past_key_values = out.past_key_values
+                logits = out.logits[:, -1, :]  # [K, head_V]
+
+                masked = torch.full_like(logits, float("-inf"))
+                for j in range(K):
+                    if done[j]:
+                        continue
+                    mask = self._full_ids_to_head_mask(states[j], head_V).to(device)
+                    masked[j] = torch.where(mask, logits[j], torch.full_like(logits[j], float("-inf")))
+                log_probs = F.log_softmax(masked.float(), dim=-1)
+                cum = beam_scores.unsqueeze(1) + log_probs
+                top_scores, top_idx = cum.view(-1).topk(K)
+                parent_of_new = (top_idx // head_V).tolist()
+                action_of_new = (top_idx % head_V).tolist()
+
+                parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
+                if past_key_values is not None:
+                    past_key_values = _reorder_pkv(past_key_values, parent_tensor, self._underlying_model())
+                decoder_input_ids = decoder_input_ids[parent_tensor]
+
+                new_states = [states[p] for p in parent_of_new]
+                new_action_seqs = [list(action_seqs[p]) for p in parent_of_new]
+                new_done = [done[p] for p in parent_of_new]
+                next_inputs = [self.tokenizer.pad_token_id] * K
+                for j in range(K):
+                    if new_done[j]:
+                        continue
+                    hi = action_of_new[j]
+                    full_id = self.full_id_for_head_idx[hi]
+                    new_action_seqs[j].append(full_id)
+                    try:
+                        new_states[j] = new_states[j].step(full_id)
+                    except ValueError:
+                        new_done[j] = True
+                        continue
+                    if full_id == self.tokenizer.eos_token_id:
+                        new_done[j] = True
+                        continue
+                    if self.config.use_copy and full_id == self.copy_token_id:
+                        src_pos = new_states[j].cursor - 1
+                        if 0 <= src_pos < len(source_ids):
+                            next_inputs[j] = source_ids[src_pos]
+                        else:
+                            next_inputs[j] = full_id
+                    else:
+                        next_inputs[j] = full_id
+
+                states = new_states
+                action_seqs = new_action_seqs
+                done = new_done
+                beam_scores = top_scores
+
+                for j in range(K):
+                    if done[j] and torch.isfinite(beam_scores[j]):
+                        finished.append(
+                            {
+                                "action_seq": list(action_seqs[j]),
+                                "score": float(beam_scores[j].item()),
+                                "length": len(action_seqs[j]),
+                                "finished": True,
+                            }
+                        )
+                        beam_scores[j] = float("-inf")
+
+                new_step = torch.tensor(next_inputs, device=device, dtype=torch.long).unsqueeze(1)
+                decoder_input_ids = torch.cat([decoder_input_ids, new_step], dim=1)
+        finally:
+            if gc_active:
+                self._set_grad_checkpointing(True)
+
+        candidates: list[dict] = list(finished)
+        for j in range(K):
+            if not done[j] and torch.isfinite(beam_scores[j]):
+                candidates.append(
+                    {
+                        "action_seq": list(action_seqs[j]),
+                        "score": float(beam_scores[j].item()),
+                        "length": len(action_seqs[j]),
+                        "finished": False,
+                    }
+                )
+        if not candidates:
+            return _empty_tree(self.config.relation_types)
+
+        length_penalty_alpha = 0.6
+        best = max(candidates, key=lambda c: c["score"] / max(c["length"], 1) ** length_penalty_alpha)
+        if not best.get("finished", False):
+            warn(
+                f"Output truncated at inference (beam): no beam reached EOS within "
+                f"max_output_length={self.config.max_output_length}."
+            )
+        edu_ranges = _edu_ranges_from_actions(best["action_seq"], source_ids, self)
+        tree = self._tree_from_action_sequence(best["action_seq"], source_ids)
+        tree._pred_edu_source_ranges = edu_ranges  # type: ignore[attr-defined]
+        tree._source_ids = source_ids  # type: ignore[attr-defined]
+        return tree
+
+    # -----------------------------------------------------------------
+    # Gold-EDU forced decode
+    # -----------------------------------------------------------------
+
+    @torch.no_grad()
+    def predict_with_gold_edus(self, tree: RstTree) -> RstTree:
+        return self._predict_one_gold_edu(tree)
+
+    @torch.no_grad()
+    def _predict_one_gold_edu(self, tree: RstTree) -> RstTree:
+        """Forced decode with gold EDU boundaries. The decoder is pinned to
+        a left-branching binary skeleton (one canonical tree shape per EDU
+        count) for the structural backbone; labels at label-slot positions
+        are still chosen by the model's argmax. Segmentation is therefore
+        gold by construction. Tree shape is fixed (left-spine), so nuc/rel
+        Parseval reflects the model's label choices alone."""
+        self.eval()
+        device = next(self.parameters()).device
+        text = _reconstruct_text(tree)
+        gold_ranges = _gold_edu_source_ranges(self.tokenizer, tree)
+
+        enc = self.tokenizer(
+            text,
+            max_length=self.config.max_input_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        ).to(device)
+        ids = enc["input_ids"][0].tolist()
+        source_ids = self._strip_specials(ids)
+        source_len = len(source_ids)
+        if not source_ids:
+            return _empty_tree(self.config.relation_types)
+
+        # Clamp gold ranges to (possibly truncated) source.
+        clamped: list[tuple[int, int]] = []
+        for s, e in gold_ranges:
+            if s >= source_len:
+                break
+            clamped.append((s, min(e, source_len)))
+        if not clamped:
+            return _empty_tree(self.config.relation_types)
+        edu_ends = [end for _, end in clamped]  # exclusive
+        edu_starts = [s for s, _ in clamped]
+        n_edus = len(edu_ends)
+
+        # Precompute the forced action skeleton (a list where each entry
+        # is either an int action id, or the sentinel string "LABEL" /
+        # "CONTENT" indicating "model picks at this slot from the legal
+        # set"). Skeleton encodes a left-spine binary tree.
+        OPEN = self.open_token_id
+        CLOSE = self.close_token_id
+        EOS = int(self.tokenizer.eos_token_id)
+        skeleton: list = []
+
+        def add_leaf(edu_i: int):
+            skeleton.append(OPEN)
+            for _ in range(edu_starts[edu_i], edu_ends[edu_i]):
+                # Content slot: copy or source-id (resolved at run time)
+                skeleton.append(("CONTENT", edu_i))
+            skeleton.append(CLOSE)
+
+        if n_edus == 1:
+            add_leaf(0)
+        else:
+            if self.config.traversal_order == "postorder":
+                # ( ( ... ( leaf_0 leaf_1 L ) leaf_2 L ) ... leaf_{n-1} L )
+                for _ in range(n_edus - 1):
+                    skeleton.append(OPEN)
+                add_leaf(0)
+                add_leaf(1)
+                skeleton.append("LABEL")
+                skeleton.append(CLOSE)
+                for i in range(2, n_edus):
+                    add_leaf(i)
+                    skeleton.append("LABEL")
+                    skeleton.append(CLOSE)
+            else:
+                # preorder: ( L ( L ... ( L leaf_0 leaf_1 ) leaf_2 ) ... leaf_{n-1} )
+                for _ in range(n_edus - 1):
+                    skeleton.append(OPEN)
+                    skeleton.append("LABEL")
+                add_leaf(0)
+                add_leaf(1)
+                skeleton.append(CLOSE)
+                for i in range(2, n_edus):
+                    add_leaf(i)
+                    skeleton.append(CLOSE)
+        skeleton.append(EOS)
+
+        gc_active = self.config.gradient_checkpointing
+        if gc_active:
+            self._set_grad_checkpointing(False)
+        try:
+            encoder = self.model.get_encoder()
+            enc_out = encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], return_dict=True)
+
+            state = self._initial_state(source_ids)
+            action_seq: list[int] = []
+            decoder_input_ids = torch.full((1, 1), self.decoder_start_token_id, device=device, dtype=torch.long)
+            past_key_values = None
+            done = False
+            hit_max_len = False
+
+            for sk in skeleton:
+                if done:
+                    break
+                if len(action_seq) >= self.config.max_output_length:
+                    hit_max_len = True
+                    break
+                step_input = decoder_input_ids[:, -1:] if past_key_values is not None else decoder_input_ids
+                out = self.model(
+                    encoder_outputs=enc_out,
+                    attention_mask=enc["attention_mask"],
+                    decoder_input_ids=step_input,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                past_key_values = out.past_key_values
+                logits = out.logits[0, -1, :]
+
+                # Resolve the skeleton entry to a concrete action.
+                if isinstance(sk, tuple) and sk[0] == "CONTENT":
+                    if self.config.use_copy:
+                        full_id = self.copy_token_id
+                    else:
+                        if state.cursor < len(source_ids):
+                            full_id = source_ids[state.cursor]
+                        else:
+                            done = True
+                            break
+                elif sk == "LABEL":
+                    # Mask logits to label-only and pick the model's best.
+                    label_mask = torch.zeros_like(logits, dtype=torch.bool)
+                    for fid in self.reduce_token_ids:
+                        hi = self.head_idx_for_full_id[fid]
+                        label_mask[hi] = True
+                    masked = torch.where(label_mask, logits, torch.full_like(logits, float("-inf")))
+                    head_idx = int(masked.argmax(-1).item())
+                    full_id = self.full_id_for_head_idx[head_idx]
+                else:
+                    full_id = int(sk)
+
+                action_seq.append(full_id)
+                try:
+                    state = state.step(full_id)
+                except ValueError:
+                    done = True
+                    break
+
+                if full_id == self.tokenizer.eos_token_id:
+                    done = True
+                    break
+
+                next_input = full_id
+                if self.config.use_copy and full_id == self.copy_token_id:
+                    src_pos = state.cursor - 1
+                    if 0 <= src_pos < len(source_ids):
+                        next_input = source_ids[src_pos]
+                new_step = torch.tensor([[next_input]], device=device, dtype=torch.long)
+                decoder_input_ids = torch.cat([decoder_input_ids, new_step], dim=1)
+        finally:
+            if gc_active:
+                self._set_grad_checkpointing(True)
+
+        if hit_max_len:
+            warn(
+                f"Output truncated at inference (gold-edu): max_output_length="
+                f"{self.config.max_output_length} without EOS."
+            )
+        edu_ranges = _edu_ranges_from_actions(action_seq, source_ids, self)
+        tree_out = self._tree_from_action_sequence(action_seq, source_ids)
+        tree_out._pred_edu_source_ranges = edu_ranges  # type: ignore[attr-defined]
+        tree_out._source_ids = source_ids  # type: ignore[attr-defined]
+        return tree_out
+
+    @torch.no_grad()
+    def predict(self, tree: RstTree, *, num_beams: int | None = None) -> RstTree:
+        text = _reconstruct_text(tree)
+        return self.predict_from_text(text, num_beams=num_beams)
+
+    @torch.no_grad()
+    def predict_batch(self, trees: list[RstTree], *, num_beams: int | None = None) -> list[RstTree]:
+        texts = [_reconstruct_text(t) for t in trees]
+        return self.predict_batch_from_texts(texts, num_beams=num_beams)
+
+    # -----------------------------------------------------------------
+    # Tree reconstruction
+    # -----------------------------------------------------------------
+
+    def _tree_from_action_sequence(self, action_ids: list[int], source_ids: list[int]) -> RstTree:
+        """Turn the emitted action sequence into an `RstTree` by building a
+        sexp string and running it through `RstTree.from_sexp`. Falls back
+        to an empty tree on any parse failure."""
+        sexp_str, edu_texts = self._actions_to_sexp_string(action_ids, source_ids)
+        try:
+            return RstTree.from_sexp(
+                sexp_str,
+                traversal_order=self.config.traversal_order,
+                edus=edu_texts,
+                relation_types=self.config.relation_types,
+            )
+        except (ValueError, IndexError) as e:
+            warn(f"Malformed decoder sexp output ({e!r}); falling back to single-EDU tree.")
+            full_text = " ".join(edu_texts) if edu_texts else ""
+            return _empty_tree(self.config.relation_types, text=full_text)
+
+    def _actions_to_sexp_string(self, action_ids: list[int], source_ids: list[int]) -> tuple[str, list[str]]:
+        """Walk the action sequence, emitting `<edu>` placeholders for
+        leaves and returning the EDU surface forms in document order so
+        `RstTree.from_sexp(edus=...)` can fill them back in."""
+        eos_id = self.tokenizer.eos_token_id
+        pieces: list[str] = []
+        edu_texts: list[str] = []
+        leaf_buffer: list[int] = []  # source subword ids inside the current leaf
+        cursor = 0
+        depth = 0
+        leaf_open = False  # whether the innermost open span is a leaf
+
+        # We track the "innermost-open-span is unresolved/leaf/internal"
+        # via a small stack: per-depth boolean `is_leaf`.
+        kind_stack: list[str | None] = []
+
+        def flush_leaf():
+            nonlocal leaf_buffer
+            if leaf_buffer:
+                decoded = self.tokenizer.decode(leaf_buffer, skip_special_tokens=False)
+                edu_texts.append(decoded)
+            else:
+                edu_texts.append("")
+            leaf_buffer = []
+
+        # We will produce the canonical placeholder sexp: every leaf is
+        # `<edu>`, internal nodes are `(<edu> <edu> NS:rel)` (postorder)
+        # or `(NS:rel <edu> <edu>)` (preorder). EDU surface text is
+        # passed via the `edus=` arg to `from_sexp`.
+        for tok in action_ids:
+            if tok == eos_id:
+                break
+            if tok == self.open_token_id:
+                pieces.append("(")
+                kind_stack.append(None)
+                depth += 1
+                leaf_open = False
+            elif tok == self.close_token_id:
+                if kind_stack and kind_stack[-1] == "leaf":
+                    # Emit the placeholder for this leaf, drop the open we
+                    # previously appended for it.
+                    # The open is the most recent "(" in pieces; remove it
+                    # and replace with `<edu>`.
+                    # Search back for last "(":
+                    for k in range(len(pieces) - 1, -1, -1):
+                        if pieces[k] == "(":
+                            pieces[k] = "<edu>"
+                            break
+                    flush_leaf()
+                    # The interior open is collapsed; no matching close needed.
+                else:
+                    pieces.append(")")
+                if kind_stack:
+                    kind_stack.pop()
+                depth = max(0, depth - 1)
+                leaf_open = bool(kind_stack) and kind_stack[-1] == "leaf"
+            elif tok in self.reduce_token_ids:
+                token_str = self.tokenizer.convert_ids_to_tokens(tok)
+                label = _reduce_token_to_label(token_str)
+                pieces.append(label)
+                if kind_stack:
+                    kind_stack[-1] = "internal"
+            elif self.config.use_copy and self.copy_token_id is not None and tok == self.copy_token_id:
+                if cursor < len(source_ids):
+                    leaf_buffer.append(source_ids[cursor])
+                    cursor += 1
+                if kind_stack and kind_stack[-1] is None:
+                    kind_stack[-1] = "leaf"
+                    leaf_open = True
+            else:
+                # Source-id token (use_copy=False) or unexpected.
+                if cursor < len(source_ids) and tok == source_ids[cursor]:
+                    leaf_buffer.append(tok)
+                    cursor += 1
+                    if kind_stack and kind_stack[-1] is None:
+                        kind_stack[-1] = "leaf"
+                        leaf_open = True
+                # else: ignore unexpected tokens (constraint should prevent)
+
+        # Best-effort close: drain any unclosed leaf/internal.
+        while kind_stack:
+            if kind_stack[-1] == "leaf":
+                for k in range(len(pieces) - 1, -1, -1):
+                    if pieces[k] == "(":
+                        pieces[k] = "<edu>"
+                        break
+                flush_leaf()
+            else:
+                pieces.append(")")
+            kind_stack.pop()
+
+        if not edu_texts:
+            # No leaves were emitted; produce a degenerate single-EDU sexp.
+            edu_texts = [""]
+            return "<edu>", edu_texts
+        return " ".join(pieces), edu_texts
+
+
+# ----- module-level helpers (used by predict + tests) -----
+
+
+def _reconstruct_text(tree: RstTree) -> str:
+    parts: list[str] = []
+    for i, edu in enumerate(tree.edus):
+        if i == 0:
+            parts.append(edu.text)
+            continue
+        prefix = edu.prefix if edu.prefix is not None else " "
+        parts.append(prefix + edu.text)
+    return "".join(parts)
+
+
+def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
+    """Per-EDU (start, end_exclusive) ranges in the encoder's whole-doc
+    tokenization space. Mirrors the seq2seq_sr helper."""
+    text = _reconstruct_text(tree)
+    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+    mapping: list[tuple[int, int]] = []
+    char_cursor = 0
+    for i, edu in enumerate(tree.edus):
+        if i > 0:
+            prefix = edu.prefix if edu.prefix is not None else " "
+            char_cursor += len(prefix)
+        char_start = char_cursor
+        char_cursor += len(edu.text)
+        char_end = char_cursor
+        first: int | None = None
+        last: int | None = None
+        for j, (tok_cs, tok_ce) in enumerate(offsets):
+            if tok_cs < char_end and tok_ce > char_start:
+                if first is None:
+                    first = j
+                last = j
+        if first is None or last is None:
+            anchor = first if first is not None else max(0, len(offsets) - 1)
+            mapping.append((anchor, anchor))
+            continue
+        mapping.append((first, last + 1))
+    return mapping
+
+
+def _edu_ranges_from_actions(
+    action_ids: list[int],
+    source_ids: list[int],
+    parser: "Seq2SeqSexpParser",
+) -> list[tuple[int, int]]:
+    """Replay the action sequence against `SexpDecodingState` to recover
+    per-EDU `(start, end_exclusive)` source-position ranges. Mid-leaf
+    truncation closes the final EDU at the current cursor."""
+    state = parser._initial_state(source_ids)
+    ranges: list[tuple[int, int]] = []
+    start: int | None = None
+    eos_id = parser.tokenizer.eos_token_id
+    for tok in action_ids:
+        if tok == eos_id:
+            break
+        pre_in_leaf = state.in_edu_leaf
+        pre_cursor = state.cursor
+        try:
+            state = state.step(tok)
+        except ValueError:
+            break
+        post_in_leaf = state.in_edu_leaf
+        if not pre_in_leaf and post_in_leaf:
+            start = pre_cursor
+        if pre_in_leaf and not post_in_leaf:
+            if start is None:
+                start = pre_cursor
+            ranges.append((start, state.cursor))
+            start = None
+    if state.in_edu_leaf and start is not None and state.cursor > start:
+        ranges.append((start, state.cursor))
+    return ranges
+
+
+def _empty_tree(relation_types, text: str = "") -> RstTree:
+    from iudex.rst.data.tree import RstNode
+
+    edu_nodes = [RstNode("1", "terminal", text or "")]
+    return RstTree(edu_nodes, [], relation_types=relation_types)
+
+
+def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
+    """Reorder a HF past_key_values cache along the beam dimension."""
+    reorder = getattr(underlying_model, "_reorder_cache", None)
+    if callable(reorder):
+        try:
+            result = reorder(past_key_values, beam_idx)
+            return result if result is not None else past_key_values
+        except (TypeError, AttributeError):
+            pass
+    if hasattr(past_key_values, "reorder_cache"):
+        result = past_key_values.reorder_cache(beam_idx)
+        return result if result is not None else past_key_values
+    return tuple(
+        tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
+        for layer in past_key_values
+    )
