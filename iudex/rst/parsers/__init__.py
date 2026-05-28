@@ -67,4 +67,12 @@ PARSERS: dict[str, ParserSpec] = {
         supports_text=True,
         signature_field="num_beams",
     ),
+    "decoder_only_sr": ParserSpec(
+        name="decoder_only_sr",
+        package="iudex.rst.parsers.decoder_only_sr",
+        config_cls="DecoderOnlySRConfig",
+        parser_cls="DecoderOnlySRParser",
+        supports_text=True,
+        signature_field="causal_mode",
+    ),
 }
