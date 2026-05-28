@@ -75,4 +75,20 @@ PARSERS: dict[str, ParserSpec] = {
         supports_text=True,
         signature_field="causal_mode",
     ),
+    "seq2seq_sexp": ParserSpec(
+        name="seq2seq_sexp",
+        package="iudex.rst.parsers.seq2seq_sexp",
+        config_cls="Seq2SeqSexpConfig",
+        parser_cls="Seq2SeqSexpParser",
+        supports_text=True,
+        signature_field="traversal_order",
+    ),
+    "decoder_only_sexp": ParserSpec(
+        name="decoder_only_sexp",
+        package="iudex.rst.parsers.decoder_only_sexp",
+        config_cls="DecoderOnlySexpConfig",
+        parser_cls="DecoderOnlySexpParser",
+        supports_text=True,
+        signature_field="use_copy",
+    ),
 }
