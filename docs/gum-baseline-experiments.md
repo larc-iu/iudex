@@ -1,9 +1,14 @@
 # GUM 12.1 baseline experiments
 
 Reference numbers I should consult when launching cluster jobs on
-`seq2seq_sr` / `decoder_only_sr`. All numbers are GUM dev (fine
-relations) unless noted. Bar to beat: DMRST at **0.4181** dev /
-**0.4531** test e2e_full_f1.
+`seq2seq_sr` / `decoder_only_sr` / `seq2seq_sexp` / `decoder_only_sexp`.
+All in-house numbers are GUM dev (fine relations) unless noted.
+
+**Bars to beat (external)**:
+- Maekawa et al. 2024 (Llama 2-70B + QLoRA, step-wise prompting): **0.552** full F1 (test) on GUM.
+- Hu & Wan 2023 (T5 + linearized s-expression, no copy): RST-DT only in the published numbers; not directly comparable here.
+
+**Bar to beat (in-house, prior parser)**: DMRST at **0.4181** dev / **0.4531** test e2e_full_f1.
 
 ## Best dev e2e_full_f1, side by side
 
@@ -140,6 +145,35 @@ Killed at step 655 / epoch 25 because trajectory was clearly behind exp1's
 at the same step (0.3534 vs exp1's 0.3654 at step 655). Larger LoRA rank
 didn't help on top of action_loss_weight=1.0; suggests exp1's gain came
 from the loss rebalance, not the capacity increase.
+
+## External baselines (from the literature)
+
+For context when interpreting cluster-run numbers.
+
+### Maekawa et al. 2024 (EACL)
+- **Title**: "Can we obtain significant success in RST discourse parsing by using Large Language Models?"
+- **Approach**: Llama 2 7B / 13B / 70B fine-tuned with QLoRA. Decoder-only LLM invoked once per parsing step in a bottom-up transition system. Stack2 / Stack1 / Queue1 spans presented as context; model emits a single token in {Shift, Reduce}, then re-prompted for nuclearity + label when reducing.
+- **Headline (Llama 2-70B, bottom-up, full Parseval F1 on test)**:
+  - RST-DT: span 79.8 / nuc 70.4 / rel 60.0 / full **0.581**
+  - Instr-DT: span 79.1 / nuc 60.4 / rel 55.1 / full **0.473**
+  - GUM: span 76.4 / nuc 64.7 / rel 56.4 / full **0.552**
+- **Note**: ~3 F1 over prior DeBERTa SOTA on RST-DT and Instr-DT; ~7 F1 over prior on GUM. Inference cost is minutes per document at 70B (vs seconds for graph-based parsers).
+- **Closest comparison in our matrix**: `decoder_only_sr` — same architecture class, but ours is one-shot whole-sequence generation rather than step-wise. No exact prior match.
+- **arXiv**: https://arxiv.org/abs/2403.05065 ; **code**: https://github.com/nttcslab-nlp/RSTParser_EACL24
+
+### Hu & Wan 2023 (TASLP)
+- **Title**: "RST Discourse Parsing as Text-to-Text Generation"
+- **Approach**: T5 encoder-decoder fine-tune. Output is the **linearized s-expression of the whole RST tree** with input text reproduced verbatim inside the brackets. Constrained decoding for well-formedness, **no copy mechanism**.
+- **Headline**: RST-DT, reported as outperforming existing methods on both parsing and segmentation. Exact F1 table not accessible without the IEEE paywall PDF.
+- **Closest comparison in our matrix**: `seq2seq_sexp` with `use_copy=False` — same architecture class, same serialization, same no-copy choice. **Apples-to-apples mirror.**
+- **IEEE**: https://ieeexplore.ieee.org/document/10224326/
+
+### Mabona et al. 2019 (EMNLP)
+- **Title**: "Neural Generative Rhetorical Structure Parsing"
+- **Approach**: RNNG (pre-Transformer). Stack-LSTM joint LM over structural actions and `GEN(w)` word-emitting actions. Bottom-up traversal; words emitted verbatim from softmax over vocabulary, no copy.
+- **Headline**: With fixed beam search, +6.8 unlabelled / +2.9 labelled F1 over a vanilla RNNG baseline on RST-DT. Comparable to non-additional-data SOTA at the time.
+- **Closest comparison in our matrix**: `seq2seq_sr` with `use_copy=False` (if we ever ran it; currently not supported by design) — but more importantly, `seq2seq_sexp` post-order with `use_copy=False` since the RNNG's unrolled trace is isomorphic to a depth-first bracketed tree with words in-stream.
+- **arXiv**: https://arxiv.org/abs/1909.11049 ; **ACL**: https://aclanthology.org/D19-1233/
 
 ## Takeaways for cluster runs
 
