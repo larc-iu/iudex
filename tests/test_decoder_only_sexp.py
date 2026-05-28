@@ -191,3 +191,16 @@ def test_predict_beam_runs_without_crash(parser):
     pred = parser.predict_from_text("Cats sleep. Dogs bark.", num_beams=3)
     assert pred is not None
     assert len(pred.edus) >= 1
+
+
+def test_evaluate_gold_edu_emits_expected_metric_keys(parser):
+    from iudex.rst.parsers.decoder_only_sexp.train_decoder_only_sexp import _evaluate_gold_edu
+
+    tree = _toy_tree()
+    metrics = _evaluate_gold_edu(parser, [("toy.rs4", tree)])
+    expected = {"gold_edu_span_f1", "gold_edu_nuc_f1", "gold_edu_rel_f1", "gold_edu_full_f1"}
+    assert expected.issubset(metrics.keys())
+    for k in expected:
+        v = metrics[k]
+        assert v == v  # not NaN
+        assert 0.0 <= v <= 1.0

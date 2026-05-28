@@ -76,6 +76,13 @@ class SexpDecodingState:
     source_ids: Tuple[int, ...] = ()  # required iff use_copy=False; len == source_len
     edu_placeholder_id: Optional[int] = None  # `<edu>` token, when serialized include_text=False
 
+    # Minimum content-token count required before a leaf may close. Mirrors
+    # the same-name knob on the SR parsers. Inference-only (training uses
+    # teacher-forced sequences). Exception: at end-of-source the leaf may
+    # close even when below the threshold, since otherwise the final EDU
+    # cannot commit.
+    min_edu_length: int = 1
+
     cursor: int = 0
     depth: int = 0
     stack: Tuple[_Frame, ...] = ()  # one frame per currently open span
@@ -202,14 +209,22 @@ class SexpDecodingState:
     def _can_close(self) -> bool:
         """Whether closing the innermost span is legal right now (i.e. the
         span structurally permits it). Root-close additionally requires the
-        cursor to have reached source_len."""
+        cursor to have reached source_len. Leaf-close additionally requires
+        the leaf to contain at least `min_edu_length` content tokens, except
+        at end-of-source (where the final EDU must be allowed to commit
+        regardless)."""
         if not self.stack:
             return False
         top = self.stack[-1]
         if top.kind is None:
             return False
-        if top.kind == "leaf" and top.leaf_token_count == 0:
-            return False
+        if top.kind == "leaf":
+            if top.leaf_token_count == 0:
+                return False
+            min_len = max(1, int(self.min_edu_length))
+            at_end = self.cursor == self.source_len
+            if top.leaf_token_count < min_len and not at_end:
+                return False
         if top.kind == "internal":
             if top.children_emitted != 2:
                 return False
@@ -357,6 +372,7 @@ def make_initial_state(
     copy_id: Optional[int] = None,
     source_ids: Optional[List[int]] = None,
     edu_placeholder_id: Optional[int] = None,
+    min_edu_length: int = 1,
 ) -> SexpDecodingState:
     return SexpDecodingState(
         source_len=source_len,
@@ -369,4 +385,5 @@ def make_initial_state(
         copy_id=copy_id,
         source_ids=tuple(source_ids or ()),
         edu_placeholder_id=edu_placeholder_id,
+        min_edu_length=int(min_edu_length),
     )

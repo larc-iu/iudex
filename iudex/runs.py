@@ -51,10 +51,13 @@ def _infer_parser_kind(config: dict, parsers: dict) -> str:
 
     Multiple parsers' signature_fields can both legitimately appear in one
     config (e.g. `decoder_only_sr` carries `num_beams`, which is also
-    `seq2seq_sr`'s signature). When that happens, prefer the parser whose
-    signature_field doesn't appear as a default field on any OTHER parser's
-    config dataclass — that's the truly distinguishing field. Falls back to
-    registration order if still ambiguous, and to "?" on no match."""
+    `seq2seq_sr`'s signature). When that happens, first try to pick the
+    parser whose signature_field doesn't appear on any OTHER parser's
+    config dataclass (truly distinguishing field). If that's still
+    ambiguous (the case with the four parsers in the seq2seq / decoder_only
+    cluster, none of whose fields are fully unique), fall back to picking
+    the parser whose default field set most closely matches the config's
+    keys (minimum symmetric difference). Returns "?" on no match."""
     import dataclasses as _dc
 
     matches = [(name, spec) for name, spec in parsers.items() if spec.signature_field in config]
@@ -62,25 +65,36 @@ def _infer_parser_kind(config: dict, parsers: dict) -> str:
         return "?"
     if len(matches) == 1:
         return matches[0][0]
-    # Build per-parser default-field sets lazily; only enter this branch
+    # Build per-parser default-field sets lazily. Only enter this branch
     # when there's actual ambiguity.
-    other_fields_by_name: dict[str, set[str]] = {}
+    fields_by_name: dict[str, set[str]] = {}
     for name, spec in parsers.items():
         try:
             cfg_cls = spec.load_config_cls()
-            other_fields_by_name[name] = {f.name for f in _dc.fields(cfg_cls)}
+            fields_by_name[name] = {f.name for f in _dc.fields(cfg_cls)}
         except Exception:
-            other_fields_by_name[name] = set()
+            fields_by_name[name] = set()
 
     distinguishing: list[str] = []
     for name, spec in matches:
         sig = spec.signature_field
-        shared = any(sig in other_fields_by_name.get(other, set()) for other in parsers if other != name)
+        shared = any(sig in fields_by_name.get(other, set()) for other in parsers if other != name)
         if not shared:
             distinguishing.append(name)
     if len(distinguishing) == 1:
         return distinguishing[0]
-    return matches[0][0]
+
+    # Tie-break: parser whose default field set most closely matches the
+    # config's keys (smallest symmetric difference). When two parsers
+    # differ only by an added field (e.g. seq2seq_sexp adds traversal_order
+    # on top of seq2seq_sr), the config carrying that added field will
+    # match the sexp parser's dataclass exactly while leaving the sr parser
+    # one short.
+    config_keys = set(config.keys())
+    candidates = distinguishing if distinguishing else [name for name, _ in matches]
+    scored = [(len(fields_by_name.get(name, set()) ^ config_keys), name) for name in candidates]
+    scored.sort()
+    return scored[0][1]
 
 
 def _list_run_dirs(checkpoint_dir: str) -> list[str]:

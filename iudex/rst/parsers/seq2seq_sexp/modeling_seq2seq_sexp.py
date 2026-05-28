@@ -25,6 +25,7 @@ small head for keeping source-token prediction working without
 enumerating the source vocab at init.
 """
 
+import dataclasses
 import logging
 from typing import List, Tuple
 
@@ -622,6 +623,7 @@ class Seq2SeqSexpParser(nn.Module):
             label_ids=frozenset(int(x) for x in self.reduce_token_ids),
             copy_id=self.copy_token_id if self.config.use_copy else None,
             source_ids=tuple(source_ids) if not self.config.use_copy else (),
+            min_edu_length=int(self.config.min_edu_length),
         )
 
     def _full_ids_to_head_mask(self, state: SexpDecodingState, head_V: int) -> torch.Tensor:
@@ -814,7 +816,7 @@ class Seq2SeqSexpParser(nn.Module):
             past_key_values = None
             finished: list[dict] = []
 
-            for _step in range(self.config.max_output_length):
+            for step in range(self.config.max_output_length):
                 if all(done):
                     break
                 step_input = decoder_input_ids[:, -1:] if past_key_values is not None else decoder_input_ids
@@ -846,7 +848,13 @@ class Seq2SeqSexpParser(nn.Module):
                 action_of_new = (top_idx % head_V).tolist()
 
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
-                if past_key_values is not None:
+                # Skip _reorder_pkv when no rearrangement is needed: step 0
+                # produces K identical rows from one starting beam (all
+                # parents are 0), and identity permutations are no-ops.
+                is_step0_uniform = step == 0 and all(p == 0 for p in parent_of_new)
+                is_identity = parent_of_new == list(range(K))
+                needs_reorder = past_key_values is not None and not (is_step0_uniform or is_identity)
+                if needs_reorder:
                     past_key_values = _reorder_pkv(past_key_values, parent_tensor, self._underlying_model())
                 decoder_input_ids = decoder_input_ids[parent_tensor]
 
@@ -989,7 +997,9 @@ class Seq2SeqSexpParser(nn.Module):
             encoder = self.model.get_encoder()
             enc_out = encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], return_dict=True)
 
-            state = self._initial_state(source_ids)
+            # Gold-EDU forcing honors gold spans exactly. Disable
+            # min_edu_length so a short gold EDU isn't blocked from closing.
+            state = dataclasses.replace(self._initial_state(source_ids), min_edu_length=1)
             action_seq: list[int] = []
             decoder_input_ids = torch.full((1, 1), self.decoder_start_token_id, device=device, dtype=torch.long)
             past_key_values = None
@@ -1259,8 +1269,10 @@ def _edu_ranges_from_actions(
 ) -> list[tuple[int, int]]:
     """Replay the action sequence against `SexpDecodingState` to recover
     per-EDU `(start, end_exclusive)` source-position ranges. Mid-leaf
-    truncation closes the final EDU at the current cursor."""
-    state = parser._initial_state(source_ids)
+    truncation closes the final EDU at the current cursor. Uses
+    min_edu_length=1 since we're tracing a sequence that has already been
+    emitted (the decode-time mask already enforced the configured min)."""
+    state = dataclasses.replace(parser._initial_state(source_ids), min_edu_length=1)
     ranges: list[tuple[int, int]] = []
     start: int | None = None
     eos_id = parser.tokenizer.eos_token_id
@@ -1294,17 +1306,41 @@ def _empty_tree(relation_types, text: str = "") -> RstTree:
 
 
 def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
-    """Reorder a HF past_key_values cache along the beam dimension."""
+    """Reorder a HF past_key_values cache along the beam dimension. Handles
+    three layouts:
+      1. Underlying model exposes `_reorder_cache(pkv, beam_idx)` (T5/T5Gemma2
+         and most HF seq2seq models).
+      2. `past_key_values` is a `DynamicCache`-like object with its own
+         `reorder_cache` method (newer transformers).
+      3. Tuple-of-tuple of Tensors (older HF), possibly with `None` entries
+         for unfilled cross-attention slots.
+    """
+    # Path 1: canonical HF helper on the base model. T5Gemma 2's inherited
+    # `_reorder_cache` assumes the legacy tuple-of-tuple layout. Newer HF
+    # versions may hand us a DynamicCache instead, which makes that call
+    # blow up. Catch and fall through to the next path on type/attribute
+    # mismatches.
     reorder = getattr(underlying_model, "_reorder_cache", None)
     if callable(reorder):
         try:
             result = reorder(past_key_values, beam_idx)
+            # Modern HF cache classes mutate in place and return None.
+            # Blindly returning None drops the cache on the next step.
             return result if result is not None else past_key_values
-        except (TypeError, AttributeError):
-            pass
+        except (TypeError, AttributeError) as e:
+            import warnings
+
+            warnings.warn(
+                f"{type(underlying_model).__name__}._reorder_cache failed on "
+                f"{type(past_key_values).__name__} ({type(e).__name__}: {e}); "
+                "falling back to object/tuple cache reordering.",
+                stacklevel=2,
+            )
+    # Path 2: DynamicCache or similar object-style cache.
     if hasattr(past_key_values, "reorder_cache"):
         result = past_key_values.reorder_cache(beam_idx)
         return result if result is not None else past_key_values
+    # Path 3: manual tuple walk, handles Nones gracefully.
     return tuple(
         tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
         for layer in past_key_values

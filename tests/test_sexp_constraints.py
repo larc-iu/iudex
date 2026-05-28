@@ -46,6 +46,7 @@ def _make(
     *,
     source_ids=None,
     edu_placeholder_id=None,
+    min_edu_length: int = 1,
 ) -> SexpDecodingState:
     if source_ids is None and not use_copy:
         # Default: 10, 11, 12, ... one per source position.
@@ -61,6 +62,7 @@ def _make(
         copy_id=COPY_ID if use_copy else None,
         source_ids=source_ids,
         edu_placeholder_id=edu_placeholder_id,
+        min_edu_length=min_edu_length,
     )
 
 
@@ -604,10 +606,118 @@ def test_in_edu_leaf_flag_lifecycle():
     s = _make(source_len=2)
     assert not s.in_edu_leaf
     s1 = s.step(OPEN_ID).step(LABEL_NS).step(OPEN_ID)
-    # Just opened — kind is still None, so not in_edu_leaf yet.
+    # Just opened. Kind is still None, so not in_edu_leaf yet.
     assert not s1.in_edu_leaf
     s2 = s1.step(10)
     assert s2.in_edu_leaf
     s3 = s2.step(CLOSE_ID)
     # Back to the parent's internal slot.
     assert not s3.in_edu_leaf
+
+
+# ---------------------------------------------------------------------------
+# min_edu_length: leaf-close is gated by leaf token count, except at
+# end-of-source (where the final EDU must always be allowed to commit).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("min_edu_len", [1, 2, 3])
+@pytest.mark.parametrize("traversal_order", ["preorder", "postorder"])
+def test_min_edu_length_blocks_short_leaf_close_except_at_eos(min_edu_len, traversal_order):
+    """Build a 2-EDU tree where each EDU gets exactly `min_edu_len * 2`
+    source tokens. The first EDU's close should be illegal until it has at
+    least `min_edu_len` content tokens. The final EDU may close earlier
+    only when the cursor reaches source_len (end-of-source exception)."""
+    per_edu = max(min_edu_len, 2) + 1
+    source_len = per_edu * 2
+    src_ids = [10 + i for i in range(source_len)]
+    s = _make(source_len=source_len, traversal_order=traversal_order, source_ids=src_ids, min_edu_length=min_edu_len)
+
+    # Walk into the first EDU's leaf frame.
+    if traversal_order == "preorder":
+        s = s.step(OPEN_ID).step(LABEL_NS).step(OPEN_ID)
+    else:
+        s = s.step(OPEN_ID).step(OPEN_ID)
+
+    # Emit content tokens one-by-one. Until we hit `min_edu_len`, CLOSE
+    # must NOT be legal (the leaf is below the minimum and we're not at
+    # end-of-source).
+    for k in range(1, min_edu_len):
+        s = s.step(src_ids[s.cursor])
+        assert s.in_edu_leaf
+        assert CLOSE_ID not in s.legal_actions(), (
+            f"CLOSE legal at leaf_token_count={k} with min_edu_length={min_edu_len}"
+        )
+        with pytest.raises(ValueError):
+            s.step(CLOSE_ID)
+
+    # One more content token brings us to min_edu_len. Now CLOSE is legal.
+    s = s.step(src_ids[s.cursor])
+    assert s.in_edu_leaf
+    assert CLOSE_ID in s.legal_actions()
+
+    # Close the first EDU.
+    s = s.step(CLOSE_ID)
+
+    # Now consume all remaining source EXCEPT the last token, in a fresh leaf.
+    if traversal_order == "preorder":
+        s = s.step(OPEN_ID)
+    else:
+        s = s.step(OPEN_ID)
+    while s.cursor < source_len - 1:
+        s = s.step(src_ids[s.cursor])
+
+    # We're inside the second leaf with exactly one content token short of
+    # source exhaustion. Emit the final token so cursor == source_len.
+    s = s.step(src_ids[s.cursor])
+    assert s.cursor == source_len
+    # At end-of-source: CLOSE is legal even though we may be below
+    # min_edu_len (the final EDU must be allowed to commit).
+    assert CLOSE_ID in s.legal_actions()
+
+
+@pytest.mark.parametrize("min_edu_len", [1, 2, 3])
+def test_min_edu_length_end_of_source_exception_short_final_edu(min_edu_len):
+    """The final EDU is allowed to close at exactly 1 content token when
+    the cursor has reached source_len, even when min_edu_length > 1."""
+    if min_edu_len <= 1:
+        # The "exception" is vacuous when the floor is 1.
+        return
+    # Source layout: min_edu_len + 1 token for the second EDU.
+    source_len = min_edu_len + 1
+    src_ids = [10 + i for i in range(source_len)]
+    s = _make(source_len=source_len, traversal_order="preorder", source_ids=src_ids, min_edu_length=min_edu_len)
+    s = s.step(OPEN_ID).step(LABEL_NS).step(OPEN_ID)
+    # First EDU swallows min_edu_len source tokens.
+    for _ in range(min_edu_len):
+        s = s.step(src_ids[s.cursor])
+    assert CLOSE_ID in s.legal_actions()
+    s = s.step(CLOSE_ID).step(OPEN_ID)
+    # Second EDU: emit exactly 1 token, leaving us at end-of-source.
+    s = s.step(src_ids[s.cursor])
+    assert s.cursor == source_len
+    # Even though 1 < min_edu_len, close is legal at EOS.
+    assert CLOSE_ID in s.legal_actions()
+    s = s.step(CLOSE_ID).step(CLOSE_ID).step(EOS_ID)
+    assert s.is_terminal()
+
+
+def test_min_edu_length_default_does_not_change_behavior():
+    """The default min_edu_length=1 leaves the existing 2-EDU walk valid."""
+    s = _make(source_len=4)  # min_edu_length defaults to 1
+    seq = [
+        OPEN_ID,
+        LABEL_NS,
+        OPEN_ID,
+        10,
+        11,
+        CLOSE_ID,
+        OPEN_ID,
+        12,
+        13,
+        CLOSE_ID,
+        CLOSE_ID,
+        EOS_ID,
+    ]
+    final = _replay(s, seq)
+    assert final.is_terminal()

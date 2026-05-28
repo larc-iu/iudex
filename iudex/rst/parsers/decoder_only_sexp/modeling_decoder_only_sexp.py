@@ -25,6 +25,7 @@ Two action-vocab modes:
 """
 
 import contextlib
+import dataclasses
 import logging
 
 import torch
@@ -604,6 +605,7 @@ class DecoderOnlySexpParser(nn.Module):
             label_ids=frozenset(self.label_id_set),
             copy_id=self.copy_token_id if self.config.use_copy else None,
             source_ids=tuple() if self.config.use_copy else tuple(),
+            min_edu_length=int(self.config.min_edu_length),
         )
 
     def _state_for_source(self, source_ids: list[int]) -> SexpDecodingState:
@@ -617,6 +619,7 @@ class DecoderOnlySexpParser(nn.Module):
             label_ids=frozenset(self.label_id_set),
             copy_id=self.copy_token_id if self.config.use_copy else None,
             source_ids=tuple() if self.config.use_copy else tuple(source_ids),
+            min_edu_length=int(self.config.min_edu_length),
         )
 
     # -----------------------------------------------------------------
@@ -997,7 +1000,9 @@ class DecoderOnlySexpParser(nn.Module):
         n_edus = len(clamped_ranges)
         edu_idx = 0
 
-        state = self._state_for_source(source_ids)
+        # Gold-EDU forcing honors gold spans exactly. Disable
+        # min_edu_length so a short gold EDU isn't blocked from closing.
+        state = dataclasses.replace(self._state_for_source(source_ids), min_edu_length=1)
 
         with self._inference_mode():
             input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
