@@ -158,14 +158,14 @@ For context when interpreting cluster-run numbers.
   - Instr-DT: span 79.1 / nuc 60.4 / rel 55.1 / full **0.473**
   - GUM: span 76.4 / nuc 64.7 / rel 56.4 / full **0.552**
 - **Note**: ~3 F1 over prior DeBERTa SOTA on RST-DT and Instr-DT; ~7 F1 over prior on GUM. Inference cost is minutes per document at 70B (vs seconds for graph-based parsers).
-- **Closest comparison in our matrix**: `decoder_only_sr` — same architecture class, but ours is one-shot whole-sequence generation rather than step-wise. No exact prior match.
+- **Comparison framing**: the relevant axis is **inference paradigm**, not parameter count. Maekawa is *step-wise iterative prompting* (many forward passes per document, one per parser action); our decoder_only_* parsers are *one-shot generation* (a single forward decode of the entire serialized tree). Reporting "X% of the parameters" is misleading because step-wise amortizes compute over many calls — wall-clock comparisons depend strongly on the document's action count. The fair framing if our numbers approach Maekawa's: "competitive at one-shot decode with substantially lower per-document inference cost."
 - **arXiv**: https://arxiv.org/abs/2403.05065 ; **code**: https://github.com/nttcslab-nlp/RSTParser_EACL24
 
 ### Hu & Wan 2023 (TASLP)
 - **Title**: "RST Discourse Parsing as Text-to-Text Generation"
 - **Approach**: T5 encoder-decoder fine-tune. Output is the **linearized s-expression of the whole RST tree** with input text reproduced verbatim inside the brackets. Constrained decoding for well-formedness, **no copy mechanism**.
 - **Headline**: RST-DT, reported as outperforming existing methods on both parsing and segmentation. Exact F1 table not accessible without the IEEE paywall PDF.
-- **Closest comparison in our matrix**: `seq2seq_sexp` with `use_copy=False` — same architecture class, same serialization, same no-copy choice. **Apples-to-apples mirror.**
+- **Comparison framing**: our `seq2seq_sexp` with `use_copy=False` adopts the **same serialization choice** (sexp, words in-stream, no copy mechanism) but differs in the rest of the recipe: T5Gemma 2 vs T5, LoRA on the base vs full FT, no sentence→document curriculum, and (per the new `constrain_content` knob) at most decoded-content positions hard-masked to source IDs vs free generation. So claim "Hu & Wan-style serialization" rather than "we replicate Hu & Wan." A real replication would require the `constrain_content: false` setting AND full fine-tuning AND the matched curriculum.
 - **IEEE**: https://ieeexplore.ieee.org/document/10224326/
 
 ### Mabona et al. 2019 (EMNLP)
