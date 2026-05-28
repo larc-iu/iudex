@@ -1,0 +1,558 @@
+import argparse
+import dataclasses
+import json
+import logging
+import os
+import random
+import time
+from collections import deque
+
+import torch
+from tonga import Params
+from torch.utils.data import DataLoader, Dataset
+
+from iudex.common.log import console, dim, rule, setup_logging, success, warn, wrote
+from iudex.common.training import (
+    TBLogger,
+    build_optimizer,
+    config_panel,
+    device_panel,
+    gpu_mem_gb,
+    install_abort_handler,
+    make_progress_bar,
+    make_scheduler,
+    model_panel,
+    prepare_run_dir,
+    save_checkpoint,
+    schedule_panel,
+    set_seeds,
+    try_resume,
+    weight_decay_panel,
+    write_run_config,
+)
+from iudex.rst import HASH_EXCLUDE
+from iudex.rst.data.metrics import metrics_table
+from iudex.rst.data.reader import infer_relation_types, read_rst_dir
+from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
+from iudex.rst.data.tree import RstTree
+from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
+from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import Seq2SeqSRParser, _reconstruct_text
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+
+class _Seq2SeqSRDataset(Dataset):
+    """Pre-tokenized (input_ids, attention_mask, labels) per training tree.
+    Trees whose target sequence overflows `cfg.max_output_length` are dropped
+    upstream and never reach this dataset (so all items here are valid)."""
+
+    def __init__(self, items: list[dict]):
+        self.items = items
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> dict:
+        return self.items[idx]
+
+
+def _build_dataset(model: Seq2SeqSRParser, pairs: list[tuple[str, RstTree]]) -> tuple[_Seq2SeqSRDataset, int]:
+    """Tokenize every (file, tree) into model-ready tensors. Returns the
+    dataset and a count of trees dropped for target-length overflow."""
+    items: list[dict] = []
+    dropped = 0
+    for _, tree in pairs:
+        encoded = model.encode_target(tree)
+        if encoded is None:
+            dropped += 1
+            continue
+        labels, decoder_input_ids = encoded
+        text = _reconstruct_text(tree)
+        enc = model.encode_input(text)
+        items.append(
+            {
+                "input_ids": enc["input_ids"],
+                "attention_mask": enc["attention_mask"],
+                "labels": labels,
+                "decoder_input_ids": decoder_input_ids,
+            }
+        )
+    return _Seq2SeqSRDataset(items), dropped
+
+
+def _build_optimizer(model: Seq2SeqSRParser, cfg: Seq2SeqSRConfig):
+    """AdamW or Adafactor depending on `cfg.optimizer`. Adafactor with
+    `scale_parameter=False, relative_step=False` lets iudex's external LR
+    scheduler control the learning rate (Adafactor's default is to auto-
+    schedule and ignore the optimizer's `lr` field)."""
+    if cfg.optimizer == "adamw":
+        return build_optimizer(model, cfg.lr, cfg.weight_decay)
+    if cfg.optimizer == "adafactor":
+        from transformers import Adafactor
+
+        return Adafactor(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=cfg.lr,
+            weight_decay=cfg.weight_decay,
+            scale_parameter=False,
+            relative_step=False,
+            warmup_init=False,
+        )
+    raise ValueError(f"Unknown optimizer {cfg.optimizer!r}; expected 'adamw' or 'adafactor'.")
+
+
+def _make_collator(pad_id: int):
+    """Variable-length pad to the longest item in the batch. `-100` label
+    padding so HF cross-entropy ignores those positions; `pad_id` pad on the
+    decoder-input side so attention masks behave."""
+
+    def collate(batch: list[dict]) -> dict[str, torch.Tensor]:
+        max_in = max(len(item["input_ids"]) for item in batch)
+        max_lbl = max(len(item["labels"]) for item in batch)
+        input_ids = torch.full((len(batch), max_in), pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(batch), max_in), dtype=torch.long)
+        labels = torch.full((len(batch), max_lbl), -100, dtype=torch.long)
+        # decoder_input_ids: substituted (source-token-rich) shift-right of
+        # labels, built by `encode_target`. Same length as labels.
+        decoder_input_ids = torch.full((len(batch), max_lbl), pad_id, dtype=torch.long)
+        for i, item in enumerate(batch):
+            n = len(item["input_ids"])
+            input_ids[i, :n] = torch.tensor(item["input_ids"], dtype=torch.long)
+            attention_mask[i, :n] = torch.tensor(item["attention_mask"], dtype=torch.long)
+            m = len(item["labels"])
+            labels[i, :m] = torch.tensor(item["labels"], dtype=torch.long)
+            d = len(item["decoder_input_ids"])
+            decoder_input_ids[i, :d] = torch.tensor(item["decoder_input_ids"], dtype=torch.long)
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "decoder_input_ids": decoder_input_ids,
+        }
+
+    return collate
+
+
+def _gold_edu_token_mapping(model: Seq2SeqSRParser, tree: RstTree) -> tuple[list[int], list[tuple[int, int]]]:
+    """EDU end-positions and per-EDU `(start, end_exclusive)` token-position
+    ranges in the ENCODER'S whole-document tokenization space.
+
+    Critically NOT just `tokenize(edu.text)` summed cumulatively — that drifts
+    from the encoder's actual tokenization because SentencePiece is whitespace-
+    sensitive (per-EDU vs whole-doc tokenizations can disagree by a few
+    subwords per doc). We instead tokenize the reconstructed doc once with
+    `return_offsets_mapping=True`, then map each EDU's character range to the
+    token positions it spans. This puts gold mappings in the same space as
+    the pred mappings produced by the inference loop's cursor tracking.
+    """
+    from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import _reconstruct_text
+
+    text = _reconstruct_text(tree)
+    enc = model.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+
+    mapping: list[tuple[int, int]] = []
+    char_cursor = 0
+    for i, edu in enumerate(tree.edus):
+        if i > 0:
+            prefix = edu.prefix if edu.prefix is not None else " "
+            char_cursor += len(prefix)
+        char_start = char_cursor
+        char_cursor += len(edu.text)
+        char_end = char_cursor
+
+        first: int | None = None
+        last: int | None = None
+        for j, (tok_cs, tok_ce) in enumerate(offsets):
+            # Token (tok_cs, tok_ce) overlaps [char_start, char_end) iff
+            # tok_cs < char_end and tok_ce > char_start.
+            if tok_cs < char_end and tok_ce > char_start:
+                if first is None:
+                    first = j
+                last = j
+        if first is None or last is None:
+            # EDU collapsed to no tokens (rare; e.g. empty text).
+            anchor = first if first is not None else len(offsets) - 1
+            mapping.append((anchor, anchor))
+            continue
+        mapping.append((first, last + 1))
+    edu_ends = [end - 1 for _, end in mapping]
+    return edu_ends, mapping
+
+
+def _pred_edu_token_mapping(pred_tree: RstTree) -> tuple[list[int], list[tuple[int, int]]]:
+    """Pull the per-EDU source-position ranges that the inference loop
+    stashed on the tree. Already in the encoder's source-id token space,
+    so no re-tokenization needed."""
+    ranges = getattr(pred_tree, "_pred_edu_source_ranges", None)
+    if ranges is None:
+        # Fallback: degenerate single-EDU empty tree.
+        return [], []
+    edu_ends = [end - 1 for _, end in ranges]
+    return edu_ends, list(ranges)
+
+
+def _write_rs4(tree: RstTree, output_dir: str, basename: str) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, basename), "w", encoding="utf-8") as f:
+        f.write(tree.to_rs4_string())
+
+
+@torch.no_grad()
+def _evaluate_on_dev(
+    model: Seq2SeqSRParser,
+    dev_pairs: list[tuple[str, RstTree]],
+    *,
+    num_beams: int | None = None,
+    batch_size: int = 1,
+    output_dir: str | None = None,
+) -> dict[str, float]:
+    """End-to-end Parseval + segmentation F1. No gold-EDU Parseval here:
+    this parser always uses its own segmentation, so EDU counts can differ
+    from gold and `evaluate_parseval` (which keys spans by EDU index) would
+    crash. Token-range keyed `evaluate_seg_and_e2e` handles the alignment.
+
+    `num_beams` overrides the parser's configured beam width. Per-epoch dev
+    eval passes 1 (greedy) when `cfg.eval_decode_greedy`; final test eval
+    passes the full `cfg.num_beams`. `batch_size > 1` groups dev documents
+    into batched `generate()` calls. `output_dir`, when set, writes each
+    pred tree as `{basename}.rs4` for later inspection.
+
+    Per-batch wall-time + EDU counts are printed via `dim()` so a slow or
+    pathological prediction is visible in real time.
+    """
+    model.eval()
+    gold_trees: list[RstTree] = []
+    seg_data: list[dict] = []
+    eval_t0 = time.monotonic()
+    for chunk_start in range(0, len(dev_pairs), batch_size):
+        chunk = dev_pairs[chunk_start : chunk_start + batch_size]
+        chunk_t0 = time.monotonic()
+        preds = model.predict_batch([gold for _, gold in chunk], num_beams=num_beams)
+        chunk_dt = time.monotonic() - chunk_t0
+        # Per-batch summary: one line covering all docs in the chunk.
+        names = ",".join(os.path.basename(fp) for fp, _ in chunk)
+        gold_counts = [len(g.edus) for _, g in chunk]
+        pred_counts = [len(p.edus) for p in preds]
+        dim(
+            f"  dev {chunk_start + 1}-{chunk_start + len(chunk)}/{len(dev_pairs)} "
+            f"[{names}]: gold_edus={gold_counts} pred_edus={pred_counts} {chunk_dt:.1f}s"
+        )
+        for (filepath, gold), pred in zip(chunk, preds):
+            gold_trees.append(gold)
+            gold_ends, gold_map = _gold_edu_token_mapping(model, gold)
+            pred_ends, pred_map = _pred_edu_token_mapping(pred)
+            seg_data.append(
+                {
+                    "gold_edu_ends": gold_ends,
+                    "pred_edu_ends": pred_ends,
+                    "e2e_pred": pred,
+                    "gold_edu_mapping": gold_map,
+                    "pred_edu_mapping": pred_map,
+                }
+            )
+            if output_dir is not None:
+                basename = os.path.splitext(os.path.basename(filepath))[0] + ".rs4"
+                _write_rs4(pred, output_dir, basename)
+    dim(f"  dev eval total: {time.monotonic() - eval_t0:.1f}s over {len(dev_pairs)} documents")
+    if output_dir is not None:
+        dim(f"  Wrote {len(dev_pairs)} predictions to {os.path.abspath(output_dir)}")
+    return evaluate_seg_and_e2e(gold_trees, seg_data)
+
+
+def train(cfg: Seq2SeqSRConfig) -> None:
+    set_seeds(cfg.seed)
+
+    run_dir, cfg_hash = prepare_run_dir(
+        dataclasses.asdict(cfg), cfg.checkpoint_dir, cfg.run_name, hash_exclude=HASH_EXCLUDE
+    )
+
+    if cfg.relation_map is not None:
+        dim(f"Applying `relation_map` ({len(cfg.relation_map)} entries) to all read trees.")
+    cfg.relation_types = infer_relation_types([cfg.train_dir, cfg.dev_dir], relation_map=cfg.relation_map)
+    dim(
+        f"Inferred {len(cfg.relation_types)} (relation, kind) pairs from "
+        f"{cfg.train_dir} + {cfg.dev_dir}" + (" (after relation_map)." if cfg.relation_map is not None else ".")
+    )
+
+    cfg_dict = dataclasses.asdict(cfg)
+    write_run_config(run_dir, cfg_dict)
+    tb = TBLogger(run_dir)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_enabled = cfg.amp and device.type == "cuda"
+    model = Seq2SeqSRParser(cfg).to(device)
+
+    train_pairs = read_rst_dir(cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
+    dev_pairs = read_rst_dir(cfg.dev_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
+    test_pairs = (
+        read_rst_dir(cfg.test_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
+        if cfg.test_dir is not None
+        else None
+    )
+
+    train_ds, dropped = _build_dataset(model, train_pairs)
+    if dropped > 0:
+        warn(
+            f"Dropped {dropped}/{len(train_pairs)} training trees whose target exceeded "
+            f"max_output_length={cfg.max_output_length}. Bump it if this is a large fraction."
+        )
+
+    collate = _make_collator(model.tokenizer.pad_token_id)
+    rng_seed = torch.Generator()
+    rng_seed.manual_seed(cfg.seed)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        collate_fn=collate,
+        generator=rng_seed,
+    )
+
+    steps_per_epoch = max(1, len(train_loader) // cfg.grad_accum)
+    total_steps = steps_per_epoch * cfg.max_epochs
+    warmup = cfg.num_warmup_steps if cfg.num_warmup_steps is not None else max(1, int(0.1 * total_steps))
+
+    console.print(config_panel(cfg_dict))
+    console.print(device_panel(device, seed=cfg.seed, checkpoint_dir=run_dir))
+    console.print(model_panel(model, num_train_trees=len(train_ds), grad_accum=cfg.grad_accum))
+    console.print(
+        schedule_panel(
+            steps_per_epoch=steps_per_epoch,
+            total_steps=total_steps,
+            warmup_steps=warmup,
+            lr=cfg.lr,
+            encoder_lr=None,
+        )
+    )
+
+    optimizer = _build_optimizer(model, cfg)
+    if cfg.optimizer == "adamw":
+        console.print(weight_decay_panel(model, optimizer))
+    scheduler = make_scheduler(optimizer, warmup, total_steps)
+
+    checkpoint = try_resume(os.path.join(run_dir, "last.pt"), expected_hash=cfg_hash)
+    if checkpoint is None:
+        global_step, start_epoch, best_val, stale = 0, 0, -1.0, 0
+    else:
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        global_step = checkpoint["global_step"]
+        start_epoch = checkpoint["epoch"]
+        best_val = checkpoint.get("best_val", -1.0)
+        stale = checkpoint.get("stale_validations", 0)
+
+    def _save(path: str, epoch: int) -> None:
+        save_checkpoint(
+            path,
+            model,
+            optimizer,
+            scheduler,
+            config=cfg_dict,
+            config_hash=cfg_hash,
+            global_step=global_step,
+            epoch=epoch,
+            best_val=best_val,
+            stale_validations=stale,
+        )
+
+    dev_beams = 1 if cfg.eval_decode_greedy else cfg.num_beams
+    # Per-epoch dev cap. Final eval below uses the full dev_pairs.
+    per_epoch_dev = dev_pairs if cfg.dev_max_docs is None else dev_pairs[: cfg.dev_max_docs]
+    if cfg.dev_max_docs is not None and cfg.dev_max_docs < len(dev_pairs):
+        dim(
+            f"Per-epoch dev eval is capped to the first {len(per_epoch_dev)}/"
+            f"{len(dev_pairs)} documents (cfg.dev_max_docs). Final eval still uses all."
+        )
+
+    def _validate(epoch: int) -> None:
+        nonlocal best_val, stale
+        pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
+        metrics = _evaluate_on_dev(
+            model,
+            per_epoch_dev,
+            num_beams=dev_beams,
+            batch_size=cfg.dev_batch_size,
+            output_dir=pred_dir,
+        )
+        tb.log_scalars("dev", metrics, global_step)
+        console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
+        score = metrics.get(cfg.val_metric_name, 0.0)
+        if score > best_val:
+            best_val = score
+            stale = 0
+            _save(os.path.join(run_dir, "best_model.pt"), epoch)
+            success(f"  New best! {cfg.val_metric_name}={best_val:.4f}")
+        else:
+            stale += 1
+            dim(f"  No improvement ({stale}/{cfg.patience})")
+        model.train()
+
+    aborted = install_abort_handler()
+    training_complete = start_epoch >= cfg.max_epochs or stale >= cfg.patience
+    if training_complete:
+        reason = "max_epochs reached" if start_epoch >= cfg.max_epochs else "patience exhausted"
+        dim(f"Skipping training: {reason} on prior run; jumping to final evaluation.")
+
+    recent_losses: deque = deque(maxlen=200)
+    recent_action_losses: deque = deque(maxlen=200)
+    recent_copy_losses: deque = deque(maxlen=200)
+    if not training_complete:
+        rule("Training")
+    training_start = time.monotonic()
+
+    for epoch in range(start_epoch, cfg.max_epochs):
+        if stale >= cfg.patience or aborted.value:
+            break
+        epoch_start = time.monotonic()
+        model.train()
+        total_loss = 0.0
+        num_batches = 0
+        epoch_step = 0
+
+        with make_progress_bar() as progress:
+            task = progress.add_task(
+                "training",
+                total=steps_per_epoch,
+                epoch=f"{epoch + 1}/{cfg.max_epochs}",
+                loss_str="loss=-.----",
+                lr_str="",
+                mem_str="",
+                total_elapsed="0:00:00",
+            )
+
+            for batch_idx, batch in enumerate(train_loader):
+                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+                    out = model(batch)
+                loss = out["loss"]
+                if cfg.grad_accum > 1:
+                    loss = loss / cfg.grad_accum
+                loss.backward()
+                raw_loss = loss.item() * (cfg.grad_accum if cfg.grad_accum > 1 else 1)
+                recent_losses.append(raw_loss)
+                if "action_loss" in out:
+                    recent_action_losses.append(float(out["action_loss"].item()))
+                    recent_copy_losses.append(float(out["copy_loss"].item()))
+                total_loss += raw_loss
+                num_batches += 1
+
+                is_step = (batch_idx + 1) % cfg.grad_accum == 0 or (batch_idx + 1) == len(train_loader)
+                if not is_step:
+                    continue
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
+                global_step += 1
+                epoch_step += 1
+
+                avg_loss = sum(recent_losses) / len(recent_losses)
+                lr_display = "/".join(f"{lr:.1e}" for lr in sorted(set(scheduler.get_last_lr())))
+                mem = gpu_mem_gb(device)
+                mem_str = f"[gpu]max_mem={mem[1]:.1f}GB[/gpu]" if mem else ""
+                secs = int(time.monotonic() - training_start)
+                progress.update(
+                    task,
+                    advance=1,
+                    loss_str=f"loss=[bold orange1]{avg_loss:.4f}[/bold orange1]",
+                    lr_str=f"lr=[dim]{lr_display}[/dim]",
+                    mem_str=mem_str,
+                    total_elapsed=f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}",
+                )
+
+                if epoch_step % cfg.log_every == 0:
+                    tb_train = {"loss": avg_loss, "lr": max(scheduler.get_last_lr()), "grad_norm": float(grad_norm)}
+                    if recent_action_losses:
+                        tb_train["action_loss"] = sum(recent_action_losses) / len(recent_action_losses)
+                        tb_train["copy_loss"] = sum(recent_copy_losses) / len(recent_copy_losses)
+                    if mem:
+                        tb_train["gpu_mem_gb"] = mem[1]
+                    tb.log_scalars("train", tb_train, global_step)
+                    mem_log = f"  mem=[dim]{mem[1]:.1f}GB[/dim]" if mem else ""
+                    split_log = ""
+                    if recent_action_losses:
+                        a = sum(recent_action_losses) / len(recent_action_losses)
+                        c = sum(recent_copy_losses) / len(recent_copy_losses)
+                        split_log = f"  act=[dim]{a:.3f}[/dim]  cpy=[dim]{c:.3f}[/dim]"
+                    progress.console.print(
+                        f"  [step]step {epoch_step}/{steps_per_epoch}[/step]  "
+                        f"loss=[loss]{avg_loss:.4f}[/loss]{split_log}  "
+                        f"grad=[dim]{grad_norm:.4f}[/dim]  "
+                        f"lr=[dim]{lr_display}[/dim]{mem_log}"
+                    )
+
+                if cfg.validate_every and global_step % cfg.validate_every == 0:
+                    _validate(epoch + 1)
+                    if stale >= cfg.patience or aborted.value:
+                        break
+
+                if cfg.checkpoint_every and global_step % cfg.checkpoint_every == 0:
+                    _save(os.path.join(run_dir, "last.pt"), epoch + 1)
+
+        if num_batches > 0 and stale < cfg.patience:
+            console.print(
+                f"  [epoch]Epoch {epoch + 1}/{cfg.max_epochs}[/epoch] "
+                f"[dim]({time.monotonic() - epoch_start:.1f}s)[/dim]  "
+                f"loss=[loss]{total_loss / num_batches:.4f}[/loss]"
+            )
+            if not cfg.validate_every:
+                _validate(epoch + 1)
+            _save(os.path.join(run_dir, "last.pt"), epoch + 1)
+            if stale >= cfg.patience or aborted.value:
+                warn(f"\nEarly stopping after {cfg.patience} validations without improvement")
+                break
+        elif stale >= cfg.patience or aborted.value:
+            warn(f"\nEarly stopping at step {global_step}")
+            break
+
+    rule("Final Evaluation")
+    best_path = os.path.join(run_dir, "best_model.pt")
+    if os.path.exists(best_path):
+        checkpoint = torch.load(best_path, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+        # Final eval uses the full beam width (cfg.num_beams), unlike the
+        # per-epoch dev eval which can run greedy via cfg.eval_decode_greedy.
+        dev_m = _evaluate_on_dev(
+            model,
+            dev_pairs,
+            num_beams=cfg.num_beams,
+            batch_size=cfg.dev_batch_size,
+            output_dir=os.path.join(run_dir, "dev_predictions", "final"),
+        )
+        console.print(metrics_table(dev_m, title="Final Dev Results"))
+        final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
+        if test_pairs is not None:
+            test_m = _evaluate_on_dev(
+                model,
+                test_pairs,
+                num_beams=cfg.num_beams,
+                batch_size=cfg.dev_batch_size,
+                output_dir=os.path.join(run_dir, "test_predictions", "final"),
+            )
+            console.print(metrics_table(test_m, title="Final Test Results"))
+            final_metrics["test"] = test_m
+            tb.log_scalars("test", test_m, global_step)
+        metrics_path = os.path.join(run_dir, "final_metrics.json")
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(final_metrics, f, indent=2)
+        wrote(metrics_path)
+    else:
+        success(f"Training complete. Best {cfg.val_metric_name}: {best_val:.4f}")
+    tb.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train the seq2seq_sr parser")
+    parser.add_argument("config", help="Path to a jsonnet config file")
+    args = parser.parse_args()
+    cfg = Seq2SeqSRConfig.from_dict(Params.from_file(args.config).as_dict(quiet=True))
+    train(cfg)
+
+
+if __name__ == "__main__":
+    main()
