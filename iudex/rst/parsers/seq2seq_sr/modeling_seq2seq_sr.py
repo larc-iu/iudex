@@ -401,16 +401,17 @@ class Seq2SeqSRParser(nn.Module):
         (the old embeddings were already well-pretrained on trillions of
         tokens; fine-tuning them on ~150 GUM docs is mostly noise).
 
-        Implementation: register a backward hook on the canonical trainable
-        embedding Parameter (the one `_retie_modules_to_save` shared across
-        the encoder/decoder embed wrappers). The hook zeros the gradient
-        rows for indices < `self._original_vocab_size`. The optimizer
-        therefore sees zero grad on those rows and doesn't update them.
+        Implementation: register a backward hook on every unique trainable
+        embedding Parameter exposed by `modules_to_save`. For models with
+        tied encoder/decoder embeddings (e.g. T5Gemma 2 1B-1B),
+        `_retie_modules_to_save` has already collapsed every wrapper to
+        share one Parameter — we observe one unique data_ptr and hook it
+        once. For models with un-tied embeddings (e.g. the original
+        T5Gemma 2B-2B-ul2), each wrapper still owns its own weight; we
+        hook each unique Parameter so old-row gradient is zeroed on every
+        path. The hook zeros gradient rows < `self._original_vocab_size`,
+        leaving only the action-token rows trainable.
         """
-        canonical = self._find_canonical_embed_weight()
-        if canonical is None:
-            logger.info("_mask_old_embedding_gradients: no trainable embed_tokens Parameter found; nothing to mask.")
-            return
         n_old = int(self._original_vocab_size)
 
         def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
@@ -418,20 +419,7 @@ class Seq2SeqSRParser(nn.Module):
             out[:n_old].zero_()
             return out
 
-        canonical.register_hook(_zero_old_rows)
-        logger.info(
-            f"Embed gradient mask: rows [0, {n_old}) frozen; only rows "
-            f"[{n_old}, {canonical.shape[0]}) (the {canonical.shape[0] - n_old} action-token rows) update."
-        )
-
-        # Sanity check: every trainable embed Parameter in every
-        # ModulesToSaveWrapper must share storage with `canonical`. If retie
-        # missed a wrapper (e.g. early-continue path for a singleton group),
-        # the hook on `canonical` would NOT cover that other Parameter and
-        # old rows could leak gradient through it. Fail loudly instead of
-        # silently mis-training.
-        canonical_ptr = canonical.data_ptr()
-        leaky_paths: list[str] = []
+        hooked: dict[int, tuple[str, nn.Parameter]] = {}
         for name, mod in self.model.named_modules():
             if type(mod).__name__ != "ModulesToSaveWrapper":
                 continue
@@ -441,14 +429,27 @@ class Seq2SeqSRParser(nn.Module):
             trainable = trainable_dict["default"]
             if not isinstance(trainable, nn.Embedding):
                 continue
-            if trainable.weight.data_ptr() != canonical_ptr:
-                leaky_paths.append(name)
-        if leaky_paths:
-            raise RuntimeError(
-                "retie didn't catch all embed wrappers — gradient mask is "
-                f"leaky on these paths: {leaky_paths}. Canonical embed at "
-                f"data_ptr={canonical_ptr:x} is not shared by the above "
-                "ModulesToSaveWrapper trainable copies."
+            ptr = trainable.weight.data_ptr()
+            if ptr in hooked:
+                continue
+            trainable.weight.register_hook(_zero_old_rows)
+            hooked[ptr] = (name, trainable.weight)
+
+        if not hooked:
+            logger.info("_mask_old_embedding_gradients: no trainable embed_tokens Parameter found; nothing to mask.")
+            return
+
+        if len(hooked) == 1:
+            name, weight = next(iter(hooked.values()))
+            logger.info(
+                f"Embed gradient mask: rows [0, {n_old}) frozen; only rows "
+                f"[{n_old}, {weight.shape[0]}) (the {weight.shape[0] - n_old} action-token rows) update."
+            )
+        else:
+            paths = [name for name, _ in hooked.values()]
+            logger.info(
+                f"Embed gradient mask: hooked {len(hooked)} independent embed Parameters "
+                f"(backbone has un-tied embeddings); old-row gradient zeroed on each. Paths: {paths}"
             )
 
     def _verify_embedding_mask(self) -> None:
