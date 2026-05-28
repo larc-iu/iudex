@@ -104,6 +104,48 @@ def _ddict2dict(d):
     return dict(d)
 
 
+_SEXP_LABEL_RE = re.compile(r"^(NS|SN|NN):.+$")
+
+
+def _is_label(tok: str) -> bool:
+    return bool(_SEXP_LABEL_RE.match(tok))
+
+
+def _tokenize_sexp(text: str) -> List[str]:
+    """Split an s-expression into tokens. Parentheses are always their own
+    tokens; everything else is whitespace-separated. Inverse of the joining
+    done by `RstTree.to_sexp` (plan style)."""
+    out: List[str] = []
+    buf: List[str] = []
+    for ch in text:
+        if ch in "()":
+            if buf:
+                tok = "".join(buf).strip()
+                if tok:
+                    out.append(tok)
+                buf = []
+            out.append(ch)
+        elif ch.isspace():
+            if buf:
+                tok = "".join(buf).strip()
+                if tok:
+                    out.append(tok)
+                buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        tok = "".join(buf).strip()
+        if tok:
+            out.append(tok)
+    return out
+
+
+def _join_surface(tokens: List[str]) -> str:
+    """Reverse the `(`/`)` escaping done by `to_sexp`'s `escape`. Surface
+    tokens are space-joined to form the EDU text."""
+    return " ".join(t.replace("-LRB-", "(").replace("-RRB-", ")") for t in tokens)
+
+
 @dataclass
 class RstNode:
     id: str
@@ -449,27 +491,41 @@ class RstTree:
                     coverage[i] = merged
         return coverage[0]
 
-    def to_sexp(self, format: str = "iudex", invert_escaping: bool = False) -> str:
-        """Serialize as an S-expression. Internal nodes always render as
-        `(NUC:relation child1 child2)` with NUC in {NS, SN, NN}; `format`
-        selects how EDU leaves render:
-          - "iudex" (default): `(EDU text)`. Literal parens in EDU text are
-            escaped to `-LRB-`/`-RRB-` (PTB convention) when
-            `invert_escaping=False`; when `invert_escaping=True`, EDU text
-            keeps literal parens as-is.
-          - "dis": `(text _!...!_)` — RST-DT `.dis` style. The `_!..._!` fence
-            removes the need for paren escaping, so EDU text is emitted
-            verbatim regardless of `invert_escaping`.
-          - "index": leaves are bare 0-based EDU indices into `self.edus`
-            (e.g. `(NS:elab 0 1)`); the tree captures structure only, pair
-            with `edu_strings` to recover content.
-        `invert_escaping` always controls structural bracketing: with `True`,
-        `(`/`)` are replaced by `-LRB-`/`-RRB-` everywhere outside leaf text.
+    def to_sexp(
+        self,
+        traversal_order: str = "preorder",
+        include_text: bool = True,
+        format: Optional[str] = None,
+        invert_escaping: bool = False,
+    ) -> str:
+        """Serialize as an S-expression. Internal nodes carry a `NUC:relation`
+        label with NUC in {NS, SN, NN}. Two output styles:
+
+        * Plan style (the default, when `format` is None). Used by the
+          `seq2seq_sexp` / `decoder_only_sexp` parsers. Leaves render as
+          `(<edu surface tokens>)` when `include_text=True` (parens inside the
+          surface text are escaped to `-LRB-`/`-RRB-`), or as the bare token
+          `<edu>` when `include_text=False` (callers supply EDU surface forms
+          out-of-band, positionally in document order). Internal nodes render
+          as `(NS:elaboration child1 child2)` for `traversal_order='preorder'`
+          or `(child1 child2 NS:elaboration)` for `traversal_order='postorder'`.
+
+        * Legacy style (when `format` is set). `format` selects between:
+          - "iudex": `(EDU text)` leaves with `-LRB-`/`-RRB-` escaping.
+          - "dis": `(text _!...!_)` RST-DT `.dis` fence (no escaping needed).
+          - "index": bare 0-based EDU indices in place of leaves.
+          The legacy modes ignore `traversal_order` and `include_text` (always
+          pre-order, always text-in). `invert_escaping=True` swaps structural
+          `(`/`)` for `-LRB-`/`-RRB-` (and disables leaf-text escaping).
+
+        Round-trip with `from_sexp` is guaranteed for the plan style only.
         """
         if not self.is_binary:
             raise NotImplementedError("Non-binary trees are not currently supported for this operation.")
-        if format not in ("iudex", "dis", "index"):
-            raise ValueError(f"Unknown format {format!r}; expected one of: iudex, dis, index")
+        if traversal_order not in ("preorder", "postorder"):
+            raise ValueError(f"Unknown traversal_order {traversal_order!r}; expected 'preorder' or 'postorder'.")
+        if format is not None and format not in ("iudex", "dis", "index"):
+            raise ValueError(f"Unknown format {format!r}; expected one of: iudex, dis, index, or None.")
 
         if invert_escaping:
             lpar, rpar = "-LRB-", "-RRB-"
@@ -482,23 +538,192 @@ class RstTree:
             def escape(s: str) -> str:
                 return s.replace("(", "-LRB-").replace(")", "-RRB-")
 
-        counter = 0
+        if format is not None:
+            counter = 0
+
+            def render_legacy(node) -> str:
+                nonlocal counter
+                if node[0] == "edu":
+                    text = node[1]
+                    if format == "iudex":
+                        return f"{lpar}EDU {escape(text)}{rpar}"
+                    if format == "dis":
+                        return f"{lpar}text _!{text}_!{rpar}"
+                    idx = counter
+                    counter += 1
+                    return str(idx)
+                _, nuc, rel, left, right = node
+                return f"{lpar}{nuc}:{rel} {render_legacy(left)} {render_legacy(right)}{rpar}"
+
+            return render_legacy(self._build_binary_tree())
 
         def render(node) -> str:
-            nonlocal counter
             if node[0] == "edu":
-                text = node[1]
-                if format == "iudex":
-                    return f"{lpar}EDU {escape(text)}{rpar}"
-                if format == "dis":
-                    return f"{lpar}text _!{text}_!{rpar}"
-                idx = counter
-                counter += 1
-                return str(idx)
+                if not include_text:
+                    return "<edu>"
+                text = escape(node[1])
+                return f"{lpar}{text}{rpar}" if text else f"{lpar}{rpar}"
             _, nuc, rel, left, right = node
-            return f"{lpar}{nuc}:{rel} {render(left)} {render(right)}{rpar}"
+            label = f"{nuc}:{rel}"
+            if traversal_order == "preorder":
+                return f"{lpar}{label} {render(left)} {render(right)}{rpar}"
+            return f"{lpar}{render(left)} {render(right)} {label}{rpar}"
 
         return render(self._build_binary_tree())
+
+    @classmethod
+    def from_sexp(
+        cls,
+        text: str,
+        traversal_order: str = "preorder",
+        edus: Optional[List[str]] = None,
+        relation_types: Optional[Tuple[Tuple[str, str], ...]] = None,
+    ) -> "RstTree":
+        """Inverse of `to_sexp` (plan style only). `text` must be the output
+        of `to_sexp(traversal_order=..., include_text=...)`. If the source had
+        `include_text=False`, pass `edus` (positional list of surface strings,
+        document order) and each `<edu>` placeholder is filled in.
+
+        Leaf vs internal disambiguation: a span is internal iff its first
+        (`preorder`) or last (`postorder`) token is a `NUC:relation` label. EDU
+        surface text never starts/ends with such a token in practice (no
+        `NS:`/`SN:`/`NN:` prefix), so the format is unambiguous.
+        """
+        if traversal_order not in ("preorder", "postorder"):
+            raise ValueError(f"Unknown traversal_order {traversal_order!r}; expected 'preorder' or 'postorder'.")
+
+        tokens = _tokenize_sexp(text)
+        pos = [0]
+
+        def parse_node() -> dict:
+            # Dispatches on the next token: `<edu>` is a placeholder leaf,
+            # `(` opens a span (leaf-with-text OR internal). Bare tokens are
+            # not legal as standalone children of an internal node.
+            if pos[0] >= len(tokens):
+                raise ValueError("from_sexp: unexpected EOF where a child was expected.")
+            tok = tokens[pos[0]]
+            if tok == "<edu>":
+                pos[0] += 1
+                return {"kind": "leaf_placeholder"}
+            if tok != "(":
+                raise ValueError(f"from_sexp: expected '(' or '<edu>', got {tok!r}")
+            return parse_paren()
+
+        def parse_paren() -> dict:
+            pos[0] += 1  # consume '('
+            # Decide leaf-with-text vs internal by peeking. Pre-order: a label
+            # right after '(' marks an internal node. Post-order: a label right
+            # before the matching ')' marks an internal node. Otherwise the
+            # span is a leaf containing only surface tokens.
+            depth_start = pos[0]
+            if traversal_order == "preorder" and pos[0] < len(tokens) and _is_label(tokens[pos[0]]):
+                label = tokens[pos[0]]
+                pos[0] += 1
+                left = parse_node()
+                right = parse_node()
+                if pos[0] >= len(tokens) or tokens[pos[0]] != ")":
+                    raise ValueError(f"from_sexp: expected ')' after internal node {label!r}.")
+                pos[0] += 1
+                return {"kind": "internal", "label": label, "left": left, "right": right}
+            if traversal_order == "postorder":
+                # Find the matching ')' by tracking depth; check the token
+                # immediately before it.
+                depth = 1
+                scan = pos[0]
+                while scan < len(tokens) and depth > 0:
+                    if tokens[scan] == "(":
+                        depth += 1
+                    elif tokens[scan] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    scan += 1
+                if scan >= len(tokens):
+                    raise ValueError("from_sexp: unbalanced parens (postorder scan).")
+                last_inner = tokens[scan - 1] if scan - 1 >= depth_start else None
+                if last_inner is not None and _is_label(last_inner):
+                    left = parse_node()
+                    right = parse_node()
+                    if pos[0] >= len(tokens) or not _is_label(tokens[pos[0]]):
+                        raise ValueError("from_sexp: expected label before ')' in postorder internal node.")
+                    label = tokens[pos[0]]
+                    pos[0] += 1
+                    if pos[0] >= len(tokens) or tokens[pos[0]] != ")":
+                        raise ValueError(f"from_sexp: expected ')' after postorder label {label!r}.")
+                    pos[0] += 1
+                    return {"kind": "internal", "label": label, "left": left, "right": right}
+            # Leaf with literal text. Consume surface tokens up to ')'.
+            surfaces: List[str] = []
+            while pos[0] < len(tokens) and tokens[pos[0]] != ")":
+                if tokens[pos[0]] == "(":
+                    raise ValueError("from_sexp: nested '(' inside a leaf span (malformed).")
+                surfaces.append(tokens[pos[0]])
+                pos[0] += 1
+            if pos[0] >= len(tokens):
+                raise ValueError("from_sexp: unbalanced parens (leaf scan).")
+            pos[0] += 1  # consume ')'
+            return {"kind": "leaf_text", "surfaces": surfaces}
+
+        parsed = parse_node()
+        if pos[0] != len(tokens):
+            raise ValueError(f"from_sexp: trailing tokens after root: {tokens[pos[0] :][:5]!r}...")
+
+        edu_texts: List[Optional[str]] = []
+        actions: List[Tuple[int, str, str]] = []
+
+        def collect(node) -> Tuple[int, int]:
+            kind = node["kind"]
+            if kind == "leaf_placeholder":
+                edu_texts.append(None)
+                idx = len(edu_texts) - 1
+                return idx, idx + 1
+            if kind == "leaf_text":
+                edu_texts.append(_join_surface(node["surfaces"]))
+                idx = len(edu_texts) - 1
+                return idx, idx + 1
+            lo_l, hi_l = collect(node["left"])
+            lo_r, hi_r = collect(node["right"])
+            if hi_l != lo_r:
+                raise ValueError(f"from_sexp: discontinuous children {hi_l} vs {lo_r}")
+            nuc, _, rel = node["label"].partition(":")
+            if nuc not in ("NS", "SN", "NN") or not rel:
+                raise ValueError(f"from_sexp: malformed label {node['label']!r}")
+            actions.append((lo_r, nuc, rel))
+            return lo_l, hi_r
+
+        collect(parsed)
+        # `parsing_actions` is depth-first (pre-order over the split index);
+        # `from_parsing_actions` reverses it internally. Either DFS pre or post
+        # works as long as `right_index` is consistent; we built it in
+        # post-order (children before parent), so reverse to pre-order for
+        # symmetry with `parsing_actions`.
+        actions.reverse()
+
+        # Fill in EDU surface forms.
+        if edus is not None:
+            if len(edus) != len(edu_texts):
+                raise ValueError(
+                    f"from_sexp: `edus` has {len(edus)} entries but the s-expression contains {len(edu_texts)} leaves."
+                )
+            final_edus: List[str] = []
+            for i, (t, e) in enumerate(zip(edu_texts, edus)):
+                if t is not None and t != e:
+                    raise ValueError(
+                        f"from_sexp: EDU {i} disagrees between in-stream text {t!r} and `edus[{i}]={e!r}`."
+                    )
+                final_edus.append(e)
+        else:
+            if any(t is None for t in edu_texts):
+                raise ValueError(
+                    "from_sexp: s-expression has `<edu>` placeholders but no `edus` argument was supplied."
+                )
+            final_edus = [t for t in edu_texts]  # type: ignore[misc]
+
+        if not actions:
+            # Single-EDU degenerate tree.
+            edu_nodes = [RstNode("1", "terminal", final_edus[0])]
+            return cls(edu_nodes, [], relation_types=relation_types)
+        return cls.from_parsing_actions(actions, final_edus, return_tree=True, relation_types=relation_types)
 
     def to_shift_reduce(
         self,
