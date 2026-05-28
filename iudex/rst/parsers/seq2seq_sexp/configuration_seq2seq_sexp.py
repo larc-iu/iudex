@@ -9,13 +9,21 @@ from iudex.rst.parsers.common.config import parse_config_dict
 class _PeftConfig(FromParams):
     """LoRA fine-tuning of the seq2seq stack. Mirrors `Seq2SeqSRConfig._PeftConfig`.
 
-    The lm_head is replaced at parser-init with a fresh, small Linear
-    projecting to just the action vocab (~100 dims), so the old tied-weight
-    issue between `embed_tokens` and `lm_head.out_proj` is gone. Only
-    `embed_tokens` needs `modules_to_save` to keep the newly-added action-
-    token rows trainable. By default we also mask gradients on the old
-    pretrained rows of `embed_tokens` so only the ~100 new rows update
-    (see `Seq2SeqSexpParser._mask_old_embedding_gradients`).
+    When `use_copy=True`, the lm_head is replaced at parser-init with a
+    fresh, small Linear projecting to just the action vocab (~100 dims),
+    so the old tied-weight issue between `embed_tokens` and
+    `lm_head.out_proj` is gone. Only `embed_tokens` needs `modules_to_save`
+    to keep the newly-added action-token rows trainable. By default we
+    also mask gradients on the old pretrained rows of `embed_tokens` so
+    only the ~100 new rows update (see
+    `Seq2SeqSexpParser._mask_old_embedding_gradients`).
+
+    When `use_copy=False`, the full pretrained lm_head stays in place
+    (source subwords are predicted natively), and
+    `train_only_new_embedding_rows` is auto-overridden to False (see
+    `Seq2SeqSexpConfig.__post_init__`): the full head must learn to
+    predict source ids, which requires all embedding rows to remain
+    trainable.
     """
 
     r: int = 16
@@ -139,22 +147,36 @@ class Seq2SeqSexpConfig(FromParams):
     # Sexp-specific. The first is also the registry signature_field for
     # this parser (`traversal_order` is unique to sexp parsers).
     traversal_order: str = "postorder"
-    # True only for now. use_copy=False is future work (see the paper's
-    # limitations section): it confounds COPY-mode ablations with lm_head
-    # architecture changes, and source-token prediction via the small head
-    # is not wired up.
+    # When True (default), action vocab includes a `<copy>` token, source
+    # subwords are replaced by `<copy>` at training time, the lm_head is
+    # replaced with a small fresh `Linear(hidden, head_vocab_size)` over
+    # the action vocab (~100 classes), and the predict path substitutes
+    # the current source id into the next decoder input when `<copy>` is
+    # emitted. When False, source subwords appear verbatim in-stream and
+    # the full pretrained lm_head is kept so source ids are scorable
+    # natively. This mirrors Hu and Wan 2023 (TASLP, "RST Discourse
+    # Parsing as Text-to-Text Generation"). Note the inherent asymmetry:
+    # the head architecture differs across modes by design (no-copy
+    # MUST keep the full head to score source ids), so a COPY ablation
+    # conflates "having COPY" with "enables a small head". This is a
+    # property of the COPY mechanism itself, not a confound we can
+    # eliminate without breaking one mode or the other.
     use_copy: bool = True
 
     def __post_init__(self):
         if self.traversal_order not in ("preorder", "postorder"):
             raise ValueError(f"traversal_order must be 'preorder' or 'postorder' (got {self.traversal_order!r})")
-        if self.use_copy is False:
-            raise NotImplementedError(
-                "Seq2SeqSexpConfig: use_copy=False is not implemented. "
-                "The small action head can't predict source ids, so source-content "
-                "positions never contribute to loss and inference dies at the first leaf. "
-                "Set use_copy=True (the canonical / supported mode)."
+        if self.use_copy is False and self.peft is not None and self.peft.train_only_new_embedding_rows:
+            import warnings
+
+            warnings.warn(
+                "Seq2SeqSexpConfig: use_copy=False with peft.train_only_new_embedding_rows=True "
+                "would hard-block training (the full lm_head must learn to predict source-subword "
+                "ids, which is impossible if pretrained embedding rows are frozen). Auto-overriding "
+                "train_only_new_embedding_rows to False.",
+                stacklevel=2,
             )
+            self.peft.train_only_new_embedding_rows = False
 
     @classmethod
     def from_dict(cls, d: dict) -> "Seq2SeqSexpConfig":

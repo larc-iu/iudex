@@ -12,9 +12,13 @@ class _PeftConfig(FromParams):
     Action-token embedding rows are added via `resize_token_embeddings` and
     `modules_to_save=['embed_tokens']` keeps them trainable. The lm_head is
     handled at parser init: when `use_copy=True` it's replaced with a small
-    fresh head over the action vocab. When `use_copy=False` it would stay
-    as the pretrained full-vocab head (we'd have to predict source subwords),
-    but that mode is not currently supported (see config docstring).
+    fresh head over the action vocab. When `use_copy=False` the full
+    pretrained head is kept (source subwords are scored natively).
+
+    `train_only_new_embedding_rows` is auto-overridden to False when
+    `use_copy=False` (see `DecoderOnlySexpConfig.__post_init__`): the
+    full lm_head must learn to predict source ids, which requires all
+    embedding rows to remain trainable.
     """
 
     r: int = 16
@@ -75,9 +79,20 @@ class DecoderOnlySexpConfig(FromParams):
 
     # S-expression knobs. `use_copy` is the registry's signature_field.
     traversal_order: str = "postorder"
-    # True only for now. use_copy=False is future work (see the paper's
-    # limitations section): it confounds COPY-mode ablations with lm_head
-    # architecture changes (asymmetric head between modes).
+    # When True (default), action vocab includes a `<copy>` token, source
+    # subwords are replaced by `<copy>` at training time, the lm_head is
+    # replaced with a small fresh `Linear(hidden, head_vocab_size)` over
+    # the action vocab (~100 classes), and the predict path substitutes
+    # the current source id into the next decoder input when `<copy>` is
+    # emitted. When False, source subwords appear verbatim in-stream and
+    # the full pretrained lm_head is kept so source ids are scorable
+    # natively. This mirrors Hu and Wan 2023 (TASLP, "RST Discourse
+    # Parsing as Text-to-Text Generation"). Note the inherent asymmetry:
+    # the head architecture differs across modes by design (no-copy
+    # MUST keep the full head to score source ids), so a COPY ablation
+    # conflates "having COPY" with "enables a small head". This is a
+    # property of the COPY mechanism itself, not a confound we can
+    # eliminate without breaking one mode or the other.
     use_copy: bool = True
 
     # LoRA. Null = full fine-tuning. When set, the base causal LM is frozen
@@ -146,12 +161,17 @@ class DecoderOnlySexpConfig(FromParams):
     def __post_init__(self):
         if self.traversal_order not in ("preorder", "postorder"):
             raise ValueError(f"traversal_order must be 'preorder' or 'postorder' (got {self.traversal_order!r})")
-        if self.use_copy is False:
-            raise NotImplementedError(
-                "DecoderOnlySexpConfig: use_copy=False is not implemented. "
-                "The two modes use asymmetric lm_heads (small vs full vocab), "
-                "which confounds the ablation. Set use_copy=True (the canonical mode)."
+        if self.use_copy is False and self.peft is not None and self.peft.train_only_new_embedding_rows:
+            import warnings
+
+            warnings.warn(
+                "DecoderOnlySexpConfig: use_copy=False with peft.train_only_new_embedding_rows=True "
+                "would hard-block training (the full lm_head must learn to predict source-subword "
+                "ids, which is impossible if pretrained embedding rows are frozen). Auto-overriding "
+                "train_only_new_embedding_rows to False.",
+                stacklevel=2,
             )
+            self.peft.train_only_new_embedding_rows = False
 
     @classmethod
     def from_dict(cls, d: dict) -> "DecoderOnlySexpConfig":

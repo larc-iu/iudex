@@ -79,10 +79,15 @@ class Seq2SeqSexpParser(nn.Module):
         if config.peft is not None:
             self._install_peft(config.peft)
 
-        if config.relation_types is not None:
+        if config.relation_types is not None and config.use_copy:
             self._install_action_head()
-            if config.peft is not None and getattr(config.peft, "train_only_new_embedding_rows", True):
-                self._mask_old_embedding_gradients()
+        if (
+            config.relation_types is not None
+            and config.use_copy
+            and config.peft is not None
+            and getattr(config.peft, "train_only_new_embedding_rows", True)
+        ):
+            self._mask_old_embedding_gradients()
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -217,40 +222,58 @@ class Seq2SeqSexpParser(nn.Module):
         }
 
         eos_id = int(self.tokenizer.eos_token_id)
-        # Small action head ordering:
-        #   [<sexp_open>, <sexp_close>, sorted REDUCE-*, eos, (<copy> if use_copy)]
-        # use_copy=False also keeps the head small here; source-subword
-        # IDs are NOT predicted by this head (they're predicted by the
-        # full backbone lm_head bypass — see `forward` / decoding paths).
-        head_ids: list[int] = [self.open_token_id, self.close_token_id, *sorted(self.reduce_token_ids), eos_id]
         if self.config.use_copy:
+            # Small action head ordering:
+            #   [<sexp_open>, <sexp_close>, sorted REDUCE-*, eos, <copy>]
             assert self.copy_token_id is not None
-            head_ids.append(self.copy_token_id)
-        self.full_id_for_head_idx: list[int] = head_ids
-        self.head_idx_for_full_id: dict[int, int] = {fid: i for i, fid in enumerate(self.full_id_for_head_idx)}
-        self.head_vocab_size = len(self.full_id_for_head_idx)
-        self.open_head_idx = self.head_idx_for_full_id[self.open_token_id]
-        self.close_head_idx = self.head_idx_for_full_id[self.close_token_id]
-        self.eos_head_idx = self.head_idx_for_full_id[eos_id]
-        self.copy_head_idx = self.head_idx_for_full_id[self.copy_token_id] if self.config.use_copy else None
-        self.reduce_head_indices = {self.head_idx_for_full_id[fid] for fid in self.reduce_token_ids}
+            head_ids: list[int] = [
+                self.open_token_id,
+                self.close_token_id,
+                *sorted(self.reduce_token_ids),
+                eos_id,
+                self.copy_token_id,
+            ]
+            self.full_id_for_head_idx: list[int] = head_ids
+            self.head_idx_for_full_id: dict[int, int] = {fid: i for i, fid in enumerate(self.full_id_for_head_idx)}
+            self.head_vocab_size = len(self.full_id_for_head_idx)
+            self.open_head_idx = self.head_idx_for_full_id[self.open_token_id]
+            self.close_head_idx = self.head_idx_for_full_id[self.close_token_id]
+            self.eos_head_idx = self.head_idx_for_full_id[eos_id]
+            self.copy_head_idx = self.head_idx_for_full_id[self.copy_token_id]
+            self.reduce_head_indices = {self.head_idx_for_full_id[fid] for fid in self.reduce_token_ids}
 
-        structural_head_ids = sorted(self.reduce_head_indices | {self.open_head_idx, self.close_head_idx})
-        self.register_buffer(
-            "_structural_token_ids_buf",
-            torch.tensor(structural_head_ids, dtype=torch.long),
-            persistent=False,
-        )
-        max_full_id = max(self.full_id_for_head_idx) + 1
-        lookup = torch.full((max_full_id,), -100, dtype=torch.long)
-        for fid, hi in self.head_idx_for_full_id.items():
-            lookup[fid] = hi
-        self.register_buffer("_label_to_head_lookup", lookup, persistent=False)
-        self.register_buffer(
-            "_reduce_head_ids_buf",
-            torch.tensor(sorted(self.reduce_head_indices), dtype=torch.long),
-            persistent=False,
-        )
+            structural_head_ids = sorted(self.reduce_head_indices | {self.open_head_idx, self.close_head_idx})
+            self.register_buffer(
+                "_structural_token_ids_buf",
+                torch.tensor(structural_head_ids, dtype=torch.long),
+                persistent=False,
+            )
+            max_full_id = max(self.full_id_for_head_idx) + 1
+            lookup = torch.full((max_full_id,), -100, dtype=torch.long)
+            for fid, hi in self.head_idx_for_full_id.items():
+                lookup[fid] = hi
+            self.register_buffer("_label_to_head_lookup", lookup, persistent=False)
+            self.register_buffer(
+                "_reduce_head_ids_buf",
+                torch.tensor(sorted(self.reduce_head_indices), dtype=torch.long),
+                persistent=False,
+            )
+        else:
+            # use_copy=False: scoring vocab IS the full pretrained vocab. No
+            # head replacement, no full_id<->head_idx mapping. Structural
+            # full-vocab ids are tracked for action_loss_weight rebalance and
+            # for the decoding masks.
+            self.copy_head_idx = None
+            self.full_id_for_head_idx = []
+            self.head_idx_for_full_id = {}
+            self.head_vocab_size = int(len(self.tokenizer))
+            self.reduce_head_indices = set()
+            structural_full_ids = sorted(self.reduce_token_ids | {self.open_token_id, self.close_token_id})
+            self.register_buffer(
+                "_structural_full_ids_buf",
+                torch.tensor(structural_full_ids, dtype=torch.long),
+                persistent=False,
+            )
 
     def _install_action_head(self) -> None:
         base = self._underlying_model()
@@ -374,32 +397,42 @@ class Seq2SeqSexpParser(nn.Module):
             decoder_input_ids=batch["decoder_input_ids"],
             return_dict=True,
         )
-        logits = out.logits  # [B, T, head_vocab_size]
+        logits = out.logits  # [B, T, V] where V = head_vocab_size or full vocab
 
         labels = batch["labels"]
         labels_flat = labels.reshape(-1)
-        max_id = self._label_to_head_lookup.size(0) - 1
-        in_range = (labels_flat >= 0) & (labels_flat <= max_id)
-        clamped = labels_flat.clamp(min=0, max=max_id)
-        head_labels_flat = torch.where(
-            in_range,
-            self._label_to_head_lookup[clamped],
-            torch.full_like(labels_flat, -100),
-        )
+        V = logits.size(-1)
+        logits_flat = logits.reshape(-1, V)
+
+        if self.config.use_copy:
+            max_id = self._label_to_head_lookup.size(0) - 1
+            in_range = (labels_flat >= 0) & (labels_flat <= max_id)
+            clamped = labels_flat.clamp(min=0, max=max_id)
+            scored_labels_flat = torch.where(
+                in_range,
+                self._label_to_head_lookup[clamped],
+                torch.full_like(labels_flat, -100),
+            )
+            structural_buf = self._structural_token_ids_buf
+        else:
+            # Identity mapping: labels are already full-vocab ids; only -100
+            # is special (the structural buffer is in full-vocab ids).
+            scored_labels_flat = labels_flat
+            structural_buf = self._structural_full_ids_buf
 
         base_loss = F.cross_entropy(
-            logits.reshape(-1, self.head_vocab_size).float(),
-            head_labels_flat,
+            logits_flat.float(),
+            scored_labels_flat,
             ignore_index=-100,
             label_smoothing=self.config.label_smoothing,
         )
         metrics: dict[str, torch.Tensor] = {"loss": base_loss}
 
-        if self._structural_token_ids_buf.numel() == 0:
+        if structural_buf.numel() == 0:
             return metrics
 
-        valid_mask = head_labels_flat != -100
-        is_structural = torch.isin(head_labels_flat, self._structural_token_ids_buf) & valid_mask
+        valid_mask = scored_labels_flat != -100
+        is_structural = torch.isin(scored_labels_flat, structural_buf) & valid_mask
         n_total = int(valid_mask.sum().item())
         n_structural = int(is_structural.sum().item())
         n_copy = n_total - n_structural
@@ -407,9 +440,8 @@ class Seq2SeqSexpParser(nn.Module):
             return metrics
 
         structural_idx = is_structural.nonzero(as_tuple=True)[0]
-        logits_flat = logits.reshape(-1, self.head_vocab_size)
         structural_logits = logits_flat.index_select(0, structural_idx).float()
-        structural_labels = head_labels_flat.index_select(0, structural_idx)
+        structural_labels = scored_labels_flat.index_select(0, structural_idx)
         action_loss = F.cross_entropy(structural_logits, structural_labels, label_smoothing=self.config.label_smoothing)
 
         with torch.no_grad():
@@ -627,17 +659,25 @@ class Seq2SeqSexpParser(nn.Module):
         )
 
     def _full_ids_to_head_mask(self, state: SexpDecodingState, head_V: int) -> torch.Tensor:
-        """Boolean mask over the HEAD vocabulary of legal actions at this
-        state. Source-content tokens (when `use_copy=False`) live OUTSIDE
-        the head vocab, so this mask only covers structural slots; the
-        decoder loop handles source-token slots separately.
+        """Boolean mask over the scoring vocab of legal actions at this state.
+
+        `use_copy=True`: scoring vocab is the small action head, so map legal
+            full-vocab ids through `head_idx_for_full_id`.
+        `use_copy=False`: scoring vocab IS the full tokenizer vocab; legal
+            ids are used directly as positions in the mask.
         """
         legal = state.legal_actions()
         mask = torch.zeros(head_V, dtype=torch.bool)
-        for full_id in legal:
-            hi = self.head_idx_for_full_id.get(int(full_id))
-            if hi is not None:
-                mask[hi] = True
+        if self.config.use_copy:
+            for full_id in legal:
+                hi = self.head_idx_for_full_id.get(int(full_id))
+                if hi is not None:
+                    mask[hi] = True
+        else:
+            for full_id in legal:
+                fid = int(full_id)
+                if 0 <= fid < head_V:
+                    mask[fid] = True
         return mask
 
     # -----------------------------------------------------------------
@@ -707,13 +747,14 @@ class Seq2SeqSexpParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[0, -1, :]  # [head_V]
 
+                V = int(logits.size(-1))
                 if self.config.use_validity_constraints:
-                    mask = self._full_ids_to_head_mask(state, self.head_vocab_size).to(device)
+                    mask = self._full_ids_to_head_mask(state, V).to(device)
                     masked = torch.where(mask, logits, torch.full_like(logits, float("-inf")))
                 else:
                     masked = logits
                 head_idx = int(masked.argmax(-1).item())
-                full_id = self.full_id_for_head_idx[head_idx]
+                full_id = self.full_id_for_head_idx[head_idx] if self.config.use_copy else head_idx
                 action_seq.append(full_id)
 
                 # Track EDU boundaries via state transitions (in_edu_leaf flips).
@@ -780,6 +821,10 @@ class Seq2SeqSexpParser(nn.Module):
         self.eval()
         device = next(self.parameters()).device
         K = int(num_beams)
+        # In use_copy=False mode the scoring vocab IS the model's full output
+        # vocab (the pretrained lm_head). In use_copy=True it's the small
+        # replacement head. Either way the size is reflected by the model's
+        # final logit dim, which we read off the first decoder pass below.
         head_V = self.head_vocab_size
 
         enc = self.tokenizer(
@@ -866,7 +911,7 @@ class Seq2SeqSexpParser(nn.Module):
                     if new_done[j]:
                         continue
                     hi = action_of_new[j]
-                    full_id = self.full_id_for_head_idx[hi]
+                    full_id = self.full_id_for_head_idx[hi] if self.config.use_copy else hi
                     new_action_seqs[j].append(full_id)
                     try:
                         new_states[j] = new_states[j].step(full_id)
@@ -1033,15 +1078,19 @@ class Seq2SeqSexpParser(nn.Module):
                 else:
                     narrowed = set(legal)
 
-                head_indices = sorted(
-                    self.head_idx_for_full_id[int(x)] for x in narrowed if int(x) in self.head_idx_for_full_id
-                )
+                if self.config.use_copy:
+                    head_indices = sorted(
+                        self.head_idx_for_full_id[int(x)] for x in narrowed if int(x) in self.head_idx_for_full_id
+                    )
+                else:
+                    V = int(logits.size(-1))
+                    head_indices = sorted(int(x) for x in narrowed if 0 <= int(x) < V)
                 masked = torch.full_like(logits, float("-inf"))
                 if head_indices:
                     idx_t = torch.tensor(head_indices, dtype=torch.long, device=logits.device)
                     masked[idx_t] = logits[idx_t]
                 head_idx = int(masked.argmax(-1).item())
-                full_id = self.full_id_for_head_idx[head_idx]
+                full_id = self.full_id_for_head_idx[head_idx] if self.config.use_copy else head_idx
 
                 closing_leaf = full_id == self.close_token_id and bool(state.stack) and state.stack[-1].kind == "leaf"
                 action_seq.append(full_id)

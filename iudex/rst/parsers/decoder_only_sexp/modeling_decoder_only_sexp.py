@@ -247,6 +247,16 @@ class DecoderOnlySexpParser(nn.Module):
                 torch.tensor(sorted(self.label_head_indices), dtype=torch.long),
                 persistent=False,
             )
+        else:
+            # use_copy=False: structural action ids in FULL vocab space, used
+            # only by the action_loss_weight rebalance in `forward`. Source
+            # subword ids at leaf-content positions get loss weight 1.0.
+            structural_full_ids = sorted(self.label_id_set | {self.open_token_id, self.close_token_id})
+            self.register_buffer(
+                "_structural_full_ids_buf",
+                torch.tensor(structural_full_ids, dtype=torch.long),
+                persistent=False,
+            )
 
     def _install_action_head(self) -> None:
         """Replace the model's lm_head with a small fresh `Linear(hidden ->
@@ -432,14 +442,41 @@ class DecoderOnlySexpParser(nn.Module):
             return metrics
 
         # use_copy=False: full-vocab cross-entropy over the original lm_head.
+        # Source subwords at leaf-content positions are scored alongside the
+        # structural action positions (open/close/labels/eos/sep).
         vocab_size = shifted_logits.size(-1)
-        loss = F.cross_entropy(
-            shifted_logits.reshape(-1, vocab_size).float(),
-            shifted_labels.reshape(-1),
+        labels_flat = shifted_labels.reshape(-1)
+        logits_flat = shifted_logits.reshape(-1, vocab_size)
+        base_loss = F.cross_entropy(
+            logits_flat.float(),
+            labels_flat,
             ignore_index=-100,
             label_smoothing=self.config.label_smoothing,
         )
-        return {"loss": loss}
+        metrics: dict[str, torch.Tensor] = {"loss": base_loss}
+
+        valid_mask = labels_flat != -100
+        is_structural = torch.isin(labels_flat, self._structural_full_ids_buf) & valid_mask
+        n_total = int(valid_mask.sum().item())
+        n_structural = int(is_structural.sum().item())
+        n_copy = n_total - n_structural
+        if n_structural == 0 or n_copy == 0:
+            return metrics
+
+        structural_idx = is_structural.nonzero(as_tuple=True)[0]
+        structural_logits = logits_flat.index_select(0, structural_idx).float()
+        structural_labels = labels_flat.index_select(0, structural_idx)
+        action_loss = F.cross_entropy(structural_logits, structural_labels, label_smoothing=self.config.label_smoothing)
+        with torch.no_grad():
+            copy_loss = (base_loss.detach() * n_total - action_loss.detach() * n_structural) / max(n_copy, 1)
+        metrics["action_loss"] = action_loss.detach()
+        metrics["copy_loss"] = copy_loss
+        metrics["n_action_tokens"] = torch.tensor(n_structural, dtype=torch.long)
+        w = self.config.action_loss_weight
+        if w != 1.0 and n_total > 0:
+            alpha = (w - 1.0) * n_structural / n_total
+            metrics["loss"] = base_loss + alpha * action_loss
+        return metrics
 
     # -----------------------------------------------------------------
     # Tokenization

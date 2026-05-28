@@ -78,23 +78,22 @@ def test_decoder_only_sexp_predict_paths_honor_marker():
         assert "_from_sexp_failed" in src, f"{name} doesn't honor _from_sexp_failed"
 
 
-def test_use_copy_false_is_gated():
-    """Fix 3: both sexp configs raise NotImplementedError when use_copy=False
-    so the broken-by-design configuration can't sneak into a run."""
+def test_use_copy_false_is_constructible():
+    """`use_copy=False` is the no-COPY mode (Hu and Wan 2023 mirror). Both
+    configs should accept it without raising. The full-vocab head and
+    source-id in-stream emission are wired up in their respective parsers."""
     from iudex.rst.parsers.decoder_only_sexp.configuration_decoder_only_sexp import DecoderOnlySexpConfig
     from iudex.rst.parsers.seq2seq_sexp.configuration_seq2seq_sexp import Seq2SeqSexpConfig
 
-    with pytest.raises(NotImplementedError):
-        Seq2SeqSexpConfig(
-            train_dir="<unused>",
-            dev_dir="<unused>",
-            relation_types=[("elaboration", "rst")],
-            use_copy=False,
-        )
-    with pytest.raises(NotImplementedError):
-        DecoderOnlySexpConfig(
-            train_dir="<unused>",
-            dev_dir="<unused>",
-            relation_types=[("elaboration", "rst")],
-            use_copy=False,
-        )
+    Seq2SeqSexpConfig(
+        train_dir="<unused>",
+        dev_dir="<unused>",
+        relation_types=[("elaboration", "rst")],
+        use_copy=False,
+    )
+    DecoderOnlySexpConfig(
+        train_dir="<unused>",
+        dev_dir="<unused>",
+        relation_types=[("elaboration", "rst")],
+        use_copy=False,
+    )
