@@ -146,16 +146,23 @@ def test_forward_returns_finite_loss(parser):
         "attention_mask": torch.ones((1, len(input_ids)), dtype=torch.long),
         "labels": torch.tensor([labels], dtype=torch.long),
     }
+    # The replacement lm_head must be trainable. PEFT freezes the base
+    # before head replacement, but the new Linear is constructed afterward
+    # so its parameters default to requires_grad=True. Asserting directly
+    # so a regression (e.g. accidentally calling .requires_grad_(False) on
+    # the head) gets caught even when the grad-flow check below would also
+    # pass via stale state.
+    lm_head_weight = parser._underlying_model().lm_head.weight
+    assert lm_head_weight.requires_grad
+
     parser.train()
     out = parser(batch)
     assert "loss" in out
     loss = out["loss"]
     assert torch.isfinite(loss).item()
-    # Gradients flow at least into the small action head.
     loss.backward()
-    head_grad = parser._underlying_model().lm_head.weight.grad
-    assert head_grad is not None
-    assert torch.isfinite(head_grad).all().item()
+    assert lm_head_weight.grad is not None
+    assert torch.isfinite(lm_head_weight.grad).all().item()
 
 
 def test_predict_with_gold_edus_emits_one_shift_per_gold_edu(parser):

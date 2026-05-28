@@ -19,6 +19,7 @@ but loops row-by-row internally; the per-row variable-prefix-length
 padding story isn't worth the speedup for smoke-test scale).
 """
 
+import contextlib
 import logging
 from typing import List, Tuple
 
@@ -134,6 +135,38 @@ class DecoderOnlySRParser(nn.Module):
             if hasattr(mod, "gradient_checkpointing"):
                 mod.gradient_checkpointing = enabled
 
+    @contextlib.contextmanager
+    def _inference_mode(self):
+        """Disable gradient checkpointing AND force `config.use_cache=True`
+        during prediction. Required: at `__init__` we set `use_cache=False`
+        on the underlying config when `gradient_checkpointing=True` so the
+        backward pass actually recomputes activations. Some submodules and
+        PEFT wrappers consult `self.config.use_cache` directly to decide
+        whether to populate `past_key_values`, so toggling only the kwarg
+        on the forward call isn't enough — leaving the config flag at
+        False during predict silently kills the KV cache and forces every
+        step to re-encode the prefix from scratch. Restores both flags on
+        exit so a subsequent training step is unaffected."""
+        gc_was_on = self.config.gradient_checkpointing
+        prev_use_cache = getattr(self.model.config, "use_cache", None)
+        base_cfg = getattr(getattr(self.model, "base_model", None), "config", None)
+        prev_base_use_cache = getattr(base_cfg, "use_cache", None) if base_cfg is not None else None
+        if gc_was_on:
+            self._set_grad_checkpointing(False)
+        if prev_use_cache is not None:
+            self.model.config.use_cache = True
+        if prev_base_use_cache is not None:
+            base_cfg.use_cache = True
+        try:
+            yield
+        finally:
+            if gc_was_on:
+                self._set_grad_checkpointing(True)
+            if prev_use_cache is not None:
+                self.model.config.use_cache = prev_use_cache
+            if prev_base_use_cache is not None:
+                base_cfg.use_cache = prev_base_use_cache
+
     def _retie_modules_to_save(self) -> None:
         """Re-share weights across `ModulesToSaveWrapper` groups whose
         originals shared storage (mirrors `Seq2SeqSRParser._retie_modules_to_save`).
@@ -228,7 +261,15 @@ class DecoderOnlySRParser(nn.Module):
         """Replace the model's lm_head (tied to embed_tokens for Gemma)
         with a small fresh `Linear(hidden -> head_vocab_size)`. Done AFTER
         PEFT wrap so any LoRA adapter PEFT attached to lm_head gets
-        discarded — we want this small head fully trainable, not LoRA."""
+        discarded — we want this small head fully trainable, not LoRA.
+
+        Warm-init copies each head row from `embed_tokens[full_id]`. This
+        is only meaningfully informative for rows whose `full_id` was
+        already in the pretrained vocab (here that's EOS — every other
+        head row is for a token added via `resize_token_embeddings` and
+        therefore has a freshly-random embedding). For those new rows the
+        warm-init is effectively just re-randomization, but it's harmless
+        and the EOS case is worth keeping."""
         base = self._underlying_model()
 
         def _warm_init(new_linear: nn.Linear) -> None:
@@ -599,10 +640,7 @@ class DecoderOnlySRParser(nn.Module):
         prefix_ids = self._build_prefix_ids(source_ids)
         source_len = len(source_ids)
 
-        gc_active = self.config.gradient_checkpointing
-        if gc_active:
-            self._set_grad_checkpointing(False)
-        try:
+        with self._inference_mode():
             input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_ids)
             out = self.model(
@@ -681,9 +719,6 @@ class DecoderOnlySRParser(nn.Module):
                 logits = out.logits[0, -1, :]
             else:
                 hit_max_len = not done
-        finally:
-            if gc_active:
-                self._set_grad_checkpointing(True)
 
         if hit_max_len:
             warn(
@@ -719,10 +754,7 @@ class DecoderOnlySRParser(nn.Module):
         prefix_ids = self._build_prefix_ids(source_ids)
         source_len = len(source_ids)
 
-        gc_active = self.config.gradient_checkpointing
-        if gc_active:
-            self._set_grad_checkpointing(False)
-        try:
+        with self._inference_mode():
             prefix_t = torch.tensor([prefix_ids], dtype=torch.long, device=device).expand(K, -1).contiguous()
             attention_mask = torch.ones_like(prefix_t)
             out = self.model(
@@ -771,7 +803,15 @@ class DecoderOnlySRParser(nn.Module):
                 action_of_new = (top_idx % head_V).tolist()
 
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
-                if past_key_values is not None:
+                # Skip the reorder when it's provably a no-op: step 0
+                # has `parent_of_new == [0]*K` because only beam 0 was
+                # alive, and the prefix forward already replicated K
+                # identical cache rows; later steps where parents form
+                # the identity permutation are also no-ops.
+                is_step0_uniform = step == 0 and all(p == 0 for p in parent_of_new)
+                is_identity = parent_of_new == list(range(K))
+                needs_reorder = past_key_values is not None and not (is_step0_uniform or is_identity)
+                if needs_reorder:
                     past_key_values = _reorder_pkv(past_key_values, parent_tensor, self._underlying_model())
 
                 new_cursors = [cursors[p] for p in parent_of_new]
@@ -845,9 +885,6 @@ class DecoderOnlySRParser(nn.Module):
                 )
                 past_key_values = out.past_key_values
                 logits = out.logits[:, -1, :]
-        finally:
-            if gc_active:
-                self._set_grad_checkpointing(True)
 
         candidates: list[dict] = list(finished_beams)
         for j in range(K):
@@ -915,10 +952,7 @@ class DecoderOnlySRParser(nn.Module):
         edu_ends = [end for _, end in clamped_ranges]
         n_edus = len(edu_ends)
 
-        gc_active = self.config.gradient_checkpointing
-        if gc_active:
-            self._set_grad_checkpointing(False)
-        try:
+        with self._inference_mode():
             input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
             attention_mask = torch.ones_like(input_ids)
             out = self.model(
@@ -998,9 +1032,6 @@ class DecoderOnlySRParser(nn.Module):
                 logits = out.logits[0, -1, :]
             else:
                 hit_max_len = not done
-        finally:
-            if gc_active:
-                self._set_grad_checkpointing(True)
 
         if hit_max_len:
             warn(
@@ -1151,11 +1182,17 @@ def _empty_tree(relation_types, text: str = "") -> RstTree:
 def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
     """Reorder a HF `past_key_values` cache along the beam dimension.
     Tries (1) the underlying model's `_reorder_cache`, (2) a `DynamicCache`-
-    style `reorder_cache` method, then (3) manual tuple-of-tuple walk."""
+    style `reorder_cache` method, then (3) manual tuple-of-tuple walk.
+
+    Modern HF `DynamicCache.reorder_cache(beam_idx)` mutates in place and
+    returns `None`; if we returned the call result blindly we'd assign
+    `past_key_values = None` and silently kill the cache on the next step.
+    Fall back to the (mutated) original whenever a path returns `None`."""
     reorder = getattr(underlying_model, "_reorder_cache", None)
     if callable(reorder):
         try:
-            return reorder(past_key_values, beam_idx)
+            result = reorder(past_key_values, beam_idx)
+            return result if result is not None else past_key_values
         except (TypeError, AttributeError) as e:
             import warnings
 
@@ -1166,7 +1203,8 @@ def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
                 stacklevel=2,
             )
     if hasattr(past_key_values, "reorder_cache"):
-        return past_key_values.reorder_cache(beam_idx)
+        result = past_key_values.reorder_cache(beam_idx)
+        return result if result is not None else past_key_values
     return tuple(
         tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
         for layer in past_key_values

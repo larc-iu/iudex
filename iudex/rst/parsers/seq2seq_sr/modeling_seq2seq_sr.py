@@ -1619,7 +1619,10 @@ def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
     reorder = getattr(underlying_model, "_reorder_cache", None)
     if callable(reorder):
         try:
-            return reorder(past_key_values, beam_idx)
+            result = reorder(past_key_values, beam_idx)
+            # Modern HF cache classes mutate in place and return None;
+            # blindly returning None drops the cache on the next step.
+            return result if result is not None else past_key_values
         except (TypeError, AttributeError) as e:
             import warnings
 
@@ -1631,7 +1634,8 @@ def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
             )
     # Path 2: DynamicCache or similar object-style cache.
     if hasattr(past_key_values, "reorder_cache"):
-        return past_key_values.reorder_cache(beam_idx)
+        result = past_key_values.reorder_cache(beam_idx)
+        return result if result is not None else past_key_values
     # Path 3: manual tuple walk; handle Nones gracefully.
     return tuple(
         tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)

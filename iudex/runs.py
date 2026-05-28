@@ -47,10 +47,40 @@ def _all_parsers() -> dict:
 
 
 def _infer_parser_kind(config: dict, parsers: dict) -> str:
+    """Find the parser whose signature_field is present in `config`.
+
+    Multiple parsers' signature_fields can both legitimately appear in one
+    config (e.g. `decoder_only_sr` carries `num_beams`, which is also
+    `seq2seq_sr`'s signature). When that happens, prefer the parser whose
+    signature_field doesn't appear as a default field on any OTHER parser's
+    config dataclass — that's the truly distinguishing field. Falls back to
+    registration order if still ambiguous, and to "?" on no match."""
+    import dataclasses as _dc
+
+    matches = [(name, spec) for name, spec in parsers.items() if spec.signature_field in config]
+    if not matches:
+        return "?"
+    if len(matches) == 1:
+        return matches[0][0]
+    # Build per-parser default-field sets lazily; only enter this branch
+    # when there's actual ambiguity.
+    other_fields_by_name: dict[str, set[str]] = {}
     for name, spec in parsers.items():
-        if spec.signature_field in config:
-            return name
-    return "?"
+        try:
+            cfg_cls = spec.load_config_cls()
+            other_fields_by_name[name] = {f.name for f in _dc.fields(cfg_cls)}
+        except Exception:
+            other_fields_by_name[name] = set()
+
+    distinguishing: list[str] = []
+    for name, spec in matches:
+        sig = spec.signature_field
+        shared = any(sig in other_fields_by_name.get(other, set()) for other in parsers if other != name)
+        if not shared:
+            distinguishing.append(name)
+    if len(distinguishing) == 1:
+        return distinguishing[0]
+    return matches[0][0]
 
 
 def _list_run_dirs(checkpoint_dir: str) -> list[str]:
