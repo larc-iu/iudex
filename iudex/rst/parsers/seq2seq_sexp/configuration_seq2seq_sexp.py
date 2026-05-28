@@ -147,6 +147,14 @@ class Seq2SeqSexpConfig(FromParams):
     # Sexp-specific. The first is also the registry signature_field for
     # this parser (`traversal_order` is unique to sexp parsers).
     traversal_order: str = "postorder"
+    # Controls how content positions are masked at decode time. Only
+    # applies when `use_copy=False`. True (default) hard-masks content
+    # positions to `source_ids[cursor]` (COPY-via-constraint, current
+    # behavior). False admits any non-structural id at content positions
+    # (free generation, closer to Hu and Wan 2023's apparent setup where
+    # the model learns to copy via attention). Requires `use_copy=False`;
+    # raises if both are True.
+    constrain_content: bool = True
     # When True (default), action vocab includes a `<copy>` token, source
     # subwords are replaced by `<copy>` at training time, the lm_head is
     # replaced with a small fresh `Linear(hidden, head_vocab_size)` over
@@ -166,15 +174,21 @@ class Seq2SeqSexpConfig(FromParams):
     def __post_init__(self):
         if self.traversal_order not in ("preorder", "postorder"):
             raise ValueError(f"traversal_order must be 'preorder' or 'postorder' (got {self.traversal_order!r})")
+        if self.use_copy and not self.constrain_content:
+            raise ValueError(
+                "constrain_content=False requires use_copy=False (free-content decoding "
+                "is only meaningful when source subwords are scored natively by the lm_head)."
+            )
         if self.use_copy is False and self.peft is not None and self.peft.train_only_new_embedding_rows:
-            import warnings
+            # Mutates self.peft in place. The override is durable because
+            # `dataclasses.asdict(self)` serializes the post-init state into
+            # `config.json` and into checkpoint hashes.
+            from iudex.common.log import warn as _warn
 
-            warnings.warn(
-                "Seq2SeqSexpConfig: use_copy=False with peft.train_only_new_embedding_rows=True "
-                "would hard-block training (the full lm_head must learn to predict source-subword "
-                "ids, which is impossible if pretrained embedding rows are frozen). Auto-overriding "
-                "train_only_new_embedding_rows to False.",
-                stacklevel=2,
+            _warn(
+                "[CONFIG OVERRIDE] use_copy=False is incompatible with train_only_new_embedding_rows=True. "
+                "Auto-overriding to False so the full lm_head and embedding rows can train. "
+                "Set explicitly in your config to silence."
             )
             self.peft.train_only_new_embedding_rows = False
 

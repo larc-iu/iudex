@@ -20,6 +20,10 @@
     // S-expression knobs.
     traversal_order: 'postorder',
     use_copy: true,
+    // Only meaningful when use_copy=false. true = hard-mask content
+    // positions to source_ids[cursor] (COPY-via-constraint). false =
+    // free content generation (Hu and Wan 2023's apparent setup).
+    constrain_content: true,
 
     peft: {
         r: 8,

@@ -242,6 +242,86 @@ def test_use_copy_false_predicts_source_ids(traversal_order):
     assert covered > 0, "no source ids were emitted under use_copy=False forced decode"
 
 
+def _toy_tree_3edu() -> RstTree:
+    actions = [
+        Shift(edu_text="Cats sleep."),
+        Shift(edu_text="Dogs bark."),
+        Reduce(nuc="NS", rel="elaboration"),
+        Shift(edu_text="Birds fly."),
+        Reduce(nuc="NS", rel="elaboration"),
+    ]
+    return RstTree.from_shift_reduce(actions, relation_types=[("elaboration", "rst")])
+
+
+@pytest.mark.parametrize("traversal_order", ["preorder", "postorder"])
+def test_predict_with_gold_edus_opens_exactly_n_edus_on_untrained_backbone(traversal_order):
+    """Regression for round-2 Fix 1. Gold-EDU forced decode must open
+    exactly len(gold_edus) leaves and close cleanly to EOS even on a
+    randomly-initialized backbone."""
+    parser = _build_parser(traversal_order, use_copy=True)
+    tree = _toy_tree_3edu()
+    gold_ranges = _gold_edu_source_ranges(parser.tokenizer, tree)
+    assert len(gold_ranges) == 3
+
+    pred = parser.predict_with_gold_edus(tree)
+    pred_ranges = getattr(pred, "_pred_edu_source_ranges", [])
+    assert len(pred.edus) == 3, f"expected 3 EDUs in predicted tree, got {len(pred.edus)}"
+    assert len(pred_ranges) == 3, f"expected 3 source ranges, got {pred_ranges}"
+    for (gs, ge), (ps, pe) in zip(gold_ranges, pred_ranges):
+        assert (ps, pe) == (gs, ge), f"gold {gs, ge} vs pred {ps, pe}"
+
+
+@pytest.mark.parametrize("traversal_order", ["preorder", "postorder"])
+def test_constrain_content_false_runs_end_to_end(traversal_order):
+    """Smoke test for round-2 Fix 3: use_copy=False + constrain_content=False
+    (free-content decoding) does forward + predict without crashing."""
+    cfg = DecoderOnlySexpConfig(
+        train_dir="<unused>",
+        dev_dir="<unused>",
+        model_name=SMALL_CAUSAL,
+        relation_types=[("elaboration", "rst")],
+        gradient_checkpointing=False,
+        amp=False,
+        max_input_length=128,
+        max_output_length=256,
+        min_edu_length=1,
+        traversal_order=traversal_order,
+        use_copy=False,
+        constrain_content=False,
+    )
+    try:
+        parser = DecoderOnlySexpParser(cfg)
+    except Exception as e:
+        pytest.skip(f"Could not load {SMALL_CAUSAL}: {e!r}")
+
+    pred = parser.predict_from_text("Cats sleep. Dogs bark.")
+    assert pred is not None
+
+    import torch
+
+    tree = _toy_tree()
+    input_ids, labels = parser.encode_target(tree)
+    batch = {
+        "input_ids": torch.tensor([input_ids], dtype=torch.long),
+        "attention_mask": torch.ones((1, len(input_ids)), dtype=torch.long),
+        "labels": torch.tensor([labels], dtype=torch.long),
+    }
+    parser.train()
+    out = parser(batch)
+    assert torch.isfinite(out["loss"]).item()
+
+
+def test_decoder_only_constrain_content_false_with_use_copy_true_raises():
+    with pytest.raises(ValueError, match="constrain_content=False requires use_copy=False"):
+        DecoderOnlySexpConfig(
+            train_dir="<unused>",
+            dev_dir="<unused>",
+            model_name=SMALL_CAUSAL,
+            use_copy=True,
+            constrain_content=False,
+        )
+
+
 @pytest.mark.parametrize("traversal_order", ["preorder", "postorder"])
 def test_use_copy_false_loss_is_finite_and_flows_to_lm_head(traversal_order):
     """Under use_copy=False the lm_head is the full pretrained head and must

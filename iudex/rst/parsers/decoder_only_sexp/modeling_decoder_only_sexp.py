@@ -35,7 +35,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.common.sexp_constraints import SexpDecodingState
+from iudex.rst.parsers.common.sexp_constraints import (
+    GoldEduForcer,
+    SexpDecodingState,
+)
 from iudex.rst.parsers.decoder_only_sexp.configuration_decoder_only_sexp import (
     DecoderOnlySexpConfig,
 )
@@ -643,6 +646,7 @@ class DecoderOnlySexpParser(nn.Module):
             copy_id=self.copy_token_id if self.config.use_copy else None,
             source_ids=tuple() if self.config.use_copy else tuple(),
             min_edu_length=int(self.config.min_edu_length),
+            constrain_content=bool(self.config.constrain_content),
         )
 
     def _state_for_source(self, source_ids: list[int]) -> SexpDecodingState:
@@ -657,6 +661,7 @@ class DecoderOnlySexpParser(nn.Module):
             copy_id=self.copy_token_id if self.config.use_copy else None,
             source_ids=tuple() if self.config.use_copy else tuple(source_ids),
             min_edu_length=int(self.config.min_edu_length),
+            constrain_content=bool(self.config.constrain_content),
         )
 
     # -----------------------------------------------------------------
@@ -699,19 +704,35 @@ class DecoderOnlySexpParser(nn.Module):
     ) -> torch.Tensor:
         """Mask logits to the SexpDecodingState's legal set. `logits` is a 1-D
         tensor in the model's native scoring space: head-vocab when
-        `use_copy=True`, full vocab when `use_copy=False`."""
+        `use_copy=True`, full vocab when `use_copy=False`. When the state
+        marks content as wildcarded (`use_copy=False, constrain_content=False`
+        inside a leaf or fresh frame), admit any non-structural id."""
         legal = state.legal_actions()
         masked = torch.full_like(logits, float("-inf"))
-        if not legal:
-            return masked
         if self.config.use_copy:
+            if not legal:
+                return masked
             for full_id in legal:
                 hi = self.head_idx_for_full_id.get(int(full_id))
                 if hi is not None:
                     masked[hi] = logits[hi]
-        else:
-            idx = torch.tensor(sorted(int(x) for x in legal), dtype=torch.long, device=logits.device)
-            masked[idx] = logits[idx]
+            return masked
+        # use_copy=False path.
+        V = int(logits.size(-1))
+        if state.content_is_wildcard():
+            masked.copy_(logits)
+            for fid in state.structural_ids():
+                if 0 <= int(fid) < V:
+                    masked[int(fid)] = float("-inf")
+            for full_id in legal:
+                fid = int(full_id)
+                if 0 <= fid < V:
+                    masked[fid] = logits[fid]
+            return masked
+        if not legal:
+            return masked
+        idx = torch.tensor(sorted(int(x) for x in legal), dtype=torch.long, device=logits.device)
+        masked[idx] = logits[idx]
         return masked
 
     def _decode_full_id(self, head_idx: int) -> int:
@@ -1004,16 +1025,18 @@ class DecoderOnlySexpParser(nn.Module):
     def _predict_one_gold_edu(self, tree: RstTree) -> RstTree:
         """Forced decode with gold EDU boundaries.
 
-        Forcing contract (shared with seq2seq_sexp / *_sr): leave structure
-        free, force boundaries.
+        Forcing contract (shared with seq2seq_sexp): segmentation matches
+        gold by construction.
 
-        - Inside a leaf frame: force content tokens until the cursor reaches
-          the current gold EDU's end, then force CLOSE.
-        - Outside a leaf frame: let the model pick freely from
-          `SexpDecodingState.legal_actions()`.
+        - Outside a leaf with more leaves to open: force OPEN (or content
+          for preorder fresh-frames where OPEN isn't legal).
+        - Inside a leaf, cursor below the gold end: force content
+          (`<copy>` / source id).
+        - Inside a leaf, cursor at the gold end: force CLOSE.
+        - After all leaves closed and inside internal nodes: force CLOSE
+          until depth==0, then force EOS.
 
-        Segmentation matches gold by construction. Tree shape and labels
-        come from the model.
+        Tree shape and labels come from the model.
         """
         self.eval()
         device = next(self.parameters()).device
@@ -1035,10 +1058,8 @@ class DecoderOnlySexpParser(nn.Module):
         if not clamped_ranges:
             return _empty_tree(self.config.relation_types)
         n_edus = len(clamped_ranges)
-        edu_idx = 0
+        forcer = GoldEduForcer(n_edus, clamped_ranges)
 
-        # Gold-EDU forcing honors gold spans exactly. Disable
-        # min_edu_length so a short gold EDU isn't blocked from closing.
         state = dataclasses.replace(self._state_for_source(source_ids), min_edu_length=1)
 
         with self._inference_mode():
@@ -1060,44 +1081,32 @@ class DecoderOnlySexpParser(nn.Module):
             hit_max_len = False
 
             for step in range(self.config.max_output_length):
-                legal = state.legal_actions()
-                in_leaf = state.in_edu_leaf
-                if in_leaf and edu_idx < n_edus:
-                    target_end = clamped_ranges[edu_idx][1]
-                    if state.cursor < target_end:
-                        # Mid-EDU: force a content token (no close).
-                        narrowed = set(legal) - {self.close_token_id}
-                    else:
-                        # At EDU end: force CLOSE.
-                        narrowed = {self.close_token_id} if self.close_token_id in legal else set(legal)
-                    if not narrowed:
-                        narrowed = set(legal)
+                narrowed = forcer.narrowed_legal(state)
+                if narrowed is not None and len(narrowed) == 1:
+                    full_id = int(next(iter(narrowed)))
                 else:
-                    # Outside a leaf: let the model choose freely; the
-                    # SexpDecodingState already enforces validity.
-                    narrowed = set(legal)
-
-                idx_t = torch.tensor(
-                    sorted(self.head_idx_for_full_id[int(x)] for x in narrowed)
-                    if self.config.use_copy
-                    else sorted(int(x) for x in narrowed),
-                    dtype=torch.long,
-                    device=logits.device,
-                )
-                masked = torch.full_like(logits, float("-inf"))
-                if idx_t.numel() > 0:
-                    masked[idx_t] = logits[idx_t]
-                head_idx = int(masked.argmax(-1).item())
-                full_id = self._decode_full_id(head_idx)
+                    masked = self._mask_logits_for_state(logits, state)
+                    if narrowed is not None:
+                        V = int(masked.size(-1))
+                        keep = torch.full_like(masked, float("-inf"))
+                        for fid in narrowed:
+                            hi = self.head_idx_for_full_id.get(int(fid)) if self.config.use_copy else int(fid)
+                            if hi is not None and 0 <= int(hi) < V:
+                                keep[int(hi)] = masked[int(hi)]
+                        masked = keep
+                    head_idx = int(masked.argmax(-1).item())
+                    full_id = self._decode_full_id(head_idx)
 
                 closing_leaf = full_id == self.close_token_id and bool(state.stack) and state.stack[-1].kind == "leaf"
                 pre_cursor = state.cursor
+                before_state = state
                 try:
                     state = state.step(full_id)
                 except ValueError:
                     done = True
                     break
                 emitted_ids.append(full_id)
+                forcer.observe(before_state, state, full_id)
 
                 if full_id == eos_id:
                     done = True
@@ -1108,7 +1117,6 @@ class DecoderOnlySexpParser(nn.Module):
                 if closing_leaf and leaf_start is not None:
                     pred_edu_ranges.append((leaf_start, state.cursor))
                     leaf_start = None
-                    edu_idx += 1
 
                 if self.config.use_copy and full_id == self.copy_token_id:
                     src_pos = state.cursor - 1

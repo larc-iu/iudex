@@ -314,6 +314,42 @@ def test_use_copy_false_predicts_source_ids(traversal_order):
     assert covered > 0, "no source ids were emitted under use_copy=False forced decode"
 
 
+def _toy_tree_3edu() -> RstTree:
+    actions = [
+        Shift(edu_text="Cats sleep."),
+        Shift(edu_text="Dogs bark."),
+        Reduce(nuc="NS", rel="elaboration"),
+        Shift(edu_text="Birds fly."),
+        Reduce(nuc="NS", rel="elaboration"),
+    ]
+    return RstTree.from_shift_reduce(actions, relation_types=[("elaboration", "rst")])
+
+
+@pytest.mark.parametrize("traversal_order", ["preorder", "postorder"])
+def test_predict_with_gold_edus_opens_exactly_n_edus_on_untrained_backbone(traversal_order):
+    """Regression for round-2 Fix 1. Gold-EDU forced decode must open
+    exactly len(gold_edus) leaves and close cleanly to EOS even on a
+    randomly-initialized backbone, with each predicted EDU's source range
+    matching the corresponding gold range. Previously the postorder loop
+    could spin OPEN until max_output_length on untrained models."""
+    parser = _variant_parser(traversal_order, use_copy=True)
+    tree = _toy_tree_3edu()
+    gold_ranges = _gold_edu_source_ranges(parser.tokenizer, tree)
+    assert len(gold_ranges) == 3
+
+    pred = parser.predict_with_gold_edus(tree)
+    pred_ranges = getattr(pred, "_pred_edu_source_ranges", [])
+    # Force contract: exactly n EDUs opened and closed, ranges match gold.
+    assert len(pred.edus) == 3, f"expected 3 EDUs in predicted tree, got {len(pred.edus)}"
+    # _pred_edu_source_ranges may be empty if the sexp parser fell back, but
+    # under the new forcing logic it shouldn't.
+    assert len(pred_ranges) == 3, f"expected 3 source ranges, got {pred_ranges}"
+    # Ranges should match gold exactly (with possible end clamp for
+    # truncation, but text is short enough to fit).
+    for (gs, ge), (ps, pe) in zip(gold_ranges, pred_ranges):
+        assert (ps, pe) == (gs, ge), f"gold {gs, ge} vs pred {ps, pe}"
+
+
 @pytest.mark.parametrize("traversal_order", ["preorder", "postorder"])
 def test_use_copy_false_loss_is_finite_and_flows_to_lm_head(traversal_order):
     """Under use_copy=False the full pretrained lm_head must receive gradient
@@ -346,3 +382,67 @@ def test_use_copy_false_loss_is_finite_and_flows_to_lm_head(traversal_order):
     loss.backward()
     assert lm_head_weight.grad is not None
     assert lm_head_weight.grad.abs().sum().item() > 0.0
+
+
+@pytest.mark.parametrize("traversal_order", ["preorder", "postorder"])
+def test_constrain_content_false_runs_end_to_end(traversal_order):
+    """Smoke test for round-2 Fix 3: use_copy=False + constrain_content=False
+    (free-content decoding) does forward + predict without crashing."""
+    cfg = Seq2SeqSexpConfig(
+        train_dir="<unused>",
+        dev_dir="<unused>",
+        model_name=SMALL_SEQ2SEQ,
+        relation_types=[("elaboration", "rst")],
+        gradient_checkpointing=False,
+        amp=False,
+        max_input_length=128,
+        max_output_length=128,
+        min_edu_length=1,
+        traversal_order=traversal_order,
+        use_copy=False,
+        constrain_content=False,
+    )
+    try:
+        parser = Seq2SeqSexpParser(cfg)
+    except Exception as e:
+        pytest.skip(f"Could not load {SMALL_SEQ2SEQ}: {e!r}")
+
+    tree = _toy_tree()
+    pred = parser.predict_from_text("Cats sleep. Dogs bark.")
+    assert pred is not None
+
+    import torch
+
+    labels, decoder_input_ids = parser.encode_target(tree)
+    text = _reconstruct_text(tree)
+    inp = parser.encode_input(text)
+    batch = {
+        "input_ids": torch.tensor([inp["input_ids"]], dtype=torch.long),
+        "attention_mask": torch.tensor([inp["attention_mask"]], dtype=torch.long),
+        "labels": torch.tensor([labels], dtype=torch.long),
+        "decoder_input_ids": torch.tensor([decoder_input_ids], dtype=torch.long),
+    }
+    parser.train()
+    out = parser(batch)
+    assert torch.isfinite(out["loss"]).item()
+
+
+def test_constrain_content_true_with_use_copy_true_is_default():
+    cfg = Seq2SeqSexpConfig(
+        train_dir="<unused>",
+        dev_dir="<unused>",
+        model_name="google-t5/t5-small",
+        use_copy=True,
+    )
+    assert cfg.constrain_content is True
+
+
+def test_constrain_content_false_with_use_copy_true_raises():
+    with pytest.raises(ValueError, match="constrain_content=False requires use_copy=False"):
+        Seq2SeqSexpConfig(
+            train_dir="<unused>",
+            dev_dir="<unused>",
+            model_name="google-t5/t5-small",
+            use_copy=True,
+            constrain_content=False,
+        )

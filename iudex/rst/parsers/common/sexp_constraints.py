@@ -83,6 +83,15 @@ class SexpDecodingState:
     # cannot commit.
     min_edu_length: int = 1
 
+    # When True (default) AND use_copy=False, content positions are masked
+    # to the single source id at `source_ids[cursor]` (COPY-via-constraint).
+    # When False AND use_copy=False, content positions admit any non-
+    # structural token id. This mirrors Hu and Wan 2023's apparent setup
+    # (free content generation, the model must learn to copy via attention).
+    # No-op when use_copy=True (the COPY token is the sole legal content
+    # action regardless).
+    constrain_content: bool = True
+
     cursor: int = 0
     depth: int = 0
     stack: Tuple[_Frame, ...] = ()  # one frame per currently open span
@@ -196,15 +205,56 @@ class SexpDecodingState:
             legal.append(self.close_id)
         return frozenset(legal)
 
+    def content_is_wildcard(self) -> bool:
+        """True iff `legal_actions()` is currently the disjoint union of its
+        returned structural ids plus the "any non-structural vocab id" wildcard.
+        Only possible when `use_copy=False` and `constrain_content=False` AND
+        the state is at a content-emit position (in a leaf or fresh frame
+        before source exhaustion).
+        """
+        if self.use_copy or self.constrain_content:
+            return False
+        if self.cursor >= self.source_len:
+            return False
+        if not self.stack:
+            return False
+        top = self.stack[-1]
+        if top.kind == "leaf":
+            return True
+        if top.kind is None:
+            # Fresh frame: content is one of the legal first actions.
+            return True
+        return False
+
+    def structural_ids(self) -> FrozenSet[int]:
+        """All structural token ids (open, close, labels, eos, copy, edu
+        placeholder). Callers use this to mask the wildcard content slot
+        in `constrain_content=False` mode."""
+        ids: set[int] = {self.open_id, self.close_id, self.eos_id}
+        ids.update(int(x) for x in self.label_ids)
+        if self.copy_id is not None:
+            ids.add(int(self.copy_id))
+        if self.edu_placeholder_id is not None:
+            ids.add(int(self.edu_placeholder_id))
+        return frozenset(ids)
+
     def _content_legal(self) -> List[int]:
-        """Source-content tokens that are legal *right now*. Either the single
-        <copy> token (use_copy=True) or the one source subword id that matches
-        source_ids[cursor] (use_copy=False)."""
+        """Source-content tokens legal *right now*.
+
+        use_copy=True: the single `<copy>` token.
+        use_copy=False, constrain_content=True (default): the one source
+            subword id at `source_ids[cursor]` (COPY-via-constraint).
+        use_copy=False, constrain_content=False: returns the empty list.
+            Content is wildcarded. The caller checks `content_is_wildcard()`
+            and admits the full vocab minus `structural_ids()`.
+        """
         if self.cursor >= self.source_len:
             return []
         if self.use_copy:
             return [self.copy_id]  # type: ignore[list-item]
-        return [self.source_ids[self.cursor]]
+        if self.constrain_content:
+            return [self.source_ids[self.cursor]]
+        return []
 
     def _can_close(self) -> bool:
         """Whether closing the innermost span is legal right now (i.e. the
@@ -335,14 +385,21 @@ class SexpDecodingState:
                 new_top = replace(top, label_emitted=True)
             return replace(self, stack=self.stack[:-1] + (new_top,))
 
-        # Action: content token (<copy> or source-id)
+        # Action: content token (<copy>, source-id, or wildcard non-structural)
         is_content = False
         if self.use_copy:
             if action_id == self.copy_id:
                 is_content = True
         else:
-            if self.cursor < self.source_len and action_id == self.source_ids[self.cursor]:
-                is_content = True
+            if self.cursor < self.source_len:
+                if self.constrain_content:
+                    is_content = action_id == self.source_ids[self.cursor]
+                else:
+                    # Anything not already in the structural ids consumed above
+                    # counts as content. Since we already early-returned on
+                    # open / close / label / placeholder / eos / copy, just
+                    # reaching here under constrain_content=False means content.
+                    is_content = True
         if is_content:
             if top.kind == "internal":
                 raise ValueError("Source content emitted inside an internal node slot.")
@@ -373,6 +430,7 @@ def make_initial_state(
     source_ids: Optional[List[int]] = None,
     edu_placeholder_id: Optional[int] = None,
     min_edu_length: int = 1,
+    constrain_content: bool = True,
 ) -> SexpDecodingState:
     return SexpDecodingState(
         source_len=source_len,
@@ -386,4 +444,160 @@ def make_initial_state(
         source_ids=tuple(source_ids or ()),
         edu_placeholder_id=edu_placeholder_id,
         min_edu_length=int(min_edu_length),
+        constrain_content=bool(constrain_content),
     )
+
+
+class GoldEduForcer:
+    """Drive a `SexpDecodingState` to emit exactly `n_edus_target` leaves
+    matching the gold ranges, regardless of how (un)trained the model is.
+
+    Strategy: a right-leaning binary spine. At every kind=None frame holding
+    k leaves in its subtree, force OPEN (internal) when k>=2 or force a
+    content emission (leaf) when k==1. Each internal node's left child is
+    the recursive subtree with k-1 leaves. Its right child is the kth leaf.
+
+    Tree shape is fixed by this forcing strategy. Only the LABEL slot and
+    the `<copy>`-vs-source content token choice are left to the model (the
+    latter is moot under `use_copy=True` or `constrain_content=True`).
+
+    Usage:
+        forcer = GoldEduForcer(n_edus_target, gold_ranges)
+        for step in ...:
+            forced = forcer.next_forced(state)
+            ... use forced if not None, else model.argmax ...
+            new_state = state.step(chosen_id)
+            forcer.observe(state, new_state, chosen_id)
+            state = new_state
+    """
+
+    def __init__(self, n_edus_target: int, gold_ranges: List[tuple]) -> None:
+        if n_edus_target != len(gold_ranges):
+            raise ValueError(f"n_edus_target={n_edus_target} != len(gold_ranges)={len(gold_ranges)}.")
+        self.n_edus_target = int(n_edus_target)
+        self.gold_ranges = list(gold_ranges)
+        self.closed_leaves = 0
+        # subtree_sizes[i] = number of leaves the i-th open frame's subtree
+        # should hold. Maintained parallel to `state.stack`.
+        self._subtree_sizes: List[int] = []
+
+    @property
+    def opened_leaves(self) -> int:
+        return self.closed_leaves
+
+    def _current_target_end(self) -> Optional[int]:
+        if self.closed_leaves >= self.n_edus_target:
+            return None
+        return self.gold_ranges[self.closed_leaves][1]
+
+    def next_forced(self, state: SexpDecodingState) -> Optional[int]:
+        """Single-action force, or None to defer to `narrowed_legal()`."""
+        narrowed = self.narrowed_legal(state)
+        if narrowed is None or len(narrowed) != 1:
+            return None
+        return next(iter(narrowed))
+
+    def narrowed_legal(self, state: SexpDecodingState) -> Optional[FrozenSet[int]]:
+        """Subset of `state.legal_actions()` consistent with the gold-EDU
+        plan. None means no narrowing (use the model's argmax over the full
+        legal set). Empty (in practice never returned) means "no legal
+        action matches the plan", which would indicate a logic bug.
+
+        When the returned set has 1 element, the caller can short-circuit
+        and emit that id. When it has more (e.g. all label ids at a
+        preorder internal slot), the caller masks logits to that set and
+        argmaxes.
+        """
+        if state.is_terminal():
+            return None
+        legal = state.legal_actions()
+
+        # Inside an active leaf: force content or CLOSE.
+        if state.in_edu_leaf and self.closed_leaves < self.n_edus_target:
+            target_end = self._current_target_end()
+            if target_end is None:
+                return None
+            if state.cursor < target_end:
+                if state.use_copy:
+                    return frozenset({state.copy_id}) if state.copy_id in legal else None
+                if state.constrain_content:
+                    if state.cursor >= state.source_len:
+                        return None
+                    return frozenset({state.source_ids[state.cursor]})
+                # Free content: narrow to "non-structural" via the wildcard.
+                # The mask helper expands the wildcard. We just signal no narrowing.
+                return None
+            return frozenset({state.close_id}) if state.close_id in legal else None
+
+        # Pre-root: force OPEN.
+        if state.depth == 0 and not state.root_emitted:
+            if self.n_edus_target == 0:
+                return frozenset({state.eos_id}) if state.eos_id in legal else None
+            return frozenset({state.open_id}) if state.open_id in legal else None
+
+        if not state.stack:
+            # Post-root: tree closed. Force EOS.
+            if state.cursor == state.source_len and state.root_emitted:
+                return frozenset({state.eos_id}) if state.eos_id in legal else None
+            return None
+
+        top = state.stack[-1]
+        top_target = self._subtree_sizes[-1] if self._subtree_sizes else self.n_edus_target
+
+        if top.kind == "internal":
+            if top.children_emitted < 2:
+                return frozenset({state.open_id}) if state.open_id in legal else None
+            if state.traversal_order == "postorder" and not top.label_emitted:
+                # Let the model pick the label, but constrain to label_ids.
+                return frozenset(state.label_ids) & legal
+            return frozenset({state.close_id}) if state.close_id in legal else None
+
+        # top.kind is None: fresh frame. Decide leaf vs internal by target.
+        if top_target <= 1:
+            # Force first content token.
+            if state.use_copy:
+                return frozenset({state.copy_id}) if state.copy_id in legal else None
+            if state.constrain_content and state.cursor < state.source_len:
+                content_id = state.source_ids[state.cursor]
+                return frozenset({content_id}) if content_id in legal else None
+            return None
+        # top_target >= 2: this frame is internal.
+        if state.traversal_order == "preorder":
+            # In preorder the first action inside an internal node is the LABEL.
+            return frozenset(state.label_ids) & legal
+        # Postorder: first action inside an internal is OPEN of its first child.
+        return frozenset({state.open_id}) if state.open_id in legal else None
+
+    def observe(self, before: SexpDecodingState, after: SexpDecodingState, action_id: int) -> None:
+        """Update the parallel subtree-size stack to mirror `after.stack`."""
+        before_top = before.stack[-1] if before.stack else None
+        # Leaf close detection.
+        if action_id == before.close_id and before_top is not None and before_top.kind == "leaf":
+            self.closed_leaves += 1
+
+        # Sync the subtree-size stack length with the new stack.
+        before_depth = len(before.stack)
+        after_depth = len(after.stack)
+        if after_depth > before_depth:
+            # A new frame was pushed. Its target = parent_remaining - (right-leaf slot if applicable).
+            # Right-spine: when a frame's subtree_size is k>=2, its first child
+            # gets k-1 and its second child gets 1.
+            parent_target = self._subtree_sizes[-1] if self._subtree_sizes else self.n_edus_target
+            parent_top_before = before.stack[-1] if before.stack else None
+            # Determine which child slot was just opened.
+            if parent_top_before is None or parent_top_before.kind is None:
+                # First-ever frame (pre-root) OR fresh-frame-just-became-internal-via-OPEN.
+                # In the pre-root case the new frame inherits n_edus_target.
+                child_size = parent_target if not self._subtree_sizes else (parent_target - 1)
+            else:
+                # parent_top_before.kind == "internal" with some children_emitted count.
+                children_emitted_before = parent_top_before.children_emitted
+                if children_emitted_before == 0:
+                    child_size = parent_target - 1  # left child gets k-1 leaves
+                else:
+                    child_size = 1  # right child gets 1 leaf
+            self._subtree_sizes.append(max(1, int(child_size)))
+        elif after_depth < before_depth:
+            # A frame was popped (close).
+            if self._subtree_sizes:
+                self._subtree_sizes.pop()

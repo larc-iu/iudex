@@ -1,15 +1,16 @@
-"""Parity test for the unified gold-EDU forcing contract across all four
+"""Parity test for the unified gold-EDU forcing contract across the four
 parsers (seq2seq_sr, decoder_only_sr, seq2seq_sexp, decoder_only_sexp).
 
-Contract (Fix 2): "force boundaries, leave structure free." Inside a leaf
-frame, force content tokens until the cursor reaches the gold EDU's end,
-then force a close / shift. Outside a leaf frame, let the model pick
-freely from the constraint-state's legal set.
+Sexp contract (Round-2 Fix 1): force EXACTLY `n_edus_target` leaves via
+a `GoldEduForcer` (right-spine planner) so even untrained backbones
+terminate cleanly. Inside a leaf, force content / close. Outside a leaf,
+force OPEN until all leaves are planted, then force CLOSE to root + EOS.
+Tree shape is fixed by the forcer. Only label slots and use_copy/
+constrain_content content choices remain free.
 
-For the sexp pair this means the docstrings and the inside-leaf forcing
-logic look the same shape. We assert the docstring contract here and that
-each parser's `_predict_one_gold_edu` runs end-to-end on a toy tree
-without exceptions.
+For the sexp pair we assert the docstrings mention the boundary / leaf
+contract and that each parser's `_predict_one_gold_edu` runs end-to-end
+on a toy tree without exceptions.
 """
 
 import os
@@ -35,20 +36,20 @@ def _toy_tree() -> RstTree:
     return RstTree.from_shift_reduce(actions, relation_types=[("elaboration", "rst")])
 
 
-def test_seq2seq_sexp_gold_edu_docstring_says_structure_free():
+def test_seq2seq_sexp_gold_edu_docstring_mentions_contract():
     from iudex.rst.parsers.seq2seq_sexp.modeling_seq2seq_sexp import Seq2SeqSexpParser
 
-    doc = Seq2SeqSexpParser._predict_one_gold_edu.__doc__ or ""
-    assert "force boundaries" in doc.lower() or "boundaries" in doc.lower()
-    assert "structure free" in doc.lower() or "structure" in doc.lower()
+    doc = (Seq2SeqSexpParser._predict_one_gold_edu.__doc__ or "").lower()
+    assert "boundaries" in doc or "gold" in doc
+    assert "leaf" in doc or "structure" in doc
 
 
-def test_decoder_only_sexp_gold_edu_docstring_says_structure_free():
+def test_decoder_only_sexp_gold_edu_docstring_mentions_contract():
     from iudex.rst.parsers.decoder_only_sexp.modeling_decoder_only_sexp import DecoderOnlySexpParser
 
-    doc = DecoderOnlySexpParser._predict_one_gold_edu.__doc__ or ""
-    assert "force boundaries" in doc.lower() or "boundaries" in doc.lower()
-    assert "structure free" in doc.lower() or "structure" in doc.lower()
+    doc = (DecoderOnlySexpParser._predict_one_gold_edu.__doc__ or "").lower()
+    assert "boundaries" in doc or "gold" in doc
+    assert "leaf" in doc or "structure" in doc
 
 
 def _build_seq2seq_sexp():
@@ -113,10 +114,9 @@ def test_gold_edu_runs_and_ranges_are_monotone(build):
 
 
 def test_sexp_parsers_use_same_gold_edu_strategy_keywords():
-    """Both sexp parsers' `_predict_one_gold_edu` source mentions the
-    in-leaf forcing pattern ("force content" / "force close"). Catches
-    accidental drift back to a left-spine skeleton or other shape-pinning
-    strategy."""
+    """Both sexp parsers' `_predict_one_gold_edu` source uses the shared
+    `GoldEduForcer` planner and drives off clamped gold ranges. Catches
+    accidental drift back to a per-parser ad hoc loop."""
     import inspect
 
     from iudex.rst.parsers.decoder_only_sexp.modeling_decoder_only_sexp import DecoderOnlySexpParser
@@ -124,8 +124,6 @@ def test_sexp_parsers_use_same_gold_edu_strategy_keywords():
 
     for cls in (Seq2SeqSexpParser, DecoderOnlySexpParser):
         src = inspect.getsource(cls._predict_one_gold_edu)
-        assert "in_edu_leaf" in src, f"{cls.__name__}._predict_one_gold_edu doesn't gate on in_edu_leaf"
+        assert "GoldEduForcer" in src, f"{cls.__name__}._predict_one_gold_edu doesn't use GoldEduForcer"
         assert "clamped_ranges" in src, f"{cls.__name__}._predict_one_gold_edu lost the clamped-ranges drive"
-        # The retired skeleton strategy used these sentinels — make sure
-        # they're gone.
         assert '"LABEL"' not in src, f"{cls.__name__} still uses LABEL sentinel"

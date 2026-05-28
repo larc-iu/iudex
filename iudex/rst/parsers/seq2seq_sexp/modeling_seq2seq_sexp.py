@@ -36,7 +36,10 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import Reduce, RstTree, Shift
-from iudex.rst.parsers.common.sexp_constraints import SexpDecodingState
+from iudex.rst.parsers.common.sexp_constraints import (
+    GoldEduForcer,
+    SexpDecodingState,
+)
 from iudex.rst.parsers.seq2seq_sexp.configuration_seq2seq_sexp import Seq2SeqSexpConfig
 
 logger = logging.getLogger(__name__)
@@ -656,6 +659,7 @@ class Seq2SeqSexpParser(nn.Module):
             copy_id=self.copy_token_id if self.config.use_copy else None,
             source_ids=tuple(source_ids) if not self.config.use_copy else (),
             min_edu_length=int(self.config.min_edu_length),
+            constrain_content=bool(self.config.constrain_content),
         )
 
     def _full_ids_to_head_mask(self, state: SexpDecodingState, head_V: int) -> torch.Tensor:
@@ -664,7 +668,8 @@ class Seq2SeqSexpParser(nn.Module):
         `use_copy=True`: scoring vocab is the small action head, so map legal
             full-vocab ids through `head_idx_for_full_id`.
         `use_copy=False`: scoring vocab IS the full tokenizer vocab; legal
-            ids are used directly as positions in the mask.
+            ids are used directly as positions in the mask. When the state
+            says content is wildcarded, admit any non-structural id.
         """
         legal = state.legal_actions()
         mask = torch.zeros(head_V, dtype=torch.bool)
@@ -673,7 +678,18 @@ class Seq2SeqSexpParser(nn.Module):
                 hi = self.head_idx_for_full_id.get(int(full_id))
                 if hi is not None:
                     mask[hi] = True
-        else:
+            return mask
+        for full_id in legal:
+            fid = int(full_id)
+            if 0 <= fid < head_V:
+                mask[fid] = True
+        if state.content_is_wildcard():
+            mask[:] = True
+            for fid in state.structural_ids():
+                if 0 <= int(fid) < head_V:
+                    mask[int(fid)] = False
+            # Re-enable explicitly-legal structural ids (e.g. close paren may
+            # be the lone structural legal here, we want it back in the mask).
             for full_id in legal:
                 fid = int(full_id)
                 if 0 <= fid < head_V:
@@ -994,17 +1010,19 @@ class Seq2SeqSexpParser(nn.Module):
     def _predict_one_gold_edu(self, tree: RstTree) -> RstTree:
         """Forced decode with gold EDU boundaries.
 
-        Forcing contract (shared with decoder_only_sexp / *_sr): leave
-        structure free, force boundaries.
+        Forcing contract (shared with decoder_only_sexp): segmentation
+        matches gold by construction.
 
-        - Inside a leaf frame: force a content token (`<copy>` or source id)
-          until the cursor reaches the current gold EDU's end, then force
-          CLOSE.
-        - Outside a leaf frame: let the model pick freely from
-          `SexpDecodingState.legal_actions()`.
+        - Outside a leaf with more leaves to open: force OPEN (or content
+          for preorder fresh-frames where OPEN isn't legal).
+        - Inside a leaf, cursor below the gold end: force content
+          (`<copy>` / source id).
+        - Inside a leaf, cursor at the gold end: force CLOSE.
+        - After all leaves closed and inside internal nodes: force CLOSE
+          until depth==0, then force EOS.
 
-        Segmentation matches gold by construction. Tree shape and labels
-        come from the model.
+        Tree shape (which OPENs hold internal vs leaf children) and labels
+        come from the model. Segmentation is gold by construction.
         """
         self.eval()
         device = next(self.parameters()).device
@@ -1024,7 +1042,6 @@ class Seq2SeqSexpParser(nn.Module):
         if not source_ids:
             return _empty_tree(self.config.relation_types)
 
-        # Clamp gold ranges to (possibly truncated) source.
         clamped_ranges: list[tuple[int, int]] = []
         for s, e in gold_ranges:
             if s >= source_len:
@@ -1033,7 +1050,7 @@ class Seq2SeqSexpParser(nn.Module):
         if not clamped_ranges:
             return _empty_tree(self.config.relation_types)
         n_edus = len(clamped_ranges)
-        edu_idx = 0
+        forcer = GoldEduForcer(n_edus, clamped_ranges)
 
         gc_active = self.config.gradient_checkpointing
         if gc_active:
@@ -1042,8 +1059,6 @@ class Seq2SeqSexpParser(nn.Module):
             encoder = self.model.get_encoder()
             enc_out = encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], return_dict=True)
 
-            # Gold-EDU forcing honors gold spans exactly. Disable
-            # min_edu_length so a short gold EDU isn't blocked from closing.
             state = dataclasses.replace(self._initial_state(source_ids), min_edu_length=1)
             action_seq: list[int] = []
             decoder_input_ids = torch.full((1, 1), self.decoder_start_token_id, device=device, dtype=torch.long)
@@ -1066,42 +1081,32 @@ class Seq2SeqSexpParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[0, -1, :]
 
-                legal = state.legal_actions()
-                if state.in_edu_leaf and edu_idx < n_edus:
-                    target_end = clamped_ranges[edu_idx][1]
-                    if state.cursor < target_end:
-                        narrowed = set(legal) - {self.close_token_id}
-                    else:
-                        narrowed = {self.close_token_id} if self.close_token_id in legal else set(legal)
-                    if not narrowed:
-                        narrowed = set(legal)
-                else:
-                    narrowed = set(legal)
-
-                if self.config.use_copy:
-                    head_indices = sorted(
-                        self.head_idx_for_full_id[int(x)] for x in narrowed if int(x) in self.head_idx_for_full_id
-                    )
+                narrowed = forcer.narrowed_legal(state)
+                if narrowed is not None and len(narrowed) == 1:
+                    full_id = int(next(iter(narrowed)))
                 else:
                     V = int(logits.size(-1))
-                    head_indices = sorted(int(x) for x in narrowed if 0 <= int(x) < V)
-                masked = torch.full_like(logits, float("-inf"))
-                if head_indices:
-                    idx_t = torch.tensor(head_indices, dtype=torch.long, device=logits.device)
-                    masked[idx_t] = logits[idx_t]
-                head_idx = int(masked.argmax(-1).item())
-                full_id = self.full_id_for_head_idx[head_idx] if self.config.use_copy else head_idx
+                    mask = self._full_ids_to_head_mask(state, V).to(logits.device)
+                    if narrowed is not None:
+                        # Multi-element narrowing (e.g. label slot). Intersect.
+                        keep = torch.zeros_like(mask)
+                        for fid in narrowed:
+                            hi = self.head_idx_for_full_id.get(int(fid)) if self.config.use_copy else int(fid)
+                            if hi is not None and 0 <= int(hi) < V:
+                                keep[int(hi)] = True
+                        mask = mask & keep
+                    masked = torch.where(mask, logits, torch.full_like(logits, float("-inf")))
+                    head_idx = int(masked.argmax(-1).item())
+                    full_id = self.full_id_for_head_idx[head_idx] if self.config.use_copy else head_idx
 
-                closing_leaf = full_id == self.close_token_id and bool(state.stack) and state.stack[-1].kind == "leaf"
                 action_seq.append(full_id)
+                before_state = state
                 try:
                     state = state.step(full_id)
                 except ValueError:
                     done = True
                     break
-
-                if closing_leaf:
-                    edu_idx += 1
+                forcer.observe(before_state, state, full_id)
 
                 if full_id == self.tokenizer.eos_token_id:
                     done = True

@@ -20,6 +20,10 @@
     // S-expression knobs. `use_copy` is the registry's signature_field.
     traversal_order: 'postorder',
     use_copy: true,
+    // Only meaningful when use_copy=false. true = hard-mask content
+    // positions to source_ids[cursor] (COPY-via-constraint). false =
+    // free content generation (Hu and Wan 2023's apparent setup).
+    constrain_content: true,
 
     // LoRA on the causal LM. When use_copy=true the lm_head is replaced at
     // parser init with a small fresh head over the action vocab; when
