@@ -1,10 +1,100 @@
 import copy
 import logging
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import List, Mapping, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Shift-reduce action types
+# ---------------------------------------------------------------------------
+# Bottom-up RST shift-reduce serializes a binary tree as a flat sequence of
+# Shift (push next EDU onto the stack) and Reduce (combine top two stack
+# items) actions. These dataclasses are the structured form; serialization
+# to the bracketed special-token strings the seq2seq tokenizer wants lives
+# in `actions_to_strings` / `strings_to_actions` below.
+#
+# Why a structured form: the (nuc, rel) -> token-string mapping squashes
+# non-alphanumerics, so it's not invertible without a lookup table.
+# Round-trips through structured actions are invertible by construction.
+
+
+@dataclass(frozen=True)
+class Shift:
+    # Populated by `RstTree.to_shift_reduce(include_text=True)`; left as
+    # None for the action-only serialization. Stored as a single space-
+    # separated string (RstTree's storage convention), not pre-tokenized.
+    edu_text: Optional[str] = None
+
+    def to_token(self) -> str:
+        return "<shift>"
+
+
+@dataclass(frozen=True)
+class Reduce:
+    nuc: str  # "NS" | "SN" | "NN"
+    rel: str  # original (pre-normalization) relation name
+
+    def to_token(self) -> str:
+        # Lowercased nuclearity + relation with non-alphanumerics squashed
+        # to '_'. Lossy, hence the parser-side `reduce_token_map`.
+        return f"<reduce_{self.nuc.lower()}_{re.sub(r'[^a-z0-9]+', '_', self.rel.lower())}>"
+
+
+ShiftReduceAction = Union[Shift, Reduce]
+
+
+def actions_to_strings(actions: List[ShiftReduceAction]) -> List[str]:
+    """Flatten an action list into the bracketed-token string sequence the
+    seq2seq tokenizer consumes. Whitespace-splits any `Shift.edu_text` and
+    interleaves the resulting tokens before each `<shift>`. Action-only
+    serializations (every `Shift.edu_text is None`) produce a pure action
+    sequence."""
+    out: List[str] = []
+    for a in actions:
+        if isinstance(a, Shift):
+            if a.edu_text is not None:
+                out.extend(a.edu_text.split(" "))
+            out.append(a.to_token())
+        elif isinstance(a, Reduce):
+            out.append(a.to_token())
+        else:
+            raise TypeError(f"actions_to_strings: unknown action type {type(a).__name__!r}")
+    return out
+
+
+def strings_to_actions(
+    tokens: List[str],
+    reduce_token_map: Mapping[str, Tuple[str, str]],
+) -> List[ShiftReduceAction]:
+    """Inverse of `actions_to_strings`. `reduce_token_map` maps known
+    `<reduce_*>` token strings back to `(nuc, rel)` pairs (built by the
+    seq2seq parser from `cfg.relation_types`). Anything that isn't
+    `<shift>` or a key in the map is treated as a surface token belonging
+    to the next `Shift` (joined with spaces into its `edu_text`)."""
+    out: List[ShiftReduceAction] = []
+    pending: List[str] = []
+    for t in tokens:
+        if t == "<shift>":
+            # Always non-None: "" is a valid degenerate EDU (rare; happens
+            # when a decoded source subword collapses to whitespace and
+            # `.split()` drops it).
+            out.append(Shift(edu_text=" ".join(pending)))
+            pending = []
+        elif t in reduce_token_map:
+            nuc, rel = reduce_token_map[t]
+            out.append(Reduce(nuc=nuc, rel=rel))
+        else:
+            pending.append(t)
+    if pending:
+        raise ValueError(
+            f"strings_to_actions: {len(pending)} surface token(s) after the last action; "
+            f"the sequence is malformed. Trailing tokens: {pending[:5]!r}..."
+        )
+    return out
 
 
 def _ddict2dict(d):
@@ -410,31 +500,126 @@ class RstTree:
 
         return render(self._build_binary_tree())
 
-    def to_shift_reduce(self, ltr: bool = True) -> List[Tuple[str, ...]]:
-        """Serialize as a chain of shift/reduce actions. Each action is either
-        `("S",)` (shift the next EDU) or `("R", nuclearity, relation)` (combine
-        the top two stack items, with `nuclearity` in {NS, SN, NN}). With
-        `ltr=True` (default) EDUs are shifted in text order; with `ltr=False`
-        they are shifted right-to-left. Nuclearity labels always describe text
-        order, so a right-to-left consumer must swap children when applying
-        each reduce.
+    def to_shift_reduce(
+        self,
+        ltr: bool = True,
+        include_text: bool = False,
+    ) -> List[ShiftReduceAction]:
+        """Serialize as a chain of shift/reduce actions. Each action is a
+        `Shift()` (shift the next EDU onto the stack) or a `Reduce(nuc,
+        rel)` (combine the top two stack items, with `nuc` in {NS, SN,
+        NN}). With `ltr=True` (default) EDUs are shifted in text order;
+        with `ltr=False` they are shifted right-to-left. Nuclearity labels
+        always describe text order, so a right-to-left consumer must swap
+        children when applying each reduce.
+
+        With `include_text=True`, each `Shift` carries the surface text of
+        the EDU it commits in its `edu_text` field; this is the form the
+        seq2seq parser feeds to its tokenizer. Hard-requires `ltr=True`
+        (right-to-left text emission is undefined).
         """
         if not self.is_binary:
             raise NotImplementedError("Non-binary trees are not currently supported for this operation.")
+        if include_text and not ltr:
+            raise ValueError("include_text=True requires ltr=True (RTL text emission is undefined).")
 
-        output: List[Tuple[str, ...]] = []
+        output: List[ShiftReduceAction] = []
 
         def walk(node) -> None:
             if node[0] == "edu":
-                output.append(("S",))
+                output.append(Shift(edu_text=node[1] if include_text else None))
                 return
             _, nuc, rel, left, right = node
             for c in [left, right] if ltr else [right, left]:
                 walk(c)
-            output.append(("R", nuc, rel))
+            output.append(Reduce(nuc=nuc, rel=rel))
 
         walk(self._build_binary_tree())
         return output
+
+    @classmethod
+    def from_shift_reduce(
+        cls,
+        actions: List[ShiftReduceAction],
+        edus: Optional[List[str]] = None,
+        relation_types: Optional[Tuple[Tuple[str, str], ...]] = None,
+    ) -> "RstTree":
+        """Inverse of `to_shift_reduce`. Walks the action sequence with a
+        node stack, building `RstNode`s and `RstEdge`s as each `Reduce`
+        fires; structurally mirrors `from_parsing_actions` but consumes
+        the bottom-up SR form rather than the post-order `(split_index,
+        nuc, rel)` form.
+
+        EDU surface text comes from each `Shift.edu_text` if all are
+        populated; otherwise `edus` (positional list of strings) must be
+        supplied. Disagreement between the two sources raises.
+        """
+        shifts = [a for a in actions if isinstance(a, Shift)]
+        shift_texts = [s.edu_text for s in shifts]
+        if edus is None:
+            if any(t is None for t in shift_texts):
+                raise ValueError(
+                    "from_shift_reduce: actions contain Shifts without edu_text; "
+                    "either populate Shift.edu_text or pass `edus` explicitly."
+                )
+            edu_strings: List[str] = list(shift_texts)
+        else:
+            if len(edus) != len(shifts):
+                raise ValueError(
+                    f"from_shift_reduce: `edus` has {len(edus)} entries but actions have {len(shifts)} Shifts."
+                )
+            for i, (e, t) in enumerate(zip(edus, shift_texts)):
+                if t is not None and t != e:
+                    raise ValueError(
+                        f"from_shift_reduce: EDU {i} disagrees between explicit `edus[{i}]={e!r}` "
+                        f"and `Shift.edu_text={t!r}`."
+                    )
+            edu_strings = list(edus)
+
+        # Pre-allocate EDU nodes so their IDs (1..n) can't collide with
+        # internal-node IDs (n+1, n+2, ...) generated as Reduces fire.
+        edu_nodes = [RstNode(str(i + 1), "terminal", text) for i, text in enumerate(edu_strings)]
+        nodes: List[RstNode] = list(edu_nodes)
+        edges: List[RstEdge] = []
+        stack: List[RstNode] = []
+        edu_counter = 0
+
+        for step, action in enumerate(actions):
+            if isinstance(action, Shift):
+                stack.append(edu_nodes[edu_counter])
+                edu_counter += 1
+            elif isinstance(action, Reduce):
+                if len(stack) < 2:
+                    raise ValueError(
+                        f"from_shift_reduce: Reduce at step {step} needs ≥2 stack items, have {len(stack)}."
+                    )
+                right_node = stack.pop()
+                left_node = stack.pop()
+                if action.nuc in ("NS", "SN"):
+                    if action.nuc == "SN":
+                        nucleus, satellite = right_node, left_node
+                    else:
+                        nucleus, satellite = left_node, right_node
+                    top = RstNode(f"{len(nodes) + 1}", type="span")
+                    nodes.append(top)
+                    edges.append(RstEdge(top.id, nucleus.id, "span"))
+                    edges.append(RstEdge(nucleus.id, satellite.id, action.rel))
+                elif action.nuc == "NN":
+                    top = RstNode(f"{len(nodes) + 1}", type="multinuc")
+                    nodes.append(top)
+                    edges.append(RstEdge(top.id, left_node.id, action.rel))
+                    edges.append(RstEdge(top.id, right_node.id, action.rel))
+                else:
+                    raise ValueError(f"from_shift_reduce: unknown nuclearity {action.nuc!r}")
+                stack.append(top)
+            else:
+                raise TypeError(f"from_shift_reduce: unknown action type {type(action).__name__!r}")
+
+        if len(stack) != 1:
+            raise ValueError(f"from_shift_reduce: action sequence ended with {len(stack)} items on stack, expected 1.")
+        if edu_counter != len(edu_strings):
+            raise ValueError(f"from_shift_reduce: consumed {edu_counter} EDUs but {len(edu_strings)} were available.")
+        return cls(nodes, edges, relation_types=relation_types)
 
     @property
     def edus(self) -> List[RstNode]:

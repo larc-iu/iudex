@@ -59,4 +59,12 @@ PARSERS: dict[str, ParserSpec] = {
         supports_text=True,
         signature_field="span_pooling",
     ),
+    "seq2seq_sr": ParserSpec(
+        name="seq2seq_sr",
+        package="iudex.rst.parsers.seq2seq_sr",
+        config_cls="Seq2SeqSRConfig",
+        parser_cls="Seq2SeqSRParser",
+        supports_text=True,
+        signature_field="num_beams",
+    ),
 }

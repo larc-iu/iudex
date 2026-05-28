@@ -177,16 +177,17 @@ def evaluate_parseval(gold_trees: List[RstTree], gold_preds: List[RstTree]) -> D
 def metrics_table(metrics: Dict[str, float], title: str) -> Table:
     """Rich table with up to three sections (gold Parseval, segmentation, e2e Parseval).
 
-    Segmentation/e2e sections render only when their keys (`seg_f1`,
+    Each section renders only when its keys (`span_f1` / `seg_f1` /
     `e2e_span_f1`) are present in `metrics`.
     """
     table = Table(title=title, show_header=True, header_style="bold cyan", padding=(0, 1))
     table.add_column("Metric", style="dim")
     table.add_column("F1", justify="right", style="bold green")
 
-    table.add_row("[bold]Gold-EDU Parseval[/bold]", "")
-    for name in ("span", "nuc", "rel", "full"):
-        table.add_row(f"  {name.upper()}", f"{metrics[f'{name}_f1']:.4f}")
+    if "span_f1" in metrics:
+        table.add_row("[bold]Gold-EDU Parseval[/bold]", "")
+        for name in ("span", "nuc", "rel", "full"):
+            table.add_row(f"  {name.upper()}", f"{metrics[f'{name}_f1']:.4f}")
 
     if "seg_f1" in metrics:
         table.add_section()
