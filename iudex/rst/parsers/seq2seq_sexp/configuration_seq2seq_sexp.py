@@ -79,11 +79,22 @@ class Seq2SeqSexpConfig(FromParams):
     # Sexp-specific. The first is also the registry signature_field for
     # this parser (`traversal_order` is unique to sexp parsers).
     traversal_order: str = "postorder"
+    # True only for now. use_copy=False is future work (see the paper's
+    # limitations section): it confounds COPY-mode ablations with lm_head
+    # architecture changes, and source-token prediction via the small head
+    # is not wired up.
     use_copy: bool = True
 
     def __post_init__(self):
         if self.traversal_order not in ("preorder", "postorder"):
             raise ValueError(f"traversal_order must be 'preorder' or 'postorder' (got {self.traversal_order!r})")
+        if self.use_copy is False:
+            raise NotImplementedError(
+                "Seq2SeqSexpConfig: use_copy=False is not implemented. "
+                "The small action head can't predict source ids, so source-content "
+                "positions never contribute to loss and inference dies at the first leaf. "
+                "Set use_copy=True (the canonical / supported mode)."
+            )
 
     @classmethod
     def from_dict(cls, d: dict) -> "Seq2SeqSexpConfig":

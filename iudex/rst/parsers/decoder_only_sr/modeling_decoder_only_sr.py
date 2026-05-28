@@ -798,6 +798,10 @@ class DecoderOnlySRParser(nn.Module):
                         masked[j, self.eos_head_idx] = logits[j, self.eos_head_idx]
                 log_probs = F.log_softmax(masked.float(), dim=-1)
                 cum = beam_scores.unsqueeze(1) + log_probs
+                # Dead beams (score=-inf, all-masked row) produce -inf + NaN = NaN
+                # rows. topk ranks NaN above any finite negative, so without this
+                # the dead beam's children would crowd out live beams.
+                cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
                 top_scores, top_idx = cum.view(-1).topk(K)
                 parent_of_new = (top_idx // head_V).tolist()
                 action_of_new = (top_idx % head_V).tolist()

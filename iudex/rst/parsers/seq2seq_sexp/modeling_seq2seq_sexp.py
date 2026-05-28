@@ -767,6 +767,8 @@ class Seq2SeqSexpParser(nn.Module):
             self,
         )
         tree = self._tree_from_action_sequence(action_seq, source_ids)
+        if getattr(tree, "_from_sexp_failed", False):
+            edu_ranges = []
         tree._pred_edu_source_ranges = edu_ranges  # type: ignore[attr-defined]
         tree._source_ids = source_ids  # type: ignore[attr-defined]
         return tree
@@ -835,6 +837,10 @@ class Seq2SeqSexpParser(nn.Module):
                     masked[j] = torch.where(mask, logits[j], torch.full_like(logits[j], float("-inf")))
                 log_probs = F.log_softmax(masked.float(), dim=-1)
                 cum = beam_scores.unsqueeze(1) + log_probs
+                # Dead beams (score=-inf, all-masked row) produce -inf + NaN = NaN
+                # rows. topk ranks NaN above any finite negative, so without this
+                # the dead beam's children would crowd out live beams.
+                cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
                 top_scores, top_idx = cum.view(-1).topk(K)
                 parent_of_new = (top_idx // head_V).tolist()
                 action_of_new = (top_idx % head_V).tolist()
@@ -917,6 +923,8 @@ class Seq2SeqSexpParser(nn.Module):
             )
         edu_ranges = _edu_ranges_from_actions(best["action_seq"], source_ids, self)
         tree = self._tree_from_action_sequence(best["action_seq"], source_ids)
+        if getattr(tree, "_from_sexp_failed", False):
+            edu_ranges = []
         tree._pred_edu_source_ranges = edu_ranges  # type: ignore[attr-defined]
         tree._source_ids = source_ids  # type: ignore[attr-defined]
         return tree
@@ -931,12 +939,20 @@ class Seq2SeqSexpParser(nn.Module):
 
     @torch.no_grad()
     def _predict_one_gold_edu(self, tree: RstTree) -> RstTree:
-        """Forced decode with gold EDU boundaries. The decoder is pinned to
-        a left-branching binary skeleton (one canonical tree shape per EDU
-        count) for the structural backbone; labels at label-slot positions
-        are still chosen by the model's argmax. Segmentation is therefore
-        gold by construction. Tree shape is fixed (left-spine), so nuc/rel
-        Parseval reflects the model's label choices alone."""
+        """Forced decode with gold EDU boundaries.
+
+        Forcing contract (shared with decoder_only_sexp / *_sr): leave
+        structure free, force boundaries.
+
+        - Inside a leaf frame: force a content token (`<copy>` or source id)
+          until the cursor reaches the current gold EDU's end, then force
+          CLOSE.
+        - Outside a leaf frame: let the model pick freely from
+          `SexpDecodingState.legal_actions()`.
+
+        Segmentation matches gold by construction. Tree shape and labels
+        come from the model.
+        """
         self.eval()
         device = next(self.parameters()).device
         text = _reconstruct_text(tree)
@@ -956,60 +972,15 @@ class Seq2SeqSexpParser(nn.Module):
             return _empty_tree(self.config.relation_types)
 
         # Clamp gold ranges to (possibly truncated) source.
-        clamped: list[tuple[int, int]] = []
+        clamped_ranges: list[tuple[int, int]] = []
         for s, e in gold_ranges:
             if s >= source_len:
                 break
-            clamped.append((s, min(e, source_len)))
-        if not clamped:
+            clamped_ranges.append((s, min(e, source_len)))
+        if not clamped_ranges:
             return _empty_tree(self.config.relation_types)
-        edu_ends = [end for _, end in clamped]  # exclusive
-        edu_starts = [s for s, _ in clamped]
-        n_edus = len(edu_ends)
-
-        # Precompute the forced action skeleton (a list where each entry
-        # is either an int action id, or the sentinel string "LABEL" /
-        # "CONTENT" indicating "model picks at this slot from the legal
-        # set"). Skeleton encodes a left-spine binary tree.
-        OPEN = self.open_token_id
-        CLOSE = self.close_token_id
-        EOS = int(self.tokenizer.eos_token_id)
-        skeleton: list = []
-
-        def add_leaf(edu_i: int):
-            skeleton.append(OPEN)
-            for _ in range(edu_starts[edu_i], edu_ends[edu_i]):
-                # Content slot: copy or source-id (resolved at run time)
-                skeleton.append(("CONTENT", edu_i))
-            skeleton.append(CLOSE)
-
-        if n_edus == 1:
-            add_leaf(0)
-        else:
-            if self.config.traversal_order == "postorder":
-                # ( ( ... ( leaf_0 leaf_1 L ) leaf_2 L ) ... leaf_{n-1} L )
-                for _ in range(n_edus - 1):
-                    skeleton.append(OPEN)
-                add_leaf(0)
-                add_leaf(1)
-                skeleton.append("LABEL")
-                skeleton.append(CLOSE)
-                for i in range(2, n_edus):
-                    add_leaf(i)
-                    skeleton.append("LABEL")
-                    skeleton.append(CLOSE)
-            else:
-                # preorder: ( L ( L ... ( L leaf_0 leaf_1 ) leaf_2 ) ... leaf_{n-1} )
-                for _ in range(n_edus - 1):
-                    skeleton.append(OPEN)
-                    skeleton.append("LABEL")
-                add_leaf(0)
-                add_leaf(1)
-                skeleton.append(CLOSE)
-                for i in range(2, n_edus):
-                    add_leaf(i)
-                    skeleton.append(CLOSE)
-        skeleton.append(EOS)
+        n_edus = len(clamped_ranges)
+        edu_idx = 0
 
         gc_active = self.config.gradient_checkpointing
         if gc_active:
@@ -1025,11 +996,8 @@ class Seq2SeqSexpParser(nn.Module):
             done = False
             hit_max_len = False
 
-            for sk in skeleton:
+            for _step in range(self.config.max_output_length):
                 if done:
-                    break
-                if len(action_seq) >= self.config.max_output_length:
-                    hit_max_len = True
                     break
                 step_input = decoder_input_ids[:, -1:] if past_key_values is not None else decoder_input_ids
                 out = self.model(
@@ -1043,34 +1011,38 @@ class Seq2SeqSexpParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[0, -1, :]
 
-                # Resolve the skeleton entry to a concrete action.
-                if isinstance(sk, tuple) and sk[0] == "CONTENT":
-                    if self.config.use_copy:
-                        full_id = self.copy_token_id
+                legal = state.legal_actions()
+                if state.in_edu_leaf and edu_idx < n_edus:
+                    target_end = clamped_ranges[edu_idx][1]
+                    if state.cursor < target_end:
+                        narrowed = set(legal) - {self.close_token_id}
                     else:
-                        if state.cursor < len(source_ids):
-                            full_id = source_ids[state.cursor]
-                        else:
-                            done = True
-                            break
-                elif sk == "LABEL":
-                    # Mask logits to label-only and pick the model's best.
-                    label_mask = torch.zeros_like(logits, dtype=torch.bool)
-                    for fid in self.reduce_token_ids:
-                        hi = self.head_idx_for_full_id[fid]
-                        label_mask[hi] = True
-                    masked = torch.where(label_mask, logits, torch.full_like(logits, float("-inf")))
-                    head_idx = int(masked.argmax(-1).item())
-                    full_id = self.full_id_for_head_idx[head_idx]
+                        narrowed = {self.close_token_id} if self.close_token_id in legal else set(legal)
+                    if not narrowed:
+                        narrowed = set(legal)
                 else:
-                    full_id = int(sk)
+                    narrowed = set(legal)
 
+                head_indices = sorted(
+                    self.head_idx_for_full_id[int(x)] for x in narrowed if int(x) in self.head_idx_for_full_id
+                )
+                masked = torch.full_like(logits, float("-inf"))
+                if head_indices:
+                    idx_t = torch.tensor(head_indices, dtype=torch.long, device=logits.device)
+                    masked[idx_t] = logits[idx_t]
+                head_idx = int(masked.argmax(-1).item())
+                full_id = self.full_id_for_head_idx[head_idx]
+
+                closing_leaf = full_id == self.close_token_id and bool(state.stack) and state.stack[-1].kind == "leaf"
                 action_seq.append(full_id)
                 try:
                     state = state.step(full_id)
                 except ValueError:
                     done = True
                     break
+
+                if closing_leaf:
+                    edu_idx += 1
 
                 if full_id == self.tokenizer.eos_token_id:
                     done = True
@@ -1083,6 +1055,8 @@ class Seq2SeqSexpParser(nn.Module):
                         next_input = source_ids[src_pos]
                 new_step = torch.tensor([[next_input]], device=device, dtype=torch.long)
                 decoder_input_ids = torch.cat([decoder_input_ids, new_step], dim=1)
+            else:
+                hit_max_len = not done
         finally:
             if gc_active:
                 self._set_grad_checkpointing(True)
@@ -1094,6 +1068,8 @@ class Seq2SeqSexpParser(nn.Module):
             )
         edu_ranges = _edu_ranges_from_actions(action_seq, source_ids, self)
         tree_out = self._tree_from_action_sequence(action_seq, source_ids)
+        if getattr(tree_out, "_from_sexp_failed", False):
+            edu_ranges = []
         tree_out._pred_edu_source_ranges = edu_ranges  # type: ignore[attr-defined]
         tree_out._source_ids = source_ids  # type: ignore[attr-defined]
         return tree_out
@@ -1115,7 +1091,10 @@ class Seq2SeqSexpParser(nn.Module):
     def _tree_from_action_sequence(self, action_ids: list[int], source_ids: list[int]) -> RstTree:
         """Turn the emitted action sequence into an `RstTree` by building a
         sexp string and running it through `RstTree.from_sexp`. Falls back
-        to an empty tree on any parse failure."""
+        to an empty tree on any parse failure. Empty-tree fallbacks carry
+        `_from_sexp_failed=True` so callers can null out
+        `_pred_edu_source_ranges` (otherwise the action-derived ranges
+        wouldn't match the single-EDU fallback's edu count)."""
         sexp_str, edu_texts = self._actions_to_sexp_string(action_ids, source_ids)
         try:
             return RstTree.from_sexp(
@@ -1127,7 +1106,9 @@ class Seq2SeqSexpParser(nn.Module):
         except (ValueError, IndexError) as e:
             warn(f"Malformed decoder sexp output ({e!r}); falling back to single-EDU tree.")
             full_text = " ".join(edu_texts) if edu_texts else ""
-            return _empty_tree(self.config.relation_types, text=full_text)
+            tree = _empty_tree(self.config.relation_types, text=full_text)
+            tree._from_sexp_failed = True  # type: ignore[attr-defined]
+            return tree
 
     def _actions_to_sexp_string(self, action_ids: list[int], source_ids: list[int]) -> tuple[str, list[str]]:
         """Walk the action sequence, emitting `<edu>` placeholders for

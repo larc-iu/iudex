@@ -52,6 +52,9 @@ class DecoderOnlySexpConfig(FromParams):
 
     # S-expression knobs. `use_copy` is the registry's signature_field.
     traversal_order: str = "postorder"
+    # True only for now. use_copy=False is future work (see the paper's
+    # limitations section): it confounds COPY-mode ablations with lm_head
+    # architecture changes (asymmetric head between modes).
     use_copy: bool = True
 
     peft: _PeftConfig | None = None
@@ -89,6 +92,12 @@ class DecoderOnlySexpConfig(FromParams):
     def __post_init__(self):
         if self.traversal_order not in ("preorder", "postorder"):
             raise ValueError(f"traversal_order must be 'preorder' or 'postorder' (got {self.traversal_order!r})")
+        if self.use_copy is False:
+            raise NotImplementedError(
+                "DecoderOnlySexpConfig: use_copy=False is not implemented. "
+                "The two modes use asymmetric lm_heads (small vs full vocab), "
+                "which confounds the ablation. Set use_copy=True (the canonical mode)."
+            )
 
     @classmethod
     def from_dict(cls, d: dict) -> "DecoderOnlySexpConfig":

@@ -742,7 +742,11 @@ class DecoderOnlySexpParser(nn.Module):
 
                 # Next model input. For COPY, substitute the source subword.
                 if self.config.use_copy and full_id == self.copy_token_id:
-                    next_input = source_ids[state.cursor - 1]
+                    src_pos = state.cursor - 1
+                    if 0 <= src_pos < len(source_ids):
+                        next_input = source_ids[src_pos]
+                    else:
+                        next_input = full_id
                 else:
                     next_input = full_id
 
@@ -770,6 +774,8 @@ class DecoderOnlySexpParser(nn.Module):
         for r in pred_edu_ranges:
             if not clean_ranges or clean_ranges[-1] != r:
                 clean_ranges.append(r)
+        if getattr(tree, "_from_sexp_failed", False):
+            clean_ranges = []
         tree._pred_edu_source_ranges = clean_ranges  # type: ignore[attr-defined]
         tree._source_ids = source_ids  # type: ignore[attr-defined]
         return tree
@@ -822,6 +828,10 @@ class DecoderOnlySexpParser(nn.Module):
 
                 log_probs = F.log_softmax(masked.float(), dim=-1)
                 cum = beam_scores.unsqueeze(1) + log_probs
+                # Dead beams (score=-inf, all-masked row) produce -inf + NaN = NaN
+                # rows. topk ranks NaN above any finite negative, so without this
+                # the dead beam's children would crowd out live beams.
+                cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
                 top_scores, top_idx = cum.view(-1).topk(K)
                 parent_of_new = (top_idx // head_V).tolist()
                 action_of_new = (top_idx % head_V).tolist()
@@ -868,7 +878,11 @@ class DecoderOnlySexpParser(nn.Module):
                         new_leaf_starts[j] = None
 
                     if self.config.use_copy and full_id == self.copy_token_id:
-                        next_inputs[j] = source_ids[new_states[j].cursor - 1]
+                        src_pos = new_states[j].cursor - 1
+                        if 0 <= src_pos < len(source_ids):
+                            next_inputs[j] = source_ids[src_pos]
+                        else:
+                            next_inputs[j] = full_id
                     else:
                         next_inputs[j] = full_id
 
@@ -935,7 +949,10 @@ class DecoderOnlySexpParser(nn.Module):
                 f"Tree closed by best-effort repair."
             )
         tree = self._tree_from_emitted(best["emitted"], source_ids)
-        tree._pred_edu_source_ranges = best["pred_edu_ranges"]  # type: ignore[attr-defined]
+        pred_ranges = best["pred_edu_ranges"]
+        if getattr(tree, "_from_sexp_failed", False):
+            pred_ranges = []
+        tree._pred_edu_source_ranges = pred_ranges  # type: ignore[attr-defined]
         tree._source_ids = source_ids  # type: ignore[attr-defined]
         return tree
 
@@ -945,12 +962,19 @@ class DecoderOnlySexpParser(nn.Module):
 
     @torch.no_grad()
     def _predict_one_gold_edu(self, tree: RstTree) -> RstTree:
-        """Greedy decode with gold EDU boundaries forced. Inside a leaf
-        frame, force content tokens until the cursor hits the current gold
-        EDU end, then force CLOSE. Outside any leaf, let the model pick
-        freely from the constraint-state legal set. This biases structure
-        (labels and bracketing) without overriding it, while guaranteeing
-        EDU spans line up with gold."""
+        """Forced decode with gold EDU boundaries.
+
+        Forcing contract (shared with seq2seq_sexp / *_sr): leave structure
+        free, force boundaries.
+
+        - Inside a leaf frame: force content tokens until the cursor reaches
+          the current gold EDU's end, then force CLOSE.
+        - Outside a leaf frame: let the model pick freely from
+          `SexpDecodingState.legal_actions()`.
+
+        Segmentation matches gold by construction. Tree shape and labels
+        come from the model.
+        """
         self.eval()
         device = next(self.parameters()).device
         eos_id = int(self.tokenizer.eos_token_id)
@@ -996,8 +1020,6 @@ class DecoderOnlySexpParser(nn.Module):
             for step in range(self.config.max_output_length):
                 legal = state.legal_actions()
                 in_leaf = state.in_edu_leaf
-                n_remaining = n_edus - edu_idx
-                at_just_opened = bool(state.stack) and state.stack[-1].kind is None
                 if in_leaf and edu_idx < n_edus:
                     target_end = clamped_ranges[edu_idx][1]
                     if state.cursor < target_end:
@@ -1008,23 +1030,9 @@ class DecoderOnlySexpParser(nn.Module):
                         narrowed = {self.close_token_id} if self.close_token_id in legal else set(legal)
                     if not narrowed:
                         narrowed = set(legal)
-                elif at_just_opened and n_remaining > 1:
-                    # This span must be internal (contains >1 leaves total).
-                    # Preorder: force a label. Postorder: force '(' for the
-                    # first child.
-                    if self.config.traversal_order == "preorder":
-                        narrowed = set(legal) & set(self.label_id_set)
-                    else:
-                        narrowed = {self.open_token_id} if self.open_token_id in legal else set(legal)
-                    if not narrowed:
-                        narrowed = set(legal)
-                elif at_just_opened and n_remaining == 1:
-                    # Exactly one leaf left, so this span must be a leaf:
-                    # force content (the first content token resolves kind to
-                    # leaf).
-                    content = set(legal) - {self.open_token_id, self.close_token_id} - set(self.label_id_set)
-                    narrowed = content if content else set(legal)
                 else:
+                    # Outside a leaf: let the model choose freely; the
+                    # SexpDecodingState already enforces validity.
                     narrowed = set(legal)
 
                 idx_t = torch.tensor(
@@ -1061,7 +1069,11 @@ class DecoderOnlySexpParser(nn.Module):
                     edu_idx += 1
 
                 if self.config.use_copy and full_id == self.copy_token_id:
-                    next_input = source_ids[state.cursor - 1]
+                    src_pos = state.cursor - 1
+                    if 0 <= src_pos < len(source_ids):
+                        next_input = source_ids[src_pos]
+                    else:
+                        next_input = full_id
                 else:
                     next_input = full_id
 
@@ -1084,7 +1096,10 @@ class DecoderOnlySexpParser(nn.Module):
                 f"Tree closed by best-effort repair."
             )
         tree_out = self._tree_from_emitted(emitted_ids, source_ids)
-        tree_out._pred_edu_source_ranges = _dedup_ranges(pred_edu_ranges)  # type: ignore[attr-defined]
+        pred_ranges = _dedup_ranges(pred_edu_ranges)
+        if getattr(tree_out, "_from_sexp_failed", False):
+            pred_ranges = []
+        tree_out._pred_edu_source_ranges = pred_ranges  # type: ignore[attr-defined]
         tree_out._source_ids = source_ids  # type: ignore[attr-defined]
         return tree_out
 
@@ -1158,7 +1173,12 @@ class DecoderOnlySexpParser(nn.Module):
         except Exception as e:
             warn(f"Malformed sexp output ({type(e).__name__}: {e}); falling back to single-EDU tree.")
             full_text = self.tokenizer.decode(source_ids, skip_special_tokens=True)
-            return _empty_tree(self.config.relation_types, text=full_text)
+            tree = _empty_tree(self.config.relation_types, text=full_text)
+            # Mark the fallback so callers null out `_pred_edu_source_ranges`
+            # (otherwise the action-derived ranges wouldn't match the
+            # single-EDU fallback's edu count and downstream eval would skip).
+            tree._from_sexp_failed = True  # type: ignore[attr-defined]
+            return tree
 
 
 def _reconstruct_text(tree: RstTree) -> str:
