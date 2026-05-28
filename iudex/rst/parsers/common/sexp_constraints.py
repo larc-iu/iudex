@@ -92,6 +92,13 @@ class SexpDecodingState:
     # action regardless).
     constrain_content: bool = True
 
+    # Tokenizer special ids (PAD, BOS, UNK, decoder_start, ...) the caller
+    # wants treated as structural at content-wildcard positions. Only
+    # consumed by `structural_ids()`; the parsers populate this from
+    # `tokenizer.all_special_ids` at state construction so leaked specials
+    # don't end up in the EDU surface text under `constrain_content=False`.
+    tokenizer_special_ids: FrozenSet[int] = frozenset()
+
     cursor: int = 0
     depth: int = 0
     stack: Tuple[_Frame, ...] = ()  # one frame per currently open span
@@ -228,14 +235,17 @@ class SexpDecodingState:
 
     def structural_ids(self) -> FrozenSet[int]:
         """All structural token ids (open, close, labels, eos, copy, edu
-        placeholder). Callers use this to mask the wildcard content slot
-        in `constrain_content=False` mode."""
+        placeholder, plus tokenizer specials like PAD/BOS/UNK/decoder_start).
+        Callers use this to mask the wildcard content slot in
+        `constrain_content=False` mode so tokenizer specials don't leak into
+        EDU surface text."""
         ids: set[int] = {self.open_id, self.close_id, self.eos_id}
         ids.update(int(x) for x in self.label_ids)
         if self.copy_id is not None:
             ids.add(int(self.copy_id))
         if self.edu_placeholder_id is not None:
             ids.add(int(self.edu_placeholder_id))
+        ids.update(int(x) for x in self.tokenizer_special_ids)
         return frozenset(ids)
 
     def _content_legal(self) -> List[int]:
@@ -431,6 +441,7 @@ def make_initial_state(
     edu_placeholder_id: Optional[int] = None,
     min_edu_length: int = 1,
     constrain_content: bool = True,
+    tokenizer_special_ids: Optional[FrozenSet[int]] = None,
 ) -> SexpDecodingState:
     return SexpDecodingState(
         source_len=source_len,
@@ -445,6 +456,7 @@ def make_initial_state(
         edu_placeholder_id=edu_placeholder_id,
         min_edu_length=int(min_edu_length),
         constrain_content=bool(constrain_content),
+        tokenizer_special_ids=frozenset(int(x) for x in (tokenizer_special_ids or frozenset())),
     )
 
 
@@ -523,10 +535,14 @@ class GoldEduForcer:
                 if state.constrain_content:
                     if state.cursor >= state.source_len:
                         return None
-                    return frozenset({state.source_ids[state.cursor]})
+                    content_id = state.source_ids[state.cursor]
+                    return frozenset({content_id}) if content_id in legal else None
                 # Free content: narrow to "non-structural" via the wildcard.
-                # The mask helper expands the wildcard. We just signal no narrowing.
-                return None
+                # The mask helper expands the wildcard. We hard-mask CLOSE out
+                # so the model can't argmax leaf-close before reaching the
+                # gold target_end (legal would otherwise admit close as soon
+                # as leaf_token_count >= min_edu_length).
+                return frozenset(legal - {state.close_id})
             return frozenset({state.close_id}) if state.close_id in legal else None
 
         # Pre-root: force OPEN.

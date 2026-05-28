@@ -446,3 +446,236 @@ def test_constrain_content_false_with_use_copy_true_raises():
             use_copy=True,
             constrain_content=False,
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-3 critical fixes
+# ---------------------------------------------------------------------------
+
+
+def _smallest_gum_train_tree():
+    """Smallest tree in the GUM train split. Used by Critical-1 regression
+    so we exercise `encode_target` on a real binarized tree rather than the
+    synthetic 3-EDU fixture that happens to round-trip under both DFS orders.
+    """
+    import glob
+    import os
+
+    candidate_dirs = ["data/gum_12.1.0_notok/train"]
+    paths = []
+    for d in candidate_dirs:
+        if os.path.isdir(d):
+            paths.extend(glob.glob(os.path.join(d, "*.rs4")))
+            break
+    if not paths:
+        pytest.skip("GUM train data not present at expected path")
+    from iudex.rst.data.reader import read_rst_file
+
+    smallest = None
+    smallest_n = 10**9
+    for p in paths:
+        try:
+            tree = read_rst_file(p)
+        except Exception:
+            continue
+        n = len(tree.edus)
+        if n < smallest_n and n >= 5:
+            smallest_n = n
+            smallest = tree
+    if smallest is None:
+        pytest.skip("no usable GUM train tree found")
+    return smallest
+
+
+@pytest.mark.parametrize("traversal_order", ["preorder", "postorder"])
+@pytest.mark.parametrize("use_copy", [True, False])
+def test_encode_target_on_real_gum_tree_does_not_raise(traversal_order, use_copy):
+    """Critical-1 regression. The pre-fix `_spans_from_parsing_actions`
+    replay assumed `parsing_actions` was left-first DFS, but it's actually
+    right-first DFS, so on any non-trivial real tree the recursion popped
+    an empty list and raised IndexError. We now walk `_build_binary_tree`
+    directly, so a real GUM tree (14 EDUs) round-trips through
+    `encode_target` without exception and produces structurally valid output."""
+    tree = _smallest_gum_train_tree()
+    from iudex.rst.data.reader import infer_relation_types
+
+    rels = infer_relation_types(["data/gum_12.1.0_notok/train"])
+    cfg = Seq2SeqSexpConfig(
+        train_dir="<unused>",
+        dev_dir="<unused>",
+        model_name=SMALL_SEQ2SEQ,
+        relation_types=rels,
+        gradient_checkpointing=False,
+        amp=False,
+        max_input_length=2048,
+        max_output_length=8192,
+        min_edu_length=1,
+        traversal_order=traversal_order,
+        use_copy=use_copy,
+    )
+    try:
+        parser = Seq2SeqSexpParser(cfg)
+    except Exception as e:
+        pytest.skip(f"Could not load {SMALL_SEQ2SEQ}: {e!r}")
+    # Some relations from infer_relation_types may not exist on the toy tree.
+    # We just need encode_target to not raise.
+    encoded = parser.encode_target(tree)
+    assert encoded is not None, "encode_target dropped a real GUM tree"
+    labels, decoder_input_ids = encoded
+    assert len(labels) == len(decoder_input_ids)
+    # Structural sanity: one open and one close per EDU and per internal node.
+    n_edus = len(tree.edus)
+    n_internal = n_edus - 1
+    n_open = sum(1 for t in labels if t == parser.open_token_id)
+    n_close = sum(1 for t in labels if t == parser.close_token_id)
+    assert n_open == n_edus + n_internal
+    assert n_close == n_edus + n_internal
+
+
+def test_constrain_content_false_emits_leaf_text_into_predicted_tree():
+    """Critical-2 regression. Under `use_copy=False + constrain_content=False`
+    the model emits free (non-source-aligned) subwords inside leaves. The
+    pre-fix `_actions_to_sexp_string` only buffered tokens when they
+    matched `source_ids[cursor]`, silently dropping all free content and
+    yielding empty leaves. We assert that an action stream containing tokens
+    that differ from `source_ids[cursor]` still produces non-empty leaf text."""
+    parser = _variant_parser("postorder", use_copy=False)
+    parser.config.constrain_content = False
+    # Source has tokens [10, 11, ...] but action stream emits tokens 100 and
+    # 200 (real subword ids in the t5 vocab, deliberately != source_ids[cursor]).
+    # Pre-fix code would drop both because they don't match source_ids[0]=10.
+    source_ids = [10, 11, 12, 13, 14, 15]
+    action_ids = [
+        parser.open_token_id,
+        100,
+        200,
+        parser.close_token_id,
+        parser.tokenizer.eos_token_id,
+    ]
+    sexp, edu_texts = parser._actions_to_sexp_string(action_ids, source_ids)
+    assert len(edu_texts) == 1, edu_texts
+    # The leaf must have decoded SOMETHING; pre-fix it would be empty since
+    # neither 100 nor 200 == 10 (source_ids[0]).
+    assert edu_texts[0] != "", "free content was dropped; leaf came back empty"
+    # And the sexp string should mark the leaf as `<edu>` (placeholder
+    # because the leaf was collapsed to a placeholder with text out-of-band).
+    assert "<edu>" in sexp
+
+
+def test_constrain_content_false_buffers_unconditional_in_real_decode():
+    """Companion to test_constrain_content_false_emits_leaf_text. Run an
+    end-to-end predict under `constrain_content=False` on a tiny model and
+    assert the predicted tree at least has non-empty leaves (we can't
+    predict tokens, just that they exist)."""
+    cfg = Seq2SeqSexpConfig(
+        train_dir="<unused>",
+        dev_dir="<unused>",
+        model_name=SMALL_SEQ2SEQ,
+        relation_types=[("elaboration", "rst")],
+        gradient_checkpointing=False,
+        amp=False,
+        max_input_length=128,
+        max_output_length=128,
+        min_edu_length=1,
+        traversal_order="postorder",
+        use_copy=False,
+        constrain_content=False,
+    )
+    try:
+        parser = Seq2SeqSexpParser(cfg)
+    except Exception as e:
+        pytest.skip(f"Could not load {SMALL_SEQ2SEQ}: {e!r}")
+    tree = _toy_tree()
+    pred = parser.predict_with_gold_edus(tree)
+    assert pred is not None
+    # At least one predicted EDU should have non-empty text (the model
+    # emits something at each leaf-content position).
+    has_text = any(getattr(edu, "text", "") for edu in pred.edus)
+    assert has_text or len(pred.edus) <= 1, (
+        f"predicted tree has empty leaves under constrain_content=False: edus={pred.edus}"
+    )
+
+
+def test_gold_edu_forcer_blocks_close_before_target_end_under_cc_false():
+    """Important-3 regression. Under `constrain_content=False` the
+    GoldEduForcer must hard-mask CLOSE out of the legal set when the cursor
+    has not reached `target_end`, so an undertrained model cannot argmax
+    leaf-close mid-EDU."""
+    from iudex.rst.parsers.common.sexp_constraints import (
+        GoldEduForcer,
+        make_initial_state,
+    )
+
+    OPEN, CLOSE, EOS = 1, 2, 3
+    LABEL_NS = 100
+    label_ids = frozenset({LABEL_NS})
+    # 4-token source, two 2-token EDUs.
+    src = [10, 11, 12, 13]
+    state = make_initial_state(
+        source_len=4,
+        traversal_order="postorder",
+        use_copy=False,
+        open_id=OPEN,
+        close_id=CLOSE,
+        eos_id=EOS,
+        label_ids=label_ids,
+        source_ids=src,
+        min_edu_length=1,
+        constrain_content=False,
+    )
+    forcer = GoldEduForcer(2, [(0, 2), (2, 4)])
+    # Drive state into the first leaf: open root, open leaf, emit one
+    # content token. Should land at cursor=1 mid-leaf, target_end=2.
+    state = state.step(OPEN)  # root opens
+    forcer.observe(
+        make_initial_state(  # before
+            source_len=4,
+            traversal_order="postorder",
+            use_copy=False,
+            open_id=OPEN,
+            close_id=CLOSE,
+            eos_id=EOS,
+            label_ids=label_ids,
+            source_ids=src,
+            min_edu_length=1,
+            constrain_content=False,
+        ),
+        state,
+        OPEN,
+    )
+    before = state
+    state = state.step(OPEN)  # leaf opens
+    forcer.observe(before, state, OPEN)
+    before = state
+    state = state.step(10)  # emit one content token, cursor=1
+    forcer.observe(before, state, 10)
+    assert state.in_edu_leaf
+    assert state.cursor == 1
+    # target_end for the first leaf is 2; we're mid-leaf.
+    narrowed = forcer.narrowed_legal(state)
+    assert narrowed is not None
+    assert CLOSE not in narrowed, (
+        f"GoldEduForcer admits leaf-close mid-EDU under constrain_content=False; narrowed={sorted(narrowed)}"
+    )
+
+
+def test_structural_ids_includes_tokenizer_specials():
+    """Minor-5 regression. `structural_ids()` must union in the tokenizer's
+    PAD/BOS/UNK/decoder-start ids when the caller provided them, so the
+    `constrain_content=False` wildcard masking knocks them out and they
+    can't leak into EDU surface text."""
+    from iudex.rst.parsers.common.sexp_constraints import SexpDecodingState
+
+    state = SexpDecodingState(
+        source_len=3,
+        traversal_order="postorder",
+        use_copy=False,
+        open_id=1,
+        close_id=2,
+        eos_id=3,
+        label_ids=frozenset({100}),
+        source_ids=(10, 11, 12),
+        tokenizer_special_ids=frozenset({0, 99, 7}),
+    )
+    sids = state.structural_ids()
+    assert {1, 2, 3, 100, 0, 99, 7} <= sids

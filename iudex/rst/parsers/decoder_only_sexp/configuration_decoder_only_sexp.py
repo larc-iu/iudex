@@ -164,6 +164,15 @@ class DecoderOnlySexpConfig(FromParams):
     # Label smoothing on the CE loss. Standard fine-tuning trick. The
     # action head is small (~100 classes) and GUM has ~150 train docs,
     # so hard targets overfit fast. 0.1 is the conventional default.
+    #
+    # SCALE AUTO-ADJUST under use_copy=False (see __post_init__): when the
+    # head is the full backbone vocab (V~262K) instead of the small action
+    # head (V~100), a raw 0.1 puts ~0.1/V mass per off-class, which is two
+    # to three orders of magnitude less per off-class than the use_copy=True
+    # head sees. To keep the per-off-class smoothing mass roughly constant
+    # across modes, the post_init scales `label_smoothing` by
+    # (~ACTION_HEAD_SIZE / ~FULL_VOCAB_SIZE) ~ 100 / 262000 ~ 4e-4 when
+    # use_copy=False. Explicit 0.0 is left untouched (idempotent zero).
     label_smoothing: float = 0.1
 
     def __post_init__(self):
@@ -174,6 +183,22 @@ class DecoderOnlySexpConfig(FromParams):
                 "constrain_content=False requires use_copy=False (free-content decoding "
                 "is only meaningful when source subwords are scored natively by the lm_head)."
             )
+        # Auto-scale label_smoothing across head sizes (see field docstring).
+        # ~ACTION_HEAD_SIZE / ~FULL_VOCAB_SIZE. Skip when the user explicitly
+        # set 0.0 so the override is idempotent.
+        if self.use_copy is False and self.label_smoothing != 0.0:
+            from iudex.common.log import warn as _warn
+
+            _APPROX_ACTION_HEAD_SIZE = 100
+            _APPROX_FULL_VOCAB_SIZE = 262_000
+            scaled = self.label_smoothing * (_APPROX_ACTION_HEAD_SIZE / _APPROX_FULL_VOCAB_SIZE)
+            _warn(
+                f"[CONFIG OVERRIDE] use_copy=False scales label_smoothing by "
+                f"~{_APPROX_ACTION_HEAD_SIZE}/{_APPROX_FULL_VOCAB_SIZE} to keep per-off-class "
+                f"smoothing mass comparable to the use_copy=True head: "
+                f"{self.label_smoothing} -> {scaled:.6f}. Set label_smoothing=0.0 to opt out."
+            )
+            self.label_smoothing = scaled
         if self.use_copy is False and self.peft is not None and self.peft.train_only_new_embedding_rows:
             # Mutates self.peft in place. The override is durable because
             # `dataclasses.asdict(self)` serializes the post-init state into

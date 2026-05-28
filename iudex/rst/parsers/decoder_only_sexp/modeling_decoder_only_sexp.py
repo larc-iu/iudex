@@ -634,20 +634,19 @@ class DecoderOnlySexpParser(nn.Module):
     # Constraint state
     # -----------------------------------------------------------------
 
-    def _initial_state(self, source_len: int) -> SexpDecodingState:
-        return SexpDecodingState(
-            source_len=source_len,
-            traversal_order=self.config.traversal_order,
-            use_copy=self.config.use_copy,
-            open_id=self.open_token_id,
-            close_id=self.close_token_id,
-            eos_id=int(self.tokenizer.eos_token_id),
-            label_ids=frozenset(self.label_id_set),
-            copy_id=self.copy_token_id if self.config.use_copy else None,
-            source_ids=tuple() if self.config.use_copy else tuple(),
-            min_edu_length=int(self.config.min_edu_length),
-            constrain_content=bool(self.config.constrain_content),
-        )
+    def _tokenizer_special_ids(self) -> frozenset[int]:
+        ids: set[int] = set()
+        for attr in ("pad_token_id", "bos_token_id", "unk_token_id"):
+            v = getattr(self.tokenizer, attr, None)
+            if v is not None:
+                ids.add(int(v))
+        for v in getattr(self.tokenizer, "all_special_ids", []) or []:
+            ids.add(int(v))
+        # SEP is also a special-introduced token. Keep it structural so
+        # constrain_content=False can't accidentally emit it as content.
+        if getattr(self, "sep_token_id", None) is not None:
+            ids.add(int(self.sep_token_id))
+        return frozenset(ids)
 
     def _state_for_source(self, source_ids: list[int]) -> SexpDecodingState:
         return SexpDecodingState(
@@ -662,6 +661,7 @@ class DecoderOnlySexpParser(nn.Module):
             source_ids=tuple() if self.config.use_copy else tuple(source_ids),
             min_edu_length=int(self.config.min_edu_length),
             constrain_content=bool(self.config.constrain_content),
+            tokenizer_special_ids=self._tokenizer_special_ids(),
         )
 
     # -----------------------------------------------------------------

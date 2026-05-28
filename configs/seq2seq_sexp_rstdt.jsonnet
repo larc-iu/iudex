@@ -46,6 +46,10 @@
     seed: 42,
     val_metric_name: 'e2e_full_f1',
     action_loss_weight: 1.0,
+    // Under use_copy=false this is auto-scaled by ~ACTION_HEAD_SIZE /
+    // ~FULL_VOCAB_SIZE (~100/262000) in __post_init__ so the per-off-class
+    // smoothing mass stays comparable across the two head sizes. Set to 0.0
+    // to opt out of the auto-scale (idempotent zero).
     label_smoothing: 0.1,
 
     // Dev eval

@@ -158,7 +158,7 @@ For context when interpreting cluster-run numbers.
   - Instr-DT: span 79.1 / nuc 60.4 / rel 55.1 / full **0.473**
   - GUM: span 76.4 / nuc 64.7 / rel 56.4 / full **0.552**
 - **Note**: ~3 F1 over prior DeBERTa SOTA on RST-DT and Instr-DT; ~7 F1 over prior on GUM. Inference cost is minutes per document at 70B (vs seconds for graph-based parsers).
-- **Comparison framing**: the relevant axis is **inference paradigm**, not parameter count. Maekawa is *step-wise iterative prompting* (many forward passes per document, one per parser action); our decoder_only_* parsers are *one-shot generation* (a single forward decode of the entire serialized tree). Reporting "X% of the parameters" is misleading because step-wise amortizes compute over many calls — wall-clock comparisons depend strongly on the document's action count. The fair framing if our numbers approach Maekawa's: "competitive at one-shot decode with substantially lower per-document inference cost."
+- **Comparison framing**: the relevant axis is **inference paradigm**, not parameter count. Maekawa is *step-wise iterative prompting* (many forward passes per document, one per parser action). Our decoder_only_* parsers are *one-shot generation* (a single forward decode of the entire serialized tree). Reporting "X% of the parameters" is misleading because step-wise amortizes compute over many calls. Wall-clock comparisons depend strongly on the document's action count. The fair framing if our numbers approach Maekawa's: "competitive at one-shot decode with substantially lower per-document inference cost."
 - **arXiv**: https://arxiv.org/abs/2403.05065 ; **code**: https://github.com/nttcslab-nlp/RSTParser_EACL24
 
 ### Hu & Wan 2023 (TASLP)
@@ -174,6 +174,11 @@ For context when interpreting cluster-run numbers.
 - **Headline**: With fixed beam search, +6.8 unlabelled / +2.9 labelled F1 over a vanilla RNNG baseline on RST-DT. Comparable to non-additional-data SOTA at the time.
 - **Closest comparison in our matrix**: `seq2seq_sr` with `use_copy=False` (if we ever ran it; currently not supported by design) — but more importantly, `seq2seq_sexp` post-order with `use_copy=False` since the RNNG's unrolled trace is isomorphic to a depth-first bracketed tree with words in-stream.
 - **arXiv**: https://arxiv.org/abs/1909.11049 ; **ACL**: https://aclanthology.org/D19-1233/
+
+## Known confounds
+
+- **`label_smoothing` scale across `use_copy` modes**: when `use_copy=True` the action head projects to ~100 classes; when `use_copy=False` it projects to the full backbone vocabulary (~262K classes). A raw `label_smoothing=0.1` puts wildly different per-off-class mass in the two regimes (0.1/100 vs 0.1/262000), which silently amplifies any apparent gap between the modes. The sexp configs `__post_init__` now scales `label_smoothing` by `~ACTION_HEAD_SIZE / ~FULL_VOCAB_SIZE` (~100/262000 ~ 4e-4) when `use_copy=False`, so the per-off-class smoothing mass stays comparable across modes. Setting `label_smoothing=0.0` explicitly is treated as idempotent (no override) so a paper-reader who wants raw zero smoothing gets it.
+- **Head architecture is bound to `use_copy`**: with `use_copy=True` we replace the lm_head with a small fresh `Linear(hidden, ~100)`. With `use_copy=False` we keep the full pretrained lm_head. So a `use_copy` ablation conflates "having COPY" with "tiny vs full head". This is a property of the COPY mechanism itself and not a confound we can remove without breaking one mode or the other (see the `use_copy` field docstring in both sexp configs).
 
 ## Takeaways for cluster runs
 

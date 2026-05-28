@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from iudex.common.log import warn
-from iudex.rst.data.tree import Reduce, RstTree, Shift
+from iudex.rst.data.tree import Reduce, RstTree
 from iudex.rst.parsers.common.sexp_constraints import (
     GoldEduForcer,
     SexpDecodingState,
@@ -522,9 +522,6 @@ class Seq2SeqSexpParser(nn.Module):
         """
         if not self.action_token_ids:
             raise RuntimeError("encode_target called before action vocab was installed; set cfg.relation_types first.")
-        actions = tree.parsing_actions()
-        if not actions and len(tree.edus) != 1:
-            return None
         _text, edu_subwords = self._edu_subword_ids(tree)
 
         label_ids: list[int] = []
@@ -557,45 +554,39 @@ class Seq2SeqSexpParser(nn.Module):
                     seen_ids.append(src_id)
             emit_close()
 
-        # Build binarized internal-node list. `parsing_actions` is DFS
-        # pre-order over the split index (each entry: (split, nuc, rel)).
-        # Translate to a list of (lo, hi, nuc, rel) spans by replaying the
-        # split decisions. The same helper logic is the inverse path used
-        # by `from_parsing_actions`.
-        spans = self._spans_from_parsing_actions(actions, n_edus=len(tree.edus))
-
-        # Render in the chosen traversal order. spans are keyed by
-        # (lo, hi) where lo, hi are EDU indices (inclusive lo, exclusive hi).
-        span_by_lohi: dict[tuple[int, int], tuple[int, str, str]] = {
-            (lo, hi): (split, nuc, rel) for lo, hi, split, nuc, rel in spans
-        }
-
-        def walk(lo: int, hi: int):
-            # [lo, hi). hi - lo == 1 -> leaf. Else internal: emit accordingly.
-            if hi - lo == 1:
-                emit_leaf(lo)
-                return
-            key = (lo, hi)
-            if key not in span_by_lohi:
-                raise ValueError(f"encode_target: no parsing action for span {key}")
-            split, nuc, rel = span_by_lohi[key]
-            if self.config.traversal_order == "preorder":
-                emit_open()
-                emit_label(nuc, rel)
-                walk(lo, split)
-                walk(split, hi)
-                emit_close()
-            else:
-                emit_open()
-                walk(lo, split)
-                walk(split, hi)
-                emit_label(nuc, rel)
-                emit_close()
-
         if len(tree.edus) == 1:
             emit_leaf(0)
         else:
-            walk(0, len(tree.edus))
+            # Walk the binarized tree directly. `_build_binary_tree` returns
+            # leaves as ("edu", text) and internals as ("node", nuc, rel,
+            # left, right) in text order, so no DFS-order replay of
+            # `parsing_actions` is needed (and the prior right-first
+            # ordering of `parsing_actions` made that replay incorrect on
+            # real trees).
+            binary = tree._build_binary_tree()
+            edu_idx = [0]
+
+            def walk(node):
+                if node[0] == "edu":
+                    emit_leaf(edu_idx[0])
+                    edu_idx[0] += 1
+                    return
+                _, nuc, rel, left, right = node
+                if self.config.traversal_order == "preorder":
+                    emit_open()
+                    emit_label(nuc, rel)
+                    walk(left)
+                    walk(right)
+                    emit_close()
+                else:
+                    emit_open()
+                    walk(left)
+                    walk(right)
+                    emit_label(nuc, rel)
+                    emit_close()
+
+            walk(binary)
+
         label_ids.append(self.tokenizer.eos_token_id)
         seen_ids.append(self.tokenizer.eos_token_id)
         decoder_input_ids = [self.decoder_start_token_id] + seen_ids[:-1]
@@ -607,28 +598,6 @@ class Seq2SeqSexpParser(nn.Module):
             )
             return None
         return label_ids, decoder_input_ids
-
-    @staticmethod
-    def _spans_from_parsing_actions(actions, n_edus):
-        """Replay the (split, nuc, rel) DFS list to extract every internal
-        span's `(lo, hi, split, nuc, rel)`. `parsing_actions` is pre-order
-        over splits: process root first, recurse left, recurse right."""
-        spans: list[tuple[int, int, int, str, str]] = []
-        if n_edus <= 1:
-            return spans
-        i = [0]
-
-        def rec(lo: int, hi: int):
-            if hi - lo == 1:
-                return
-            split, nuc, rel = actions[i[0]]
-            i[0] += 1
-            spans.append((lo, hi, split, nuc, rel))
-            rec(lo, split)
-            rec(split, hi)
-
-        rec(0, n_edus)
-        return spans
 
     # -----------------------------------------------------------------
     # Inference helpers
@@ -647,6 +616,23 @@ class Seq2SeqSexpParser(nn.Module):
             ids = ids[1:]
         return ids
 
+    def _tokenizer_special_ids(self) -> frozenset[int]:
+        ids: set[int] = set()
+        for attr in ("pad_token_id", "bos_token_id", "unk_token_id", "decoder_start_token_id"):
+            v = getattr(self.tokenizer, attr, None)
+            if v is not None:
+                ids.add(int(v))
+        # Catches additional specials (PAD aliases, model-specific markers).
+        for v in getattr(self.tokenizer, "all_special_ids", []) or []:
+            ids.add(int(v))
+        dst = getattr(self, "decoder_start_token_id", None)
+        if dst is not None:
+            ids.add(int(dst))
+        # EOS, structural specials, and copy live in their own slots in
+        # `structural_ids()`, so don't add them here either (they'd be a
+        # no-op union but it's tidier to keep the sets disjoint).
+        return frozenset(ids)
+
     def _initial_state(self, source_ids: list[int]) -> SexpDecodingState:
         return SexpDecodingState(
             source_len=len(source_ids),
@@ -660,6 +646,7 @@ class Seq2SeqSexpParser(nn.Module):
             source_ids=tuple(source_ids) if not self.config.use_copy else (),
             min_edu_length=int(self.config.min_edu_length),
             constrain_content=bool(self.config.constrain_content),
+            tokenizer_special_ids=self._tokenizer_special_ids(),
         )
 
     def _full_ids_to_head_mask(self, state: SexpDecodingState, head_V: int) -> torch.Tensor:
@@ -1244,14 +1231,20 @@ class Seq2SeqSexpParser(nn.Module):
                     kind_stack[-1] = "leaf"
                     leaf_open = True
             else:
-                # Source-id token (use_copy=False) or unexpected.
-                if cursor < len(source_ids) and tok == source_ids[cursor]:
-                    leaf_buffer.append(tok)
+                # Source-id token (use_copy=False) or free-content emission.
+                # Mirror decoder_only_sexp: buffer the token unconditionally
+                # and advance cursor based on constraint mode. Under
+                # constrain_content=False the model emits its own subwords,
+                # so the cursor advances per emission regardless of match.
+                leaf_buffer.append(tok)
+                if self.config.constrain_content:
+                    if cursor < len(source_ids) and tok == source_ids[cursor]:
+                        cursor += 1
+                else:
                     cursor += 1
-                    if kind_stack and kind_stack[-1] is None:
-                        kind_stack[-1] = "leaf"
-                        leaf_open = True
-                # else: ignore unexpected tokens (constraint should prevent)
+                if kind_stack and kind_stack[-1] is None:
+                    kind_stack[-1] = "leaf"
+                    leaf_open = True
 
         # Best-effort close: drain any unclosed leaf/internal.
         while kind_stack:
