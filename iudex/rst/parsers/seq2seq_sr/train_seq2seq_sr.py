@@ -417,13 +417,14 @@ def train(cfg: Seq2SeqSRConfig) -> None:
     def _validate(epoch: int) -> None:
         nonlocal best_val, stale
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
+        # Per-epoch validation deliberately skips the gold-EDU pass to save
+        # time. Final dev/test eval below always runs it.
         metrics = _evaluate_on_dev(
             model,
             per_epoch_dev,
             num_beams=dev_beams,
             batch_size=cfg.dev_batch_size,
             output_dir=pred_dir,
-            eval_gold_edu=cfg.eval_gold_edu,
         )
         tb.log_scalars("dev", metrics, global_step)
         console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
@@ -571,7 +572,7 @@ def train(cfg: Seq2SeqSRConfig) -> None:
             num_beams=cfg.num_beams,
             batch_size=cfg.dev_batch_size,
             output_dir=os.path.join(run_dir, "dev_predictions", "final"),
-            eval_gold_edu=cfg.eval_gold_edu,
+            eval_gold_edu=True,
         )
         console.print(metrics_table(dev_m, title="Final Dev Results"))
         final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
@@ -582,7 +583,7 @@ def train(cfg: Seq2SeqSRConfig) -> None:
                 num_beams=cfg.num_beams,
                 batch_size=cfg.dev_batch_size,
                 output_dir=os.path.join(run_dir, "test_predictions", "final"),
-                eval_gold_edu=cfg.eval_gold_edu,
+                eval_gold_edu=True,
             )
             console.print(metrics_table(test_m, title="Final Test Results"))
             final_metrics["test"] = test_m

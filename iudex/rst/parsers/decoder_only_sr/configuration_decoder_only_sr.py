@@ -90,8 +90,6 @@ class DecoderOnlySRConfig(FromParams):
     dev_max_docs: int | None = None
     dev_batch_size: int = 1
 
-    eval_gold_edu: bool = False
-
     action_loss_weight: float = 1.0
     label_smoothing: float = 0.1
 

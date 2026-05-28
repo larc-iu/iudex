@@ -59,5 +59,4 @@
     use_validity_constraints: true,
     eval_decode_greedy: true,
     min_edu_length: 1,
-    eval_gold_edu: false,
 }

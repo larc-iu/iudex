@@ -67,7 +67,4 @@
     // <shift> becomes legal. 1 = no constraint. Bump to 2 or 3 to suppress
     // over-segmentation at decode time.
     min_edu_length: 1,
-    // When true, also report Parseval under forced gold-EDU segmentation
-    // for apples-to-apples comparison against parsers that assume gold EDUs.
-    eval_gold_edu: false,
 }

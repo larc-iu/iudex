@@ -54,7 +54,6 @@ def _build_parser():
         max_input_length=128,
         max_output_length=128,
         min_edu_length=1,
-        eval_gold_edu=True,
     )
     try:
         return DecoderOnlySRParser(cfg)

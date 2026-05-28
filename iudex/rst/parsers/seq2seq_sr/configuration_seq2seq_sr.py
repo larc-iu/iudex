@@ -123,13 +123,6 @@ class Seq2SeqSRConfig(FromParams):
     # in batch_size up to memory. 1 = original per-document loop.
     dev_batch_size: int = 1
 
-    # When True, dev/test eval runs a second pass with gold-EDU segmentation
-    # forced at decode time (cursor-driven copy/shift; reduces stay free), and
-    # reports Parseval under `gold_edu_{span,nuc,rel,full}_f1`. Apples-to-apples
-    # comparison surface with gold-EDU parsers like topdown_biaffine. Off by
-    # default; `val_metric_name` is unaffected.
-    eval_gold_edu: bool = False
-
     # Multiplier on the gradient contribution of structural-action positions
     # (`<shift>`, `<reduce_*>`) in the training loss. Default 1.0 (no
     # rebalance) since the replacement lm_head projects to ~100 action
