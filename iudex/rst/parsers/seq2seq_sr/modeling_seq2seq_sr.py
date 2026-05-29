@@ -415,9 +415,15 @@ class Seq2SeqSRParser(nn.Module):
         n_old = int(self._original_vocab_size)
 
         def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
-            out = grad.clone()
-            out[:n_old].zero_()
-            return out
+            # Zero in place rather than `grad.clone()` then zero: the embed
+            # gradient is the largest trainable tensor in the model (full
+            # vocab x hidden, ~600 MB bf16 for T5Gemma 2 1B-1B), and cloning
+            # it doubles that allocation at backward peak. This hook is the
+            # sole consumer of the leaf Parameter's accumulation grad (one
+            # tied Parameter after `_retie_modules_to_save`, hooked once), so
+            # the incoming grad isn't aliased elsewhere and in-place is safe.
+            grad[:n_old].zero_()
+            return grad
 
         hooked: dict[int, tuple[str, nn.Parameter]] = {}
         for name, mod in self.model.named_modules():

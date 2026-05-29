@@ -307,9 +307,12 @@ class DecoderOnlySexpParser(nn.Module):
         n_old = int(self._original_vocab_size)
 
         def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
-            out = grad.clone()
-            out[:n_old].zero_()
-            return out
+            # Zero in place rather than clone-then-zero: the embed gradient is
+            # the largest trainable tensor in the model and cloning it doubles
+            # that allocation at backward peak. This hook is the sole consumer
+            # of the leaf Parameter's accumulation grad, so in-place is safe.
+            grad[:n_old].zero_()
+            return grad
 
         canonical.register_hook(_zero_old_rows)
         logger.info(
