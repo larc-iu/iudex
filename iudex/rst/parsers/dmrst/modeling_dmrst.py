@@ -16,6 +16,49 @@ from iudex.rst.parsers.common.segmentation import Segmenter
 from iudex.rst.parsers.dmrst.configuration_dmrst import DMRSTConfig
 
 
+def encode_tokens_fixed_window(
+    encoder: nn.Module,
+    input_ids: torch.Tensor,
+    window_size: int,
+    context: int,
+) -> torch.Tensor:
+    """DMRST's original fixed sliding-window encoding (reference module.py
+    EncoderRNN.forward).
+
+    Encodes `window_size` content tokens per step. Each LM call also sees
+    `context` neighbor tokens on each interior side (and 2*context on the open
+    side of the first/last window) which are sliced off after encoding, so every
+    position gets bidirectional context and lands in exactly one output slice. No
+    [CLS]/[SEP] are added (the original feeds raw token ids), so the LM sees at
+    most window_size + 2*context tokens per call (500 with the paper's 300/100).
+    Requires window_size + 2*context <= the encoder's positional budget.
+
+    Returns: [num_tokens, hidden_size] (1:1 with input positions).
+    """
+    seqlen = input_ids.shape[0]
+    hidden_size = encoder.config.hidden_size
+    if seqlen == 0:
+        return torch.empty((0, hidden_size), device=input_ids.device)
+    edge = 2 * context
+    slide_steps = (seqlen + window_size - 1) // window_size
+    pieces = []
+    for step in range(slide_steps):
+        if step == 0:
+            window = input_ids[: window_size + edge]
+            emb = encoder(input_ids=window.unsqueeze(0)).last_hidden_state[0, :window_size]
+        elif step == slide_steps - 1:
+            remaining = seqlen - window_size * step
+            window = input_ids[-(remaining + edge) :]
+            emb = encoder(input_ids=window.unsqueeze(0)).last_hidden_state[0, edge:]
+        else:
+            window = input_ids[window_size * step - context : window_size * (step + 1) + context]
+            emb = encoder(input_ids=window.unsqueeze(0)).last_hidden_state[0, context : window_size + context]
+        pieces.append(emb)
+    out = torch.cat(pieces, dim=0)
+    assert out.shape[0] == seqlen, f"fixed-window encoding produced {out.shape[0]} tokens, expected {seqlen}"
+    return out
+
+
 class _LabelClassifier(nn.Module):
     """Deep biaffine classifier (Dozat & Manning) over joint nuclearity+relation
     labels, e.g. "SN_elaboration".
@@ -260,6 +303,13 @@ class DMRSTParser(nn.Module):
             compile_encoder=compile_encoder,
         )
 
+    def _encode_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Token-level encoding, selecting DMRST's original fixed sliding window
+        (`encoder_window_size` set) or the shared max-length striding."""
+        if self.config.encoder_window_size is not None:
+            return encode_tokens_fixed_window(self.encoder, input_ids, self.config.encoder_window_size, self.stride)
+        return encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
+
     def _encode(self, tree: RstTree) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full encoder pass using gold EDU segmentation.
 
@@ -278,7 +328,7 @@ class DMRSTParser(nn.Module):
             detokenizer=self.detokenizer,
             prefixes=tree.edu_prefixes if self.use_edu_prefixes else None,
         )
-        embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
+        embeddings = self._encode_tokens(input_ids)
         normed = self.layer_norm(embeddings.float())  # [num_tokens, hidden_size]
 
         if self.segmenter is not None and self.training:
@@ -520,7 +570,7 @@ class DMRSTParser(nn.Module):
             # exactly one root). Single-EDU is handled below.
             raise ValueError("predict_from_text: input text tokenized to zero tokens")
         input_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
-        embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
+        embeddings = self._encode_tokens(input_ids)
         normed = self.layer_norm(embeddings.float())
 
         breaks = self.segmenter.predict_breaks(normed)
@@ -568,7 +618,7 @@ class DMRSTParser(nn.Module):
             detokenizer=self.detokenizer,
             prefixes=tree.edu_prefixes if self.use_edu_prefixes else None,
         )
-        token_embeddings = encode_tokens_strided(self.encoder, self.tokenizer, input_ids, self.max_length, self.stride)
+        token_embeddings = self._encode_tokens(input_ids)
         normed = self.layer_norm(token_embeddings.float())
         embeddings = self.encoder_dropout(normed)  # eval mode → identity
 

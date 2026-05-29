@@ -84,6 +84,12 @@ class DMRSTConfig(FromParams):
     # Model
     model_name: str = "xlm-roberta-base"
     stride: int = 100
+    # When set, encode with DMRST's original fixed sliding-window scheme
+    # (reference module.py EncoderRNN): `encoder_window_size` content tokens per
+    # window, `stride` context tokens discarded per interior side, no [CLS]/[SEP].
+    # Requires encoder_window_size + 2*stride <= the encoder's positional budget.
+    # None (default) uses the shared max-length striding (CLS/SEP per chunk).
+    encoder_window_size: int | None = None
     attention_type: str = "dot_product"  # or "biaffine"
     classifier_use_bias: bool = True
     num_rnn_layers: int = 1

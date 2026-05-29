@@ -3,8 +3,11 @@
     relation_map: import 'lib/rstdt_coarse_map.libsonnet',
 
     // Model
-    model_name: "jhu-clsp/ettin-encoder-400m",
+    model_name: "xlm-roberta-base",
     stride: 100,
+    // DMRST's original fixed 300-token sliding window (reference EncoderRNN):
+    // 300 content tokens per window with `stride` context discarded per side.
+    encoder_window_size: 300,
     attention_type: "dot_product",
     classifier_use_bias: true,
     num_rnn_layers: 1,
@@ -24,7 +27,7 @@
     // Joint EDU segmentation. Set to `null` to disable (lose `predict_from_text`).
     segmentation: {
         pos_weight: 10.0,
-        start_loss: false,
+        start_loss: true,
     },
 
     // Detokenize corpus EDU text to natural form so the segmenter trains on the
@@ -39,7 +42,7 @@
     // Training
     lr: 1e-4,
     encoder_lr: 2e-5,
-    max_epochs: 50,
+    max_epochs: 15,
     grad_accum: 3,
     patience: 10,
     max_grad_norm: 5.0,
@@ -53,9 +56,8 @@
     seed: 42,
     val_metric_name: "e2e_full_f1",
 
-    // Dynamic loss weighting. `window: 2` reproduces the paper's lagged
-    // L(t-1)/L(t-2) ratio; larger windows give smoother ratios at the cost
-    // of slower adaptation (recommended for noisy whole-tree training).
-    // Set to `null` for unweighted sum.
-    dlw: { temperature: 2.0, window: 30 },
+    // Dynamic loss weighting (paper §3.2). `window: 2` is the paper's lagged
+    // L(t-1)/L(t-2) ratio. Larger windows smooth the ratio at the cost of
+    // slower adaptation. Set to `null` for an unweighted sum.
+    dlw: { temperature: 2.0, window: 2 },
 }
