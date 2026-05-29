@@ -513,6 +513,12 @@ class GoldEduForcer:
             new_state = state.step(chosen_id)
             forcer.observe(state, new_state, chosen_id)
             state = new_state
+
+    Assumes the driven state has `min_edu_length == 1` (both consumers pin it
+    for the forced state). With `min_edu_length > 1` an earlier leaf can
+    overshoot and exhaust the source before a later leaf can start, deadlocking
+    the forcer into an OPEN-spin to max length; honoring min_edu>1 here would
+    need a force-toward-close fallback rather than deferring to the model.
     """
 
     def __init__(self, n_edus_target: int, gold_ranges: List[tuple]) -> None:
@@ -522,23 +528,26 @@ class GoldEduForcer:
         # subword and fell back to an `(anchor, anchor)` range) and backward
         # (non-monotonic) starts would otherwise make the forcer spin OPEN on
         # a frame whose leaf can never receive content and can never close.
-        # Drop zero-width ranges and clamp each range's end to be strictly
-        # greater than the running monotonic floor, so every surviving range
-        # is a non-empty, non-decreasing forward span. The per-parser range
-        # producers clamp ranges to source_len before constructing the forcer,
-        # this is the belt-and-suspenders guard in the shared forcer.
+        # Drop any range that has no room left past the running monotonic
+        # floor, so every surviving range is a non-empty, non-decreasing
+        # forward span keyed to a REAL gold end (never a fabricated one).
+        # Clamping the start up to the floor and then keeping the true gold
+        # end `e` is safe; fabricating `end = start + 1` past the floor would
+        # invent a leaf with no content target and re-trigger the OPEN-runaway
+        # this guard exists to prevent. The per-parser range producers already
+        # emit tiling ranges (the C1 alignment helper), so this is the
+        # belt-and-suspenders guard in the shared forcer.
         sanitized: List[tuple] = []
         floor = 0
         for s, e in gold_ranges:
             s, e = int(s), int(e)
-            start = max(s, floor)
-            end = max(e, start + 1)  # ensure width >= 1 from the (clamped) start
             if e <= s:
-                # Zero-width / inverted gold range: skip it entirely rather
-                # than fabricate a leaf with no real content target.
-                continue
-            sanitized.append((start, end))
-            floor = end
+                continue  # zero-width / inverted gold range
+            start = max(s, floor)
+            if e <= start:
+                continue  # range falls entirely behind the floor: no room
+            sanitized.append((start, e))
+            floor = e
         self.n_edus_target = len(sanitized)
         self.gold_ranges = sanitized
         self.closed_leaves = 0

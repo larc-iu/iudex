@@ -299,6 +299,24 @@ def test_m6_non_monotonic_start_clamped():
     assert final.cursor == source_len
 
 
+def test_m6_overlapping_range_dropped_not_fabricated():
+    """A later range whose room is fully consumed by the monotonic floor is
+    DROPPED, not fabricated into a phantom leaf past source_len. Regression for
+    the `end = max(e, start+1)` bug that re-triggered the OPEN-runaway."""
+    # Second range overlaps the first; once clamped its start hits source_len.
+    gold_ranges = [(0, 4), (3, 4)]  # floor after first = 4; second clamps to start 4, e=4 -> no room
+    source_len = 4
+    state = _make_state(source_len, "preorder")
+    forcer = GoldEduForcer(len(gold_ranges), gold_ranges)
+    assert forcer.gold_ranges == [(0, 4)]  # phantom (4, 5) leaf never fabricated
+    assert forcer.n_edus_target == 1
+    assert all(e <= source_len for _, e in forcer.gold_ranges)
+
+    final, actions, n_steps = _run_forced_decode(state, forcer, max_steps=200)
+    assert final.is_terminal(), f"runaway: {n_steps} steps, actions={actions}"
+    assert final.cursor == source_len
+
+
 def test_m6_all_zero_width_yields_empty_target():
     """If every gold range is zero-width, the forcer targets zero leaves
     (n_edus_target == 0). At pre-root it forces EOS (empty tree)."""

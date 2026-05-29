@@ -266,8 +266,10 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
     train_ds, dropped = _build_dataset(model, train_pairs)
     if dropped > 0:
         warn(
-            f"Dropped {dropped}/{len(train_pairs)} training trees whose target exceeded "
-            f"max_output_length={cfg.max_output_length}. Bump it if this is a large fraction."
+            f"Dropped {dropped}/{len(train_pairs)} training trees (source > "
+            f"max_input_length={cfg.max_input_length} or target > "
+            f"max_output_length={cfg.max_output_length}; see per-tree warnings above). "
+            f"Bump the caps if this is a large fraction."
         )
 
     collate = _make_collator(model.tokenizer.pad_token_id)
