@@ -208,6 +208,15 @@ def resume_or_init(
         return {"global_step": 0, "epoch": 0, "best_val": -1.0, "stale_validations": 0}
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    # Optimizer state was just loaded onto CPU (see map_location in try_resume).
+    # Move it to the params' device so the first step() doesn't hit a
+    # CPU-state vs GPU-grad device mismatch. Factored Adafactor state is tiny,
+    # so this is cheap and not a memory concern.
+    opt_device = next(model.parameters()).device
+    for opt_state in optimizer.state.values():
+        for k, v in opt_state.items():
+            if isinstance(v, torch.Tensor):
+                opt_state[k] = v.to(opt_device)
     scheduler.load_state_dict(ckpt["scheduler_state_dict"])
     return {
         "global_step": ckpt["global_step"],
@@ -299,7 +308,12 @@ def try_resume(checkpoint_path: str, *, expected_hash: str) -> dict[str, Any] | 
     """
     if not os.path.exists(checkpoint_path):
         return None
-    ckpt = torch.load(checkpoint_path, weights_only=False)
+    # map_location="cpu" is load-bearing: checkpoints are saved with the
+    # state dicts on GPU, so without it `torch.load` restores every tensor
+    # (a full duplicate of the model weights plus optimizer state) onto the
+    # GPU on top of the already-constructed GPU model, transiently doubling
+    # VRAM at resume and OOMing a run that trains fine from scratch.
+    ckpt = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
     found_hash = ckpt.get("config_hash")
     if found_hash != expected_hash:
         warn(
