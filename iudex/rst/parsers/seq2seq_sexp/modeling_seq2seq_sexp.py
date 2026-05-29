@@ -36,7 +36,9 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import Reduce, RstTree
+from iudex.rst.parsers.common.encoding import align_edus_to_tokens
 from iudex.rst.parsers.common.sexp_constraints import (
+    FORCE_CONTENT,
     GoldEduForcer,
     SexpDecodingState,
 )
@@ -496,29 +498,8 @@ class Seq2SeqSexpParser(nn.Module):
     def _edu_subword_ids(self, tree: RstTree) -> tuple[str, list[list[int]]]:
         """Per-EDU subword IDs in the encoder's whole-doc tokenization space."""
         text = _reconstruct_text(tree)
-        enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-        full_input_ids = enc["input_ids"]
-        offsets = enc["offset_mapping"]
-        edu_subword_ids: list[list[int]] = []
-        char_cursor = 0
-        for i, edu in enumerate(tree.edus):
-            if i > 0:
-                prefix = edu.prefix if edu.prefix is not None else " "
-                char_cursor += len(prefix)
-            char_start = char_cursor
-            char_cursor += len(edu.text)
-            char_end = char_cursor
-            first: int | None = None
-            last: int | None = None
-            for j, (tok_cs, tok_ce) in enumerate(offsets):
-                if tok_cs < char_end and tok_ce > char_start:
-                    if first is None:
-                        first = j
-                    last = j
-            if first is None or last is None:
-                edu_subword_ids.append([])
-            else:
-                edu_subword_ids.append(list(full_input_ids[first : last + 1]))
+        full_input_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
+        edu_subword_ids = [list(full_input_ids[s:e]) for s, e in spans]
         return text, edu_subword_ids
 
     def encode_target(self, tree: RstTree) -> tuple[list[int], list[int]] | None:
@@ -539,6 +520,22 @@ class Seq2SeqSexpParser(nn.Module):
         if not self.action_token_ids:
             raise RuntimeError("encode_target called before action vocab was installed; set cfg.relation_types first.")
         _text, edu_subwords = self._edu_subword_ids(tree)
+
+        # The target references source subwords from the FULL (untruncated) doc
+        # tokenization, but `encode_input` truncates the encoder source to
+        # `max_input_length`. If the source overruns that budget the target
+        # would reference positions the encoder never saw (and under
+        # use_copy=False the labels themselves become unseen source ids). Drop
+        # the tree rather than emit a desynced (source, target) pair. The minus
+        # one budgets the trailing special token `encode_input` adds.
+        source_subword_count = sum(len(ids) for ids in edu_subwords)
+        if source_subword_count > self.config.max_input_length - 1:
+            warn(
+                f"Source too long: {source_subword_count} > max_input_length="
+                f"{self.config.max_input_length} subwords for a {len(tree.edus)}-EDU tree. "
+                f"Tree DROPPED (would desync target from truncated encoder source)."
+            )
+            return None
 
         label_ids: list[int] = []
         seen_ids: list[int] = []
@@ -742,9 +739,6 @@ class Seq2SeqSexpParser(nn.Module):
 
             state = self._initial_state(source_ids)
             action_seq: list[int] = []  # full-vocab IDs in emission order
-            edu_starts: list[int] = []
-            edu_ends: list[int] = []
-            current_edu_start: int | None = None
 
             decoder_input_ids = torch.full((1, 1), self.decoder_start_token_id, device=device, dtype=torch.long)
             past_key_values = None
@@ -776,28 +770,11 @@ class Seq2SeqSexpParser(nn.Module):
                 full_id = self.full_id_for_head_idx[head_idx] if self.config.use_copy else head_idx
                 action_seq.append(full_id)
 
-                # Track EDU boundaries via state transitions (in_edu_leaf flips).
-                pre_in_leaf = state.in_edu_leaf
                 try:
                     state = state.step(full_id)
                 except ValueError:
                     done = True
                     break
-                post_in_leaf = state.in_edu_leaf
-                if not pre_in_leaf and post_in_leaf:
-                    current_edu_start = state.cursor - (1 if state.cursor > 0 else 0)
-                    # `state.cursor` already advanced if the token was content;
-                    # initial open is structural (cursor unchanged). The first
-                    # content emission inside a leaf sets cursor to start+1, so
-                    # the leaf actually started at cursor-1 in the source IDs
-                    # only if a content token transitioned us. We rely on the
-                    # cleaner post-pass below instead.
-                if pre_in_leaf and not post_in_leaf:
-                    # Close of leaf: record (start, cursor).
-                    if current_edu_start is not None:
-                        edu_starts.append(current_edu_start)
-                        edu_ends.append(state.cursor)
-                        current_edu_start = None
 
                 next_input = full_id
                 if self.config.use_copy and full_id == self.copy_token_id:
@@ -1085,19 +1062,29 @@ class Seq2SeqSexpParser(nn.Module):
                 logits = out.logits[0, -1, :]
 
                 narrowed = forcer.narrowed_legal(state)
-                if narrowed is not None and len(narrowed) == 1:
+                if isinstance(narrowed, frozenset) and len(narrowed) == 1:
                     full_id = int(next(iter(narrowed)))
                 else:
                     V = int(logits.size(-1))
-                    mask = self._full_ids_to_head_mask(state, V).to(logits.device)
-                    if narrowed is not None:
-                        # Multi-element narrowing (e.g. label slot). Intersect.
-                        keep = torch.zeros_like(mask)
-                        for fid in narrowed:
-                            hi = self.head_idx_for_full_id.get(int(fid)) if self.config.use_copy else int(fid)
-                            if hi is not None and 0 <= int(hi) < V:
-                                keep[int(hi)] = True
-                        mask = mask & keep
+                    if narrowed is FORCE_CONTENT:
+                        # Admit ONLY the content wildcard: all-True minus every
+                        # structural id (CLOSE included, so the leaf can't close
+                        # before the gold target_end). Don't re-enable any legal
+                        # structural ids the wildcard path otherwise would.
+                        mask = torch.ones(V, dtype=torch.bool, device=logits.device)
+                        for fid in state.structural_ids():
+                            if 0 <= int(fid) < V:
+                                mask[int(fid)] = False
+                    else:
+                        mask = self._full_ids_to_head_mask(state, V).to(logits.device)
+                        if isinstance(narrowed, frozenset):
+                            # Multi-element narrowing (e.g. label slot). Intersect.
+                            keep = torch.zeros_like(mask)
+                            for fid in narrowed:
+                                hi = self.head_idx_for_full_id.get(int(fid)) if self.config.use_copy else int(fid)
+                                if hi is not None and 0 <= int(hi) < V:
+                                    keep[int(hi)] = True
+                            mask = mask & keep
                     masked = torch.where(mask, logits, torch.full_like(logits, float("-inf")))
                     head_idx = int(masked.argmax(-1).item())
                     full_id = self.full_id_for_head_idx[head_idx] if self.config.use_copy else head_idx
@@ -1299,30 +1286,8 @@ def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
     """Per-EDU (start, end_exclusive) ranges in the encoder's whole-doc
     tokenization space. Mirrors the seq2seq_sr helper."""
     text = _reconstruct_text(tree)
-    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    offsets = enc["offset_mapping"]
-    mapping: list[tuple[int, int]] = []
-    char_cursor = 0
-    for i, edu in enumerate(tree.edus):
-        if i > 0:
-            prefix = edu.prefix if edu.prefix is not None else " "
-            char_cursor += len(prefix)
-        char_start = char_cursor
-        char_cursor += len(edu.text)
-        char_end = char_cursor
-        first: int | None = None
-        last: int | None = None
-        for j, (tok_cs, tok_ce) in enumerate(offsets):
-            if tok_cs < char_end and tok_ce > char_start:
-                if first is None:
-                    first = j
-                last = j
-        if first is None or last is None:
-            anchor = first if first is not None else max(0, len(offsets) - 1)
-            mapping.append((anchor, anchor))
-            continue
-        mapping.append((first, last + 1))
-    return mapping
+    _full_input_ids, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
+    return list(spans)
 
 
 def _edu_ranges_from_actions(

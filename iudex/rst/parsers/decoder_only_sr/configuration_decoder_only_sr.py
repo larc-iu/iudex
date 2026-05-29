@@ -49,8 +49,9 @@ class DecoderOnlySRConfig(FromParams):
 
     # Single-stream layout, so length budgets must accommodate
     # source + actions + 2 specials (BOS + SEP) in one sequence. Naming
-    # mirrors seq2seq_sr so per-side caps stay readable; the trainer
-    # enforces the combined length internally.
+    # mirrors seq2seq_sr so per-side caps stay readable; `encode_target`
+    # enforces the combined length (min of the per-side sum and the model's
+    # max_position_embeddings) and drops trees that overflow it.
     max_input_length: int = 3072
     max_output_length: int = 5120
     gradient_checkpointing: bool = False
@@ -84,6 +85,9 @@ class DecoderOnlySRConfig(FromParams):
 
     # Decoding
     num_beams: int = 4
+    # Honored by greedy decoding only. Beam search always applies the validity
+    # mask regardless of this flag (a feasible tree per beam is required to
+    # reconstruct), so setting it False has no effect under num_beams > 1.
     use_validity_constraints: bool = True
     eval_decode_greedy: bool = True
 

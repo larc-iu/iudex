@@ -35,7 +35,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import RstTree
+from iudex.rst.parsers.common.encoding import align_edus_to_tokens
 from iudex.rst.parsers.common.sexp_constraints import (
+    FORCE_CONTENT,
     GoldEduForcer,
     SexpDecodingState,
 )
@@ -61,8 +63,8 @@ class DecoderOnlySexpParser(nn.Module):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        torch_dtype = torch.bfloat16 if config.amp else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch_dtype)
+        model_dtype = torch.bfloat16 if config.amp else torch.float32
+        self.model = AutoModelForCausalLM.from_pretrained(config.model_name, dtype=model_dtype)
 
         self.label_token_ids: dict[str, int] = {}
         self.label_token_map: dict[str, tuple[str, str]] = {}
@@ -483,43 +485,35 @@ class DecoderOnlySexpParser(nn.Module):
     # -----------------------------------------------------------------
 
     def _tokenize_source(self, text: str) -> list[int]:
-        full_len = len(self.tokenizer(text, add_special_tokens=False).input_ids)
-        enc = self.tokenizer(text, add_special_tokens=False, truncation=True, max_length=self.config.max_input_length)
-        if full_len > self.config.max_input_length:
+        """Tokenize the inference source WITHOUT truncation.
+
+        M5: truncating here desynced the target/eval bookkeeping. Training
+        (`encode_target` via `_edu_subword_ids`) and the eval gold mapping
+        (`_gold_edu_token_mapping` / `_gold_edu_source_ranges`) both tokenize
+        the full doc, so a truncated inference source put pred EDU/source
+        ranges in a different (shorter) token-index space than the full-doc
+        gold ranges, misaligning seg metrics and, under use_copy=False,
+        making the constraint reference source ids the model never saw.
+        Keeping the full-doc tokenization here puts all three in one index
+        space. Over-long docs simply exceed the model's position budget (a
+        capacity concern, not a correctness one) and emit a warning; training
+        DROPS them, so they are out of scope by design."""
+        ids = self.tokenizer(text, add_special_tokens=False).input_ids
+        if len(ids) > self.config.max_input_length:
             warn(
-                f"Source truncated: {full_len} -> {self.config.max_input_length} subwords. "
-                f"Bump max_input_length or the doc's tail is invisible to the model."
+                f"Source exceeds max_input_length: {len(ids)} > {self.config.max_input_length} subwords. "
+                f"Fed full-doc at inference (no truncation, to keep pred/gold token spaces aligned), "
+                f"but this doc is over the position budget and was dropped from training."
             )
-        return enc["input_ids"]
+        return ids
 
     def _edu_subword_ids(self, tree: RstTree) -> tuple[list[int], list[list[int]]]:
         """Tokenize the reconstructed doc text once. Return (source_ids,
-        per-EDU subword id lists) using character-offset alignment."""
+        per-EDU subword id lists) via the shared tiling helper, whose spans
+        partition source_ids exactly (no gaps/overlaps)."""
         text = _reconstruct_text(tree)
-        enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-        source_ids = enc["input_ids"]
-        offsets = enc["offset_mapping"]
-
-        edu_subword_ids: list[list[int]] = []
-        char_cursor = 0
-        for i, edu in enumerate(tree.edus):
-            if i > 0:
-                prefix = edu.prefix if edu.prefix is not None else " "
-                char_cursor += len(prefix)
-            char_start = char_cursor
-            char_cursor += len(edu.text)
-            char_end = char_cursor
-            first: int | None = None
-            last: int | None = None
-            for j, (tok_cs, tok_ce) in enumerate(offsets):
-                if tok_cs < char_end and tok_ce > char_start:
-                    if first is None:
-                        first = j
-                    last = j
-            if first is None or last is None:
-                edu_subword_ids.append([])
-            else:
-                edu_subword_ids.append(list(source_ids[first : last + 1]))
+        source_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
+        edu_subword_ids = [list(source_ids[s:e]) for s, e in spans]
         return source_ids, edu_subword_ids
 
     def _build_sexp_tokens(
@@ -625,6 +619,19 @@ class DecoderOnlySexpParser(nn.Module):
         # then EOS. -100 only on [BOS source].
         labels = [-100] * (1 + len(source_ids)) + [self.sep_token_id] + label_sexp
         assert len(input_ids) == len(labels), (len(input_ids), len(labels))
+
+        # The realized single stream is [BOS] + source + [SEP] + sexp, so per-side
+        # caps don't bound it. Drop trees whose combined length overflows the budget
+        # (the model's positional limit if cheaply known, else the sum of per-side caps).
+        sum_cap = self.config.max_input_length + self.config.max_output_length + 2
+        max_positions = getattr(self.model.config, "max_position_embeddings", None)
+        combined_cap = min(sum_cap, max_positions) if isinstance(max_positions, int) and max_positions > 0 else sum_cap
+        if len(input_ids) > combined_cap:
+            warn(
+                f"Combined stream overflowed: {len(input_ids)} > combined cap {combined_cap} "
+                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED from this epoch."
+            )
+            return None
         return input_ids, labels
 
     # -----------------------------------------------------------------
@@ -692,7 +699,12 @@ class DecoderOnlySexpParser(nn.Module):
         return [bos_id, *source_ids, self.sep_token_id]
 
     def _vocab_size(self) -> int:
-        return int(self._underlying_model().lm_head.weight.shape[0])
+        """Scoring-vocab size for use_copy=False beam decoding (head_V drives
+        `top_idx // head_V` / `% head_V`). Reading `lm_head.weight.shape[0]`
+        is fragile under PEFT (the head may be a LoRA/ModulesToSave wrapper
+        whose `.weight` is absent or wrong), so go through the tokenizer,
+        which is resized in lockstep with the embeddings."""
+        return len(self.tokenizer)
 
     def _mask_logits_for_state(
         self,
@@ -1079,11 +1091,25 @@ class DecoderOnlySexpParser(nn.Module):
 
             for step in range(self.config.max_output_length):
                 narrowed = forcer.narrowed_legal(state)
-                if narrowed is not None and len(narrowed) == 1:
+                if narrowed is FORCE_CONTENT:
+                    # Admit ONLY the content wildcard: every scoring id except
+                    # the structurals. We do NOT re-enable any legal structural
+                    # (in particular CLOSE stays masked mid-leaf), so the model
+                    # is forced to emit a content token. FORCE_CONTENT only
+                    # arises under use_copy=False, so the scoring space is the
+                    # full vocab and ids map 1:1 (no head remap).
+                    masked = logits.clone()
+                    V = int(masked.size(-1))
+                    for fid in state.structural_ids():
+                        if 0 <= int(fid) < V:
+                            masked[int(fid)] = float("-inf")
+                    head_idx = int(masked.argmax(-1).item())
+                    full_id = self._decode_full_id(head_idx)
+                elif isinstance(narrowed, frozenset) and len(narrowed) == 1:
                     full_id = int(next(iter(narrowed)))
                 else:
                     masked = self._mask_logits_for_state(logits, state)
-                    if narrowed is not None:
+                    if isinstance(narrowed, frozenset):
                         V = int(masked.size(-1))
                         keep = torch.full_like(masked, float("-inf"))
                         for fid in narrowed:
@@ -1171,7 +1197,6 @@ class DecoderOnlySexpParser(nn.Module):
         parts: list[str] = []
         leaf_buf: list[int] = []
         cursor = 0
-        in_leaf = False
 
         def flush_leaf():
             if leaf_buf:
@@ -1186,20 +1211,14 @@ class DecoderOnlySexpParser(nn.Module):
             if tok == self.open_token_id:
                 flush_leaf()
                 parts.append("(")
-                # Whether this opens an internal node or a leaf is determined
-                # by what comes next, but we set in_leaf optimistically and
-                # flip it back below if a label or another '(' shows up.
-                in_leaf = True
                 continue
             if tok == self.close_token_id:
                 flush_leaf()
                 parts.append(")")
-                in_leaf = False
                 continue
             if tok in self.label_id_set:
                 flush_leaf()
                 parts.append(self.label_id_to_str[tok][1:-1])  # strip the angle brackets
-                in_leaf = False
                 continue
             if self.config.use_copy and tok == self.copy_token_id:
                 if cursor < len(source_ids):
@@ -1241,30 +1260,8 @@ def _reconstruct_text(tree: RstTree) -> str:
 
 def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
     text = _reconstruct_text(tree)
-    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    offsets = enc["offset_mapping"]
-    mapping: list[tuple[int, int]] = []
-    char_cursor = 0
-    for i, edu in enumerate(tree.edus):
-        if i > 0:
-            prefix = edu.prefix if edu.prefix is not None else " "
-            char_cursor += len(prefix)
-        char_start = char_cursor
-        char_cursor += len(edu.text)
-        char_end = char_cursor
-        first: int | None = None
-        last: int | None = None
-        for j, (tok_cs, tok_ce) in enumerate(offsets):
-            if tok_cs < char_end and tok_ce > char_start:
-                if first is None:
-                    first = j
-                last = j
-        if first is None or last is None:
-            anchor = first if first is not None else max(0, len(offsets) - 1)
-            mapping.append((anchor, anchor))
-            continue
-        mapping.append((first, last + 1))
-    return mapping
+    _, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
+    return spans
 
 
 def _empty_tree(relation_types, text: str = "") -> RstTree:

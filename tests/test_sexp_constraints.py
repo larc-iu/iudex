@@ -3,8 +3,7 @@ s-expression seq2seq decoder).
 
 The state machine is a pure function of the action-id prefix. These tests
 build small synthetic vocabularies and walk known-valid / known-invalid
-action sequences against it, mirroring `tests/test_constraints.py`'s style
-for the shift-reduce processor.
+action sequences against it.
 
 Action-id convention used throughout (no overlap with any source id):
     OPEN_ID  = 1

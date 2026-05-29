@@ -47,7 +47,39 @@ hard-mask to source_ids[cursor], but that's done by the caller using
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import FrozenSet, List, Optional, Tuple
+from typing import FrozenSet, List, Optional, Tuple, Union
+
+
+class _ForceContent:
+    """Singleton sentinel for `GoldEduForcer.narrowed_legal`'s third return
+    case. See `FORCE_CONTENT`."""
+
+    _instance: Optional["_ForceContent"] = None
+
+    def __new__(cls) -> "_ForceContent":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "FORCE_CONTENT"
+
+
+# Third `narrowed_legal` return case (cc=False only). Tells the caller to
+# build a mask that admits ONLY the content wildcard (the full vocab minus
+# all structural ids), forcing the next emitted token to be EDU content. The
+# whitelist-intersection protocol can't express this because under the
+# content wildcard `state.legal_actions()` is empty (content is not an
+# enumerable id set), so a frozenset return would be the empty set and the
+# caller would mask everything to -inf. The caller handles FORCE_CONTENT by
+# constructing the same mask `state.content_is_wildcard()` would produce:
+# start all-True, then zero out `state.structural_ids()` (OPEN, CLOSE, all
+# label ids, EOS, copy, edu placeholder, and tokenizer specials). See the
+# module-level note on `narrowed_legal` for the full caller contract.
+FORCE_CONTENT = _ForceContent()
+
+# Type alias for `narrowed_legal`'s return.
+NarrowedLegal = Union[None, FrozenSet[int], _ForceContent]
 
 
 # Per-span state pushed onto the stack each time '(' opens a span.
@@ -486,8 +518,29 @@ class GoldEduForcer:
     def __init__(self, n_edus_target: int, gold_ranges: List[tuple]) -> None:
         if n_edus_target != len(gold_ranges):
             raise ValueError(f"n_edus_target={n_edus_target} != len(gold_ranges)={len(gold_ranges)}.")
-        self.n_edus_target = int(n_edus_target)
-        self.gold_ranges = list(gold_ranges)
+        # M6 guard: zero-width `(s, s)` ranges (an EDU that aligned to no
+        # subword and fell back to an `(anchor, anchor)` range) and backward
+        # (non-monotonic) starts would otherwise make the forcer spin OPEN on
+        # a frame whose leaf can never receive content and can never close.
+        # Drop zero-width ranges and clamp each range's end to be strictly
+        # greater than the running monotonic floor, so every surviving range
+        # is a non-empty, non-decreasing forward span. The per-parser range
+        # producers clamp ranges to source_len before constructing the forcer,
+        # this is the belt-and-suspenders guard in the shared forcer.
+        sanitized: List[tuple] = []
+        floor = 0
+        for s, e in gold_ranges:
+            s, e = int(s), int(e)
+            start = max(s, floor)
+            end = max(e, start + 1)  # ensure width >= 1 from the (clamped) start
+            if e <= s:
+                # Zero-width / inverted gold range: skip it entirely rather
+                # than fabricate a leaf with no real content target.
+                continue
+            sanitized.append((start, end))
+            floor = end
+        self.n_edus_target = len(sanitized)
+        self.gold_ranges = sanitized
         self.closed_leaves = 0
         # subtree_sizes[i] = number of leaves the i-th open frame's subtree
         # should hold. Maintained parallel to `state.stack`.
@@ -503,22 +556,43 @@ class GoldEduForcer:
         return self.gold_ranges[self.closed_leaves][1]
 
     def next_forced(self, state: SexpDecodingState) -> Optional[int]:
-        """Single-action force, or None to defer to `narrowed_legal()`."""
+        """Single-action force, or None to defer to `narrowed_legal()`.
+
+        FORCE_CONTENT is NOT a single action (it forces "some content token",
+        not one specific id), so it is treated like a non-singleton narrowing
+        here and returns None. The caller must consult `narrowed_legal`
+        directly to see FORCE_CONTENT, not rely on `next_forced`."""
         narrowed = self.narrowed_legal(state)
-        if narrowed is None or len(narrowed) != 1:
+        if narrowed is None or narrowed is FORCE_CONTENT or len(narrowed) != 1:
             return None
         return next(iter(narrowed))
 
-    def narrowed_legal(self, state: SexpDecodingState) -> Optional[FrozenSet[int]]:
-        """Subset of `state.legal_actions()` consistent with the gold-EDU
-        plan. None means no narrowing (use the model's argmax over the full
-        legal set). Empty (in practice never returned) means "no legal
-        action matches the plan", which would indicate a logic bug.
+    def narrowed_legal(self, state: SexpDecodingState) -> NarrowedLegal:
+        """Narrowing of `state.legal_actions()` consistent with the gold-EDU
+        plan. One of three return shapes:
 
-        When the returned set has 1 element, the caller can short-circuit
-        and emit that id. When it has more (e.g. all label ids at a
-        preorder internal slot), the caller masks logits to that set and
-        argmaxes.
+          * None -> no narrowing (use the model's argmax over the full legal
+            set, or over a multi-element whitelist on a later call).
+          * frozenset[int] of full-vocab ids -> whitelist. The caller masks
+            logits to (legal & this set) and argmaxes. A singleton is a hard
+            force. (In practice this is never the empty set.)
+          * FORCE_CONTENT (cc=False only) -> the caller must build a mask
+            admitting ONLY the content wildcard: start all-True, then zero out
+            every id in `state.structural_ids()` (OPEN, CLOSE, all label ids,
+            EOS, copy, edu placeholder, tokenizer specials). This is exactly
+            the mask `_full_ids_to_head_mask` already builds when
+            `state.content_is_wildcard()` is True, so the simplest caller
+            implementation is: on FORCE_CONTENT, skip the whitelist-intersect
+            branch and let the existing wildcard-mask path run. The whitelist
+            protocol cannot express this because under the content wildcard
+            `legal_actions()` is empty (content is not an enumerable id set).
+
+        FORCE_CONTENT replaces the two broken cc=False paths: a fresh
+        leaf-start frame (previously returned None, letting the model open an
+        internal node and never close the leaf) and a mid-leaf position below
+        the gold target_end (previously returned `frozenset(legal - {close})`,
+        which is the EMPTY set under the wildcard and masked everything to
+        -inf). The cc=True / use_copy paths are byte-for-byte unchanged.
         """
         if state.is_terminal():
             return None
@@ -537,12 +611,17 @@ class GoldEduForcer:
                         return None
                     content_id = state.source_ids[state.cursor]
                     return frozenset({content_id}) if content_id in legal else None
-                # Free content: narrow to "non-structural" via the wildcard.
-                # The mask helper expands the wildcard. We hard-mask CLOSE out
-                # so the model can't argmax leaf-close before reaching the
-                # gold target_end (legal would otherwise admit close as soon
-                # as leaf_token_count >= min_edu_length).
-                return frozenset(legal - {state.close_id})
+                # Free content (cc=False): force a content token via the
+                # wildcard. We can't return `frozenset(legal - {close})` (it's
+                # empty under the wildcard -> masks everything to -inf), and we
+                # can't return None (the model might argmax CLOSE before the
+                # gold target_end, since `legal` admits close once
+                # leaf_token_count >= min_edu_length). When the source is
+                # already exhausted there is no content to emit, so defer and
+                # let CLOSE happen.
+                if state.cursor >= state.source_len:
+                    return None
+                return FORCE_CONTENT
             return frozenset({state.close_id}) if state.close_id in legal else None
 
         # Pre-root: force OPEN.
@@ -570,13 +649,22 @@ class GoldEduForcer:
 
         # top.kind is None: fresh frame. Decide leaf vs internal by target.
         if top_target <= 1:
-            # Force first content token.
+            # Force first content token. At a fresh frame `legal_actions()`
+            # also offers structural starters (labels / OPEN), so deferring to
+            # the model here (the old cc=False behavior) lets it turn the
+            # intended leaf into an internal node that never closes. We must
+            # force content to start the leaf.
             if state.use_copy:
                 return frozenset({state.copy_id}) if state.copy_id in legal else None
-            if state.constrain_content and state.cursor < state.source_len:
+            if state.cursor >= state.source_len:
+                # No source left to start a leaf with. Defer (should not arise
+                # for a valid, M6-sanitized gold range).
+                return None
+            if state.constrain_content:
                 content_id = state.source_ids[state.cursor]
                 return frozenset({content_id}) if content_id in legal else None
-            return None
+            # cc=False: force the content wildcard to begin the leaf.
+            return FORCE_CONTENT
         # top_target >= 2: this frame is internal.
         if state.traversal_order == "preorder":
             # In preorder the first action inside an internal node is the LABEL.

@@ -29,6 +29,7 @@ from iudex.rst.data.tree import (
     ShiftReduceAction,
     strings_to_actions,
 )
+from iudex.rst.parsers.common.encoding import align_edus_to_tokens
 from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,10 @@ class Seq2SeqSRParser(nn.Module):
         # optimizer states (when they inherit param dtype, e.g. torch.AdamW) get
         # halved too — a 2B-param model's optimizer footprint goes from ~32 GB
         # fp32 AdamW down to ~16 GB bf16 AdamW, or ~50 MB with Adafactor.
+        # Acknowledged leak: `amp` here doubles as the load-dtype selector but is
+        # in iudex.rst.HASH_EXCLUDE, so flipping it keeps the same run hash. A
+        # bf16 checkpoint resuming into an fp32 model (or vice versa) under an
+        # existing run dir is unsupported; start a fresh run dir if you change amp.
         torch_dtype = torch.bfloat16 if config.amp else torch.float32
         self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, torch_dtype=torch_dtype)
 
@@ -552,37 +557,14 @@ class Seq2SeqSRParser(nn.Module):
                 "encode_target called before action vocab was installed; did you forget to set cfg.relation_types?"
             )
         actions = tree.to_shift_reduce(include_text=False)
-        # Tokenize the whole document once with offsets, then slice each EDU's
-        # subword IDs by its character range. Per-EDU tokenization drifts from
-        # whole-doc tokenization on SentencePiece-family tokenizers (whitespace-
-        # sensitive), which desyncs the training-time COPY substitutions from
-        # the inference-time `source_ids` stream. Mirrors `_gold_edu_token_mapping`
-        # in train_seq2seq_sr.py so training and inference see the same token
-        # space the encoder sees at predict time.
+        # The per-EDU subword id slices must TILE the whole-doc tokenization so
+        # the training-time COPY substitutions match the inference-time
+        # `source_ids` stream exactly. `align_edus_to_tokens` guarantees that
+        # tiling; the same helper drives `_gold_edu_source_ranges` and the
+        # trainer's `_gold_edu_token_mapping`.
         text = _reconstruct_text(tree)
-        enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-        full_input_ids = enc["input_ids"]
-        offsets = enc["offset_mapping"]
-        edu_subword_ids: list[list[int]] = []
-        char_cursor = 0
-        for i, edu in enumerate(tree.edus):
-            if i > 0:
-                prefix = edu.prefix if edu.prefix is not None else " "
-                char_cursor += len(prefix)
-            char_start = char_cursor
-            char_cursor += len(edu.text)
-            char_end = char_cursor
-            first: int | None = None
-            last: int | None = None
-            for j, (tok_cs, tok_ce) in enumerate(offsets):
-                if tok_cs < char_end and tok_ce > char_start:
-                    if first is None:
-                        first = j
-                    last = j
-            if first is None or last is None:
-                edu_subword_ids.append([])
-            else:
-                edu_subword_ids.append(list(full_input_ids[first : last + 1]))
+        full_input_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
+        edu_subword_ids = [full_input_ids[s:e] for (s, e) in spans]
 
         label_ids: list[int] = []
         seen_ids: list[int] = []  # what the decoder sees in its history (substituted)
@@ -1428,34 +1410,13 @@ def _reconstruct_text(tree: RstTree) -> str:
 
 def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
     """Per-EDU `(start, end_exclusive)` token-position ranges in the encoder's
-    whole-doc tokenization space. Mirrors `_gold_edu_token_mapping` in
-    train_seq2seq_sr.py — duplicated so the predict path doesn't pull the
+    whole-doc tokenization space, tiling it exactly. Mirrors
+    `_gold_edu_token_mapping` in train_seq2seq_sr.py (both via
+    `align_edus_to_tokens`) — duplicated so the predict path doesn't pull the
     trainer into module-load."""
     text = _reconstruct_text(tree)
-    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    offsets = enc["offset_mapping"]
-    mapping: list[tuple[int, int]] = []
-    char_cursor = 0
-    for i, edu in enumerate(tree.edus):
-        if i > 0:
-            prefix = edu.prefix if edu.prefix is not None else " "
-            char_cursor += len(prefix)
-        char_start = char_cursor
-        char_cursor += len(edu.text)
-        char_end = char_cursor
-        first: int | None = None
-        last: int | None = None
-        for j, (tok_cs, tok_ce) in enumerate(offsets):
-            if tok_cs < char_end and tok_ce > char_start:
-                if first is None:
-                    first = j
-                last = j
-        if first is None or last is None:
-            anchor = first if first is not None else max(0, len(offsets) - 1)
-            mapping.append((anchor, anchor))
-            continue
-        mapping.append((first, last + 1))
-    return mapping
+    _, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
+    return spans
 
 
 def _empty_tree(relation_types, text: str = "") -> RstTree:

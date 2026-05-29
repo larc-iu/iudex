@@ -2,6 +2,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -23,10 +24,10 @@ from iudex.common.training import (
     make_scheduler,
     model_panel,
     prepare_run_dir,
+    resume_or_init,
     save_checkpoint,
     schedule_panel,
     set_seeds,
-    try_resume,
     weight_decay_panel,
     write_run_config,
 )
@@ -141,42 +142,17 @@ def _gold_edu_token_mapping(model: Seq2SeqSRParser, tree: RstTree) -> tuple[list
     Critically NOT just `tokenize(edu.text)` summed cumulatively — that drifts
     from the encoder's actual tokenization because SentencePiece is whitespace-
     sensitive (per-EDU vs whole-doc tokenizations can disagree by a few
-    subwords per doc). We instead tokenize the reconstructed doc once with
-    `return_offsets_mapping=True`, then map each EDU's character range to the
-    token positions it spans. This puts gold mappings in the same space as
-    the pred mappings produced by the inference loop's cursor tracking.
+    subwords per doc). `align_edus_to_tokens` tokenizes the reconstructed doc
+    once and partitions its subwords among the EDUs so the ranges TILE the
+    tokenization, putting gold mappings in the same space as the pred mappings
+    produced by the inference loop's cursor tracking. The same helper drives
+    `encode_target` and `_gold_edu_source_ranges` so all three stay consistent.
     """
+    from iudex.rst.parsers.common.encoding import align_edus_to_tokens
     from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import _reconstruct_text
 
     text = _reconstruct_text(tree)
-    enc = model.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    offsets = enc["offset_mapping"]
-
-    mapping: list[tuple[int, int]] = []
-    char_cursor = 0
-    for i, edu in enumerate(tree.edus):
-        if i > 0:
-            prefix = edu.prefix if edu.prefix is not None else " "
-            char_cursor += len(prefix)
-        char_start = char_cursor
-        char_cursor += len(edu.text)
-        char_end = char_cursor
-
-        first: int | None = None
-        last: int | None = None
-        for j, (tok_cs, tok_ce) in enumerate(offsets):
-            # Token (tok_cs, tok_ce) overlaps [char_start, char_end) iff
-            # tok_cs < char_end and tok_ce > char_start.
-            if tok_cs < char_end and tok_ce > char_start:
-                if first is None:
-                    first = j
-                last = j
-        if first is None or last is None:
-            # EDU collapsed to no tokens (rare; e.g. empty text).
-            anchor = first if first is not None else len(offsets) - 1
-            mapping.append((anchor, anchor))
-            continue
-        mapping.append((first, last + 1))
+    _, mapping = align_edus_to_tokens(model.tokenizer, text, tree.edus)
     edu_ends = [end - 1 for _, end in mapping]
     return edu_ends, mapping
 
@@ -357,7 +333,9 @@ def train(cfg: Seq2SeqSRConfig) -> None:
         generator=rng_seed,
     )
 
-    steps_per_epoch = max(1, len(train_loader) // cfg.grad_accum)
+    # ceil, not floor: the loop also steps the final partial-accumulation batch,
+    # so a floor undercounts total_steps and the LR scheduler decays to 0 early.
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / cfg.grad_accum))
     total_steps = steps_per_epoch * cfg.max_epochs
     warmup = cfg.num_warmup_steps if cfg.num_warmup_steps is not None else max(1, int(0.1 * total_steps))
 
@@ -379,17 +357,17 @@ def train(cfg: Seq2SeqSRConfig) -> None:
         console.print(weight_decay_panel(model, optimizer))
     scheduler = make_scheduler(optimizer, warmup, total_steps)
 
-    checkpoint = try_resume(os.path.join(run_dir, "last.pt"), expected_hash=cfg_hash)
-    if checkpoint is None:
-        global_step, start_epoch, best_val, stale = 0, 0, -1.0, 0
-    else:
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        global_step = checkpoint["global_step"]
-        start_epoch = checkpoint["epoch"]
-        best_val = checkpoint.get("best_val", -1.0)
-        stale = checkpoint.get("stale_validations", 0)
+    # resume_or_init loads model/optimizer/scheduler and moves optimizer state
+    # to the param device (try_resume reads with map_location="cpu", so the
+    # optimizer state would otherwise be CPU-resident and mismatch CUDA grads
+    # on the first step()).
+    resume_state = resume_or_init(
+        run_dir, model=model, optimizer=optimizer, scheduler=scheduler, expected_hash=cfg_hash
+    )
+    global_step = resume_state["global_step"]
+    start_epoch = resume_state["epoch"]
+    best_val = resume_state["best_val"]
+    stale = resume_state["stale_validations"]
 
     def _save(path: str, epoch: int) -> None:
         save_checkpoint(
@@ -473,7 +451,7 @@ def train(cfg: Seq2SeqSRConfig) -> None:
             )
 
             for batch_idx, batch in enumerate(train_loader):
-                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                batch = {k: v.to(device) for k, v in batch.items()}
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
                     out = model(batch)
                 loss = out["loss"]

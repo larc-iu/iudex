@@ -2,6 +2,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import math
 import os
 import time
 from collections import deque
@@ -22,10 +23,10 @@ from iudex.common.training import (
     make_scheduler,
     model_panel,
     prepare_run_dir,
+    resume_or_init,
     save_checkpoint,
     schedule_panel,
     set_seeds,
-    try_resume,
     weight_decay_panel,
     write_run_config,
 )
@@ -34,6 +35,7 @@ from iudex.rst.data.metrics import compute_parseval_metrics, f1, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
 from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
 from iudex.rst.data.tree import RstTree
+from iudex.rst.parsers.common.encoding import align_edus_to_tokens
 from iudex.rst.parsers.seq2seq_sexp.configuration_seq2seq_sexp import Seq2SeqSexpConfig
 from iudex.rst.parsers.seq2seq_sexp.modeling_seq2seq_sexp import (
     Seq2SeqSexpParser,
@@ -124,29 +126,8 @@ def _gold_edu_token_mapping(model: Seq2SeqSexpParser, tree: RstTree) -> tuple[li
     """Per-EDU `(start, end_exclusive)` ranges in encoder whole-doc token
     space. Same logic as the seq2seq_sr helper of the same name."""
     text = _reconstruct_text(tree)
-    enc = model.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    offsets = enc["offset_mapping"]
-    mapping: list[tuple[int, int]] = []
-    char_cursor = 0
-    for i, edu in enumerate(tree.edus):
-        if i > 0:
-            prefix = edu.prefix if edu.prefix is not None else " "
-            char_cursor += len(prefix)
-        char_start = char_cursor
-        char_cursor += len(edu.text)
-        char_end = char_cursor
-        first: int | None = None
-        last: int | None = None
-        for j, (tok_cs, tok_ce) in enumerate(offsets):
-            if tok_cs < char_end and tok_ce > char_start:
-                if first is None:
-                    first = j
-                last = j
-        if first is None or last is None:
-            anchor = first if first is not None else len(offsets) - 1
-            mapping.append((anchor, anchor))
-            continue
-        mapping.append((first, last + 1))
+    _full_input_ids, spans = align_edus_to_tokens(model.tokenizer, text, tree.edus)
+    mapping = list(spans)
     edu_ends = [end - 1 for _, end in mapping]
     return edu_ends, mapping
 
@@ -300,7 +281,9 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
         generator=rng_seed,
     )
 
-    steps_per_epoch = max(1, len(train_loader) // cfg.grad_accum)
+    # ceil, not floor: the trailing partial accumulation window is stepped too
+    # (see the optimizer-step guard `(batch_idx + 1) == len(train_loader)`).
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / cfg.grad_accum))
     total_steps = steps_per_epoch * cfg.max_epochs
     warmup = cfg.num_warmup_steps if cfg.num_warmup_steps is not None else max(1, int(0.1 * total_steps))
 
@@ -322,17 +305,17 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
         console.print(weight_decay_panel(model, optimizer))
     scheduler = make_scheduler(optimizer, warmup, total_steps)
 
-    checkpoint = try_resume(os.path.join(run_dir, "last.pt"), expected_hash=cfg_hash)
-    if checkpoint is None:
-        global_step, start_epoch, best_val, stale = 0, 0, -1.0, 0
-    else:
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        global_step = checkpoint["global_step"]
-        start_epoch = checkpoint["epoch"]
-        best_val = checkpoint.get("best_val", -1.0)
-        stale = checkpoint.get("stale_validations", 0)
+    resumed = resume_or_init(
+        run_dir,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        expected_hash=cfg_hash,
+    )
+    global_step = resumed["global_step"]
+    start_epoch = resumed["epoch"]
+    best_val = resumed["best_val"]
+    stale = resumed["stale_validations"]
 
     def _save(path: str, epoch: int) -> None:
         save_checkpoint(

@@ -598,10 +598,15 @@ def test_constrain_content_false_buffers_unconditional_in_real_decode():
 
 def test_gold_edu_forcer_blocks_close_before_target_end_under_cc_false():
     """Important-3 regression. Under `constrain_content=False` the
-    GoldEduForcer must hard-mask CLOSE out of the legal set when the cursor
-    has not reached `target_end`, so an undertrained model cannot argmax
-    leaf-close mid-EDU."""
+    GoldEduForcer must prevent leaf-close when the cursor has not reached
+    `target_end`, so an undertrained model cannot argmax leaf-close mid-EDU.
+
+    The forcer now signals this with the FORCE_CONTENT sentinel (not a
+    CLOSE-excluding frozenset): the caller builds a content-wildcard mask
+    that zeroes out all structural ids including CLOSE, so CLOSE is
+    unreachable mid-leaf. See `sexp_constraints.narrowed_legal`."""
     from iudex.rst.parsers.common.sexp_constraints import (
+        FORCE_CONTENT,
         GoldEduForcer,
         make_initial_state,
     )
@@ -651,11 +656,13 @@ def test_gold_edu_forcer_blocks_close_before_target_end_under_cc_false():
     forcer.observe(before, state, 10)
     assert state.in_edu_leaf
     assert state.cursor == 1
-    # target_end for the first leaf is 2; we're mid-leaf.
+    # target_end for the first leaf is 2; we're mid-leaf. The forcer returns
+    # FORCE_CONTENT, whose mask (all ids minus structural_ids()) excludes
+    # CLOSE, so leaf-close is unreachable mid-EDU.
     narrowed = forcer.narrowed_legal(state)
-    assert narrowed is not None
-    assert CLOSE not in narrowed, (
-        f"GoldEduForcer admits leaf-close mid-EDU under constrain_content=False; narrowed={sorted(narrowed)}"
+    assert narrowed is FORCE_CONTENT
+    assert CLOSE in state.structural_ids(), (
+        "CLOSE must be a structural id so the FORCE_CONTENT mask zeroes it out mid-EDU"
     )
 
 

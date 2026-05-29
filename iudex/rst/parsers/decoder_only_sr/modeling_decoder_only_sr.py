@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from iudex.common.log import warn
+from iudex.rst.parsers.common.encoding import align_edus_to_tokens
 from iudex.rst.data.tree import (
     Reduce,
     RstTree,
@@ -58,8 +59,8 @@ class DecoderOnlySRParser(nn.Module):
             # so generic causal-LM tokenizers (Llama, Qwen) work out of the box.
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        torch_dtype = torch.bfloat16 if config.amp else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=torch_dtype)
+        model_dtype = torch.bfloat16 if config.amp else torch.float32
+        self.model = AutoModelForCausalLM.from_pretrained(config.model_name, dtype=model_dtype)
 
         self.action_token_ids: dict[str, int] = {}
         self.shift_token_id: int | None = None
@@ -459,9 +460,7 @@ class DecoderOnlySRParser(nn.Module):
             )
 
         text = _reconstruct_text(tree)
-        enc = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-        source_ids = enc["input_ids"]
-        offsets = enc["offset_mapping"]
+        source_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
 
         if len(source_ids) > self.config.max_input_length:
             warn(
@@ -470,26 +469,7 @@ class DecoderOnlySRParser(nn.Module):
             )
             return None
 
-        edu_subword_ids: list[list[int]] = []
-        char_cursor = 0
-        for i, edu in enumerate(tree.edus):
-            if i > 0:
-                prefix = edu.prefix if edu.prefix is not None else " "
-                char_cursor += len(prefix)
-            char_start = char_cursor
-            char_cursor += len(edu.text)
-            char_end = char_cursor
-            first: int | None = None
-            last: int | None = None
-            for j, (tok_cs, tok_ce) in enumerate(offsets):
-                if tok_cs < char_end and tok_ce > char_start:
-                    if first is None:
-                        first = j
-                    last = j
-            if first is None or last is None:
-                edu_subword_ids.append([])
-            else:
-                edu_subword_ids.append(list(source_ids[first : last + 1]))
+        edu_subword_ids: list[list[int]] = [list(source_ids[s:e]) for s, e in spans]
 
         actions = tree.to_shift_reduce(include_text=False)
         seen_actions: list[int] = []
@@ -528,6 +508,19 @@ class DecoderOnlySRParser(nn.Module):
         input_ids = [bos_id, *source_ids, self.sep_token_id, *seen_actions]
         labels = [-100] * (1 + len(source_ids) + 1) + label_actions
         assert len(input_ids) == len(labels), (len(input_ids), len(labels))
+
+        # The realized single stream is [BOS] + source + [SEP] + actions, so per-side
+        # caps don't bound it. Drop trees whose combined length overflows the budget
+        # (the model's positional limit if cheaply known, else the sum of per-side caps).
+        sum_cap = self.config.max_input_length + self.config.max_output_length + 2
+        max_positions = getattr(self.model.config, "max_position_embeddings", None)
+        combined_cap = min(sum_cap, max_positions) if isinstance(max_positions, int) and max_positions > 0 else sum_cap
+        if len(input_ids) > combined_cap:
+            warn(
+                f"Combined stream overflowed: {len(input_ids)} > combined cap {combined_cap} "
+                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED from this epoch."
+            )
+            return None
         return input_ids, labels
 
     # -----------------------------------------------------------------
@@ -874,7 +867,8 @@ class DecoderOnlySRParser(nn.Module):
     def predict_with_gold_edus(self, tree: RstTree) -> RstTree:
         """Greedy decode with gold EDU boundaries forced at the copy/shift
         positions. Reduces stay model-driven; only segmentation is supplied.
-        Used by training-time eval when `cfg.eval_gold_edu` is True."""
+        Used by the trainer's final-eval path (gold-EDU eval is gated by the
+        `eval_gold_edu` parameter of `_evaluate_on_dev`, not a config field)."""
         return self._predict_one_gold_edu(tree)
 
     @torch.no_grad()
@@ -1094,33 +1088,11 @@ def _reconstruct_text(tree: RstTree) -> str:
 
 def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
     """Per-EDU `(start, end_exclusive)` token-position ranges in the source
-    tokenizer's whole-doc tokenization space. Duplicated from `seq2seq_sr`
-    so the predict path doesn't pull the trainer into module-load."""
+    tokenizer's whole-doc tokenization space. Delegates to the shared
+    `align_edus_to_tokens` tiling helper so train and predict agree exactly."""
     text = _reconstruct_text(tree)
-    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
-    offsets = enc["offset_mapping"]
-    mapping: list[tuple[int, int]] = []
-    char_cursor = 0
-    for i, edu in enumerate(tree.edus):
-        if i > 0:
-            prefix = edu.prefix if edu.prefix is not None else " "
-            char_cursor += len(prefix)
-        char_start = char_cursor
-        char_cursor += len(edu.text)
-        char_end = char_cursor
-        first: int | None = None
-        last: int | None = None
-        for j, (tok_cs, tok_ce) in enumerate(offsets):
-            if tok_cs < char_end and tok_ce > char_start:
-                if first is None:
-                    first = j
-                last = j
-        if first is None or last is None:
-            anchor = first if first is not None else max(0, len(offsets) - 1)
-            mapping.append((anchor, anchor))
-            continue
-        mapping.append((first, last + 1))
-    return mapping
+    _, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
+    return spans
 
 
 def _empty_tree(relation_types, text: str = "") -> RstTree:

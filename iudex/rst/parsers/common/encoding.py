@@ -174,6 +174,59 @@ def tokenize_document(
     return input_ids, boundaries
 
 
+def align_edus_to_tokens(
+    tokenizer: Any,
+    text: str,
+    edus: Any,
+) -> tuple[list[int], list[tuple[int, int]]]:
+    """Tokenize `text` (the reconstructed document) and partition its subword
+    tokens among `edus` so the per-EDU token ranges TILE range(len(input_ids))
+    exactly: no gaps, no overlaps, sum of lengths == len(input_ids).
+
+    `edus` is a sequence of objects with `.text: str` and `.prefix: str | None`
+    (default prefix " " for all but the first EDU), matching how `_reconstruct_text`
+    builds `text`. Assignment is by a single monotonic forward sweep over tokens:
+    each token goes to the current EDU until its character midpoint crosses into
+    the next EDU's char range; the final EDU absorbs all trailing tokens. This
+    guarantees a tiling even when a token straddles a boundary or sits in
+    inter-EDU whitespace. An EDU shorter than a token may receive an empty range
+    (start == end); that is allowed and still tiles.
+
+    Returns (input_ids: list[int], edu_token_spans: list[tuple[int, int]]) where
+    edu_token_spans[i] = (start, end) is a half-open token-index range into
+    input_ids for EDU i.
+    """
+    enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    input_ids = enc["input_ids"]
+    offsets = enc["offset_mapping"]
+
+    # Exclusive char-end per EDU, walking prefixes/text exactly like _reconstruct_text.
+    char_ends: list[int] = []
+    char_cursor = 0
+    for i, edu in enumerate(edus):
+        if i > 0:
+            prefix = edu.prefix if edu.prefix is not None else " "
+            char_cursor += len(prefix)
+        char_cursor += len(edu.text)
+        char_ends.append(char_cursor)
+
+    n_edus = len(char_ends)
+    counts = [0] * n_edus
+    edu_idx = 0
+    for tcs, tce in offsets:
+        m = (tcs + tce) / 2
+        while edu_idx < n_edus - 1 and m >= char_ends[edu_idx]:
+            edu_idx += 1
+        counts[edu_idx] += 1
+
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for c in counts:
+        spans.append((cursor, cursor + c))
+        cursor += c
+    return input_ids, spans
+
+
 def encode_tokens_strided(
     encoder: torch.nn.Module,
     tokenizer: Any,

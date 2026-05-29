@@ -128,9 +128,10 @@ class Seq2SeqSexpConfig(FromParams):
 
     # Label smoothing on the CE loss. Standard seq2seq fine-tuning trick.
     # The action head is small (~100 classes) and GUM has ~150 train docs,
-    # so hard targets overfit fast. 0.1 is the conventional default and
-    # applies uniformly to all cells, full-vocab (use_copy=False) cells
-    # included.
+    # so hard targets overfit fast. 0.1 is the conventional default. Applied
+    # uniformly at its configured value in both use_copy modes (no auto-
+    # scaling); under use_copy=False this is a known confound across the
+    # ~100-class head and the full-vocab head.
     label_smoothing: float = 0.1
 
     # Sexp-specific. The first is also the registry signature_field for

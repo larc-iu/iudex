@@ -159,9 +159,10 @@ class DecoderOnlySexpConfig(FromParams):
 
     # Label smoothing on the CE loss. Standard fine-tuning trick. The
     # action head is small (~100 classes) and GUM has ~150 train docs,
-    # so hard targets overfit fast. 0.1 is the conventional default and
-    # applies uniformly to all cells, full-vocab (use_copy=False) cells
-    # included.
+    # so hard targets overfit fast. Applied uniformly at the configured
+    # value in both use_copy modes (no auto-scale). Under use_copy=False the
+    # head is the full vocab rather than ~100 action classes, a known
+    # head-size confound on the per-off-class smoothing mass.
     label_smoothing: float = 0.1
 
     def __post_init__(self):
