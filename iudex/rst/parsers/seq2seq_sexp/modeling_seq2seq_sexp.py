@@ -1164,8 +1164,12 @@ class Seq2SeqSexpParser(nn.Module):
                 edus=edu_texts,
                 relation_types=self.config.relation_types,
             )
-        except (ValueError, IndexError) as e:
-            warn(f"Malformed decoder sexp output ({e!r}). Falling back to single-EDU tree.")
+        except Exception as e:
+            # Parses untrusted model output, so degrade on ANY parse failure
+            # (incl. RecursionError from a pathologically deep predicted tree),
+            # matching decoder_only_sexp. The type is logged so a genuine bug
+            # surfaces as a flood of warnings rather than a silent swallow.
+            warn(f"Malformed decoder sexp output ({type(e).__name__}: {e}). Falling back to single-EDU tree.")
             full_text = " ".join(edu_texts) if edu_texts else ""
             tree = _empty_tree(self.config.relation_types, text=full_text)
             tree._from_sexp_failed = True  # type: ignore[attr-defined]
