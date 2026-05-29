@@ -42,14 +42,14 @@ class DecoderOnlySRConfig(FromParams):
     relation_map: dict[str, str] | None = None
 
     # Model. Default is the smallest publicly-released Gemma 3 instruction-
-    # tuned checkpoint; the parser is architecture-agnostic and works with
+    # tuned checkpoint. The parser is architecture-agnostic and works with
     # any AutoModelForCausalLM (Llama, Qwen, etc.) as long as the tokenizer
     # exposes character-offset mapping for SentencePiece-style alignment.
     model_name: str = "google/gemma-3-1b-it"
 
     # Single-stream layout, so length budgets must accommodate
     # source + actions + 2 specials (BOS + SEP) in one sequence. Naming
-    # mirrors seq2seq_sr so per-side caps stay readable; `encode_target`
+    # mirrors seq2seq_sr so per-side caps stay readable. `encode_target`
     # enforces the combined length (min of the per-side sum and the model's
     # max_position_embeddings) and drops trees that overflow it.
     max_input_length: int = 3072
@@ -58,7 +58,7 @@ class DecoderOnlySRConfig(FromParams):
 
     # Distinguishes this parser's configs from any other (the registry's
     # `signature_field` needs a unique field name per parser kind). Reading
-    # it as True here is no-op information — it exists to tag a config.json
+    # it as True here is no-op information. It exists to tag a config.json
     # as belonging to decoder_only_sr.
     causal_mode: bool = True
 

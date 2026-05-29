@@ -18,9 +18,12 @@
 
     // LoRA on the seq2seq stack. The lm_head is replaced at parser init
     // with a small fresh head projecting to just the action vocab (~100
-    // dims). Only `embed_tokens` needs `modules_to_save`, and even that
-    // gets its pretrained rows frozen via `train_only_new_embedding_rows`
-    // (only the ~100 newly-added action-token rows accumulate gradient).
+    // dims). The input embedding is handled by carving the ~100 newly-added
+    // action-token rows into a small trainable Parameter and freezing the
+    // pretrained base matrix. This carve happens unconditionally, so both
+    // `modules_to_save` and `train_only_new_embedding_rows` below are no-ops
+    // for this parser. They are kept only to satisfy the strict config parse
+    // and the convention of setting every field explicitly.
     peft: {
         r: 8,
         alpha: 16,

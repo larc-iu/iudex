@@ -100,12 +100,12 @@ def _build_optimizer(model: Seq2SeqSRParser, cfg: Seq2SeqSRConfig):
             relative_step=False,
             warmup_init=False,
         )
-    raise ValueError(f"Unknown optimizer {cfg.optimizer!r}; expected 'adamw' or 'adafactor'.")
+    raise ValueError(f"Unknown optimizer {cfg.optimizer!r}. Expected 'adamw' or 'adafactor'.")
 
 
 def _make_collator(pad_id: int):
     """Variable-length pad to the longest item in the batch. `-100` label
-    padding so HF cross-entropy ignores those positions; `pad_id` pad on the
+    padding so HF cross-entropy ignores those positions, `pad_id` pad on the
     decoder-input side so attention masks behave."""
 
     def collate(batch: list[dict]) -> dict[str, torch.Tensor]:
@@ -139,7 +139,7 @@ def _gold_edu_token_mapping(model: Seq2SeqSRParser, tree: RstTree) -> tuple[list
     """EDU end-positions and per-EDU `(start, end_exclusive)` token-position
     ranges in the ENCODER'S whole-document tokenization space.
 
-    Critically NOT just `tokenize(edu.text)` summed cumulatively — that drifts
+    Critically NOT just `tokenize(edu.text)` summed cumulatively, that drifts
     from the encoder's actual tokenization because SentencePiece is whitespace-
     sensitive (per-EDU vs whole-doc tokenizations can disagree by a few
     subwords per doc). `align_edus_to_tokens` tokenizes the reconstructed doc
@@ -148,7 +148,7 @@ def _gold_edu_token_mapping(model: Seq2SeqSRParser, tree: RstTree) -> tuple[list
     produced by the inference loop's cursor tracking. The same helper drives
     `encode_target` and `_gold_edu_source_ranges` so all three stay consistent.
     """
-    from iudex.rst.parsers.common.encoding import align_edus_to_tokens
+    from iudex.rst.parsers.common.seqgen import align_edus_to_tokens
     from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import _reconstruct_text
 
     text = _reconstruct_text(tree)
@@ -421,7 +421,7 @@ def train(cfg: Seq2SeqSRConfig) -> None:
     training_complete = start_epoch >= cfg.max_epochs or stale >= cfg.patience
     if training_complete:
         reason = "max_epochs reached" if start_epoch >= cfg.max_epochs else "patience exhausted"
-        dim(f"Skipping training: {reason} on prior run; jumping to final evaluation.")
+        dim(f"Skipping training: {reason} on prior run, jumping to final evaluation.")
 
     recent_losses: deque = deque(maxlen=200)
     recent_action_losses: deque = deque(maxlen=200)

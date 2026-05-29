@@ -23,6 +23,8 @@
         target_modules: 'all-linear',
         bias: 'none',
         dora: false,
+        // No effect under the default use_copy=true (small action head, frozen
+        // base embedding + new-rows Parameter). Honored only under use_copy=false.
         modules_to_save: ['embed_tokens'],
         train_only_new_embedding_rows: true,
     },

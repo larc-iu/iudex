@@ -4,13 +4,13 @@ interleaved verbatim. Recovers both EDU segmentation (from SHIFT
 positions) and the labeled tree (from REDUCE actions).
 
 Differs from the other iudex parsers in two ways worth flagging:
-  * `forward(batch)` takes a batched dict, not a per-tree forward — the
+  * `forward(batch)` takes a batched dict, not a per-tree forward. The
     seq2seq fine-tuning loop runs proper batches. `train_seq2seq_sr.py`
-    knows about this; `predict` and `predict_from_text` stay per-document
+    knows about this. `predict` and `predict_from_text` stay per-document
     so the shared predict CLI works unchanged.
   * `segmenter` is a truthy property (returns self) so the shared CLI's
     `_require_segmenter` accepts text input. This parser always segments
-    by construction; there's no separate segmenter head.
+    by construction, there's no separate segmenter head.
 """
 
 import logging
@@ -29,7 +29,7 @@ from iudex.rst.data.tree import (
     ShiftReduceAction,
     strings_to_actions,
 )
-from iudex.rst.parsers.common.encoding import align_edus_to_tokens
+from iudex.rst.parsers.common.seqgen import align_edus_to_tokens, reorder_past_key_values
 from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
 
 logger = logging.getLogger(__name__)
@@ -45,15 +45,15 @@ class Seq2SeqSRParser(nn.Module):
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
         # Load weights in bf16 when the user opted into mixed precision. T5Gemma2
-        # / mT5 release in bf16 anyway; HF's default upcasts to fp32 (doubling
+        # / mT5 release in bf16 anyway. HF's default upcasts to fp32 (doubling
         # weight+grad memory). bf16 here halves them at no quality cost, and the
         # optimizer states (when they inherit param dtype, e.g. torch.AdamW) get
-        # halved too — a 2B-param model's optimizer footprint goes from ~32 GB
+        # halved too. A 2B-param model's optimizer footprint goes from ~32 GB
         # fp32 AdamW down to ~16 GB bf16 AdamW, or ~50 MB with Adafactor.
         # Acknowledged leak: `amp` here doubles as the load-dtype selector but is
         # in iudex.rst.HASH_EXCLUDE, so flipping it keeps the same run hash. A
         # bf16 checkpoint resuming into an fp32 model (or vice versa) under an
-        # existing run dir is unsupported; start a fresh run dir if you change amp.
+        # existing run dir is unsupported. Start a fresh run dir if you change amp.
         torch_dtype = torch.bfloat16 if config.amp else torch.float32
         self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, torch_dtype=torch_dtype)
 
@@ -80,7 +80,7 @@ class Seq2SeqSRParser(nn.Module):
             # Carve the newly-added action-token rows out of the resized
             # embedding into a small trainable Parameter, freeze the base
             # matrix, and splice the two at lookup time. Only the ~100 new
-            # rows train; we never materialize a full trainable copy or a
+            # rows train. We never materialize a full trainable copy or a
             # dense full-vocab gradient.
             self._carve_new_token_embeddings()
 
@@ -91,7 +91,7 @@ class Seq2SeqSRParser(nn.Module):
             # recomputes activations instead of recovering them from KV cache.
             self.model.config.use_cache = False
             # PEFT wraps in PeftModel which masks `.gradient_checkpointing_enable()`
-            # under some versions; ensure use_cache is also off on the base.
+            # under some versions, ensure use_cache is also off on the base.
             if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "config"):
                 self.model.base_model.config.use_cache = False
 
@@ -100,10 +100,10 @@ class Seq2SeqSRParser(nn.Module):
     # -----------------------------------------------------------------
 
     # Sentinel emitted at every source-copy position. The decoder predicts
-    # this in place of the actual source subword ID; tree reconstruction
+    # this in place of the actual source subword ID. Tree reconstruction
     # walks a cursor over the input subwords and appends `source_ids[cursor]`
     # for each emitted COPY. This dramatically simplifies the decoder's
-    # decision space — every prediction is now over a ~100-action vocab
+    # decision space, every prediction is now over a ~100-action vocab
     # instead of a 262K-vocab softmax dominated by trivially-copyable
     # source tokens.
     COPY_TOKEN: str = "<copy>"
@@ -161,7 +161,7 @@ class Seq2SeqSRParser(nn.Module):
 
     def _resolve_decoder_start_token_id(self) -> int:
         """Find the decoder start token in a model-family-portable way.
-        T5/mT5 expose `decoder_start_token_id` on `config`; T5Gemma 2 only
+        T5/mT5 expose `decoder_start_token_id` on `config`. T5Gemma 2 only
         exposes it via `model.prepare_decoder_input_ids_from_labels` (which
         prepends `bos_token_id`). Probe the standard paths in order, then
         invoke the canonical HF helper on a stub label to extract whatever
@@ -191,7 +191,7 @@ class Seq2SeqSRParser(nn.Module):
 
     def _install_action_vocab(self) -> None:
         action_vocab = self._build_action_vocab()
-        # Snapshot original vocab size BEFORE adding new tokens — used by
+        # Snapshot original vocab size BEFORE adding new tokens, used by
         # the embedding gradient mask to identify "old" (pretrained) rows
         # that should stay frozen.
         self._original_vocab_size = len(self.tokenizer)
@@ -217,7 +217,7 @@ class Seq2SeqSRParser(nn.Module):
         # `lm_head`. Order: COPY, SHIFT, sorted REDUCE-*, EOS. The head's
         # output dim is `len(self.full_id_for_head_idx)`. Labels (full
         # vocab IDs) get mapped to head indices via `_label_to_head_lookup`
-        # at training time; head argmax indices map back to full IDs via
+        # at training time. Head argmax indices map back to full IDs via
         # `self.full_id_for_head_idx` at inference time.
         eos_id = int(self.tokenizer.eos_token_id)
         self.full_id_for_head_idx: list[int] = [
@@ -262,7 +262,7 @@ class Seq2SeqSRParser(nn.Module):
         role as a 262K-wide unembedding (the model only ever predicts these
         ~100 actions, and the [B, T, 262K] logits tensor at training was
         ~8 GB at moderate sequence lengths). Also discards any LoRA adapter
-        PEFT applied to the original out_proj — we want this small head
+        PEFT applied to the original out_proj. We want this small head
         fully trainable, not low-rank-deltaed."""
         base = self._underlying_model()
 
@@ -309,7 +309,7 @@ class Seq2SeqSRParser(nn.Module):
             base.lm_head = new
         else:
             raise RuntimeError(
-                f"Don't know how to replace lm_head on {type(base).__name__}; expected "
+                f"Don't know how to replace lm_head on {type(base).__name__}. Expected "
                 f"`lm_head` as Linear or `lm_head.out_proj` as Linear."
             )
         logger.info(
@@ -339,14 +339,14 @@ class Seq2SeqSRParser(nn.Module):
         and only `new_token_embeddings` (n_new x hidden, ~0.2 MB) carries
         gradient. The patched forward does a two-lookup splice:
           old ids (< n_old) -> frozen base, new ids (>= n_old) -> small param.
-        Gradient flows only to `new_token_embeddings`; the base weight's
+        Gradient flows only to `new_token_embeddings`, the base weight's
         `.grad` stays None.
 
         T5/T5Gemma 2 tie encoder + decoder input embeddings (one weight, one
         `nn.Embedding` object aliased under several names), so patching every
         `nn.Embedding` whose weight shares the input-embedding storage covers
         both sides with one Parameter. Untied backbones expose distinct
-        objects sharing the same storage; both get patched.
+        objects sharing the same storage, both get patched.
         """
         n_old = int(self._original_vocab_size)
         embed = self._underlying_model().get_input_embeddings()
@@ -374,7 +374,7 @@ class Seq2SeqSRParser(nn.Module):
                 patched += 1
         logger.info(
             f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
-            f"(base {n_total}x{full_weight.shape[1]} frozen); patched {patched} embedding lookup(s)."
+            f"(base {n_total}x{full_weight.shape[1]} frozen). Patched {patched} embedding lookup(s)."
         )
 
     @property
@@ -442,9 +442,9 @@ class Seq2SeqSRParser(nn.Module):
 
         # Map labels (full vocab IDs) → head indices via the lookup buffer.
         # Labels are full-vocab IDs in {copy, shift, reduce_*, eos} plus
-        # -100 for padding; the lookup buffer maps those to head indices
+        # -100 for padding. The lookup buffer maps those to head indices
         # 0..head_vocab_size-1 (or -100 for anything not in the action
-        # vocab, defensive — shouldn't normally happen).
+        # vocab, defensive, shouldn't normally happen).
         labels = batch["labels"]
         labels_flat = labels.reshape(-1)
         max_id = self._label_to_head_lookup.size(0) - 1
@@ -509,12 +509,12 @@ class Seq2SeqSRParser(nn.Module):
 
     def encode_input(self, text: str) -> dict[str, list[int]]:
         """Encode the raw document for the encoder side. Shrieks if the
-        tokenizer truncates — silent input truncation corrupts the training
+        tokenizer truncates. Silent input truncation corrupts the training
         signal (the target still references EDUs whose source tokens the
         encoder never saw) and silently degrades inference (the model can't
         parse anything past the cut)."""
         # Untruncated length is our truncation detector. Two tokenizer calls
-        # is the simplest reliable signal; the second is bounded by
+        # is the simplest reliable signal. The second is bounded by
         # max_input_length so the cost is negligible vs. the forward pass.
         full_len = len(self.tokenizer(text, add_special_tokens=False).input_ids)
         enc = self.tokenizer(
@@ -526,7 +526,7 @@ class Seq2SeqSRParser(nn.Module):
         if full_len > self.config.max_input_length - 1:  # -1 for the trailing EOS
             warn(
                 f"Input truncated: {full_len} -> {self.config.max_input_length} subwords. "
-                f"Bump max_input_length (model supports up to ~32K for T5Gemma 2; "
+                f"Bump max_input_length (model supports up to ~32K for T5Gemma 2, "
                 f"~1K-2K for mT5) or this doc's tail is invisible to the model."
             )
         return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}
@@ -534,12 +534,12 @@ class Seq2SeqSRParser(nn.Module):
     def encode_target(self, tree: RstTree) -> tuple[list[int], list[int]] | None:
         """Build two aligned target streams:
 
-          * `labels`: the prediction targets — `<copy>` at source-copy
+          * `labels`: the prediction targets, `<copy>` at source-copy
             positions, `<shift>` and `<reduce_*>` at structural positions,
             `<eos>` at the end. The decoder is trained to PREDICT these.
 
           * `decoder_input_ids`: what the decoder ACTUALLY SEES in its
-            self-attention history — `<copy>` is replaced by the actual
+            self-attention history, where `<copy>` is replaced by the actual
             source subword ID, so the decoder's input distribution at
             training matches inference (where we substitute before
             appending). Length-aligned with `labels`: position i is
@@ -547,20 +547,20 @@ class Seq2SeqSRParser(nn.Module):
 
         Length is identical to the previous "actual source subword IDs"
         formulation, but the model's prediction vocabulary at every position
-        is now just the ~100 action tokens instead of the 262K full vocab —
-        the deterministic copy task no longer competes with structural
+        is now just the ~100 action tokens instead of the 262K full vocab.
+        The deterministic copy task no longer competes with structural
         decisions for gradient.
 
         Returns None when the target overflows `cfg.max_output_length`."""
         if self.shift_token_id is None:
             raise RuntimeError(
-                "encode_target called before action vocab was installed; did you forget to set cfg.relation_types?"
+                "encode_target called before action vocab was installed. Did you forget to set cfg.relation_types?"
             )
         actions = tree.to_shift_reduce(include_text=False)
         # The per-EDU subword id slices must TILE the whole-doc tokenization so
         # the training-time COPY substitutions match the inference-time
         # `source_ids` stream exactly. `align_edus_to_tokens` guarantees that
-        # tiling; the same helper drives `_gold_edu_source_ranges` and the
+        # tiling. The same helper drives `_gold_edu_source_ranges` and the
         # trainer's `_gold_edu_token_mapping`.
         text = _reconstruct_text(tree)
         full_input_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
@@ -628,7 +628,7 @@ class Seq2SeqSRParser(nn.Module):
         """Generate trees for a batch of documents. Dispatches to a batched
         greedy path (num_beams <= 1) or a per-example beam search path
         (num_beams > 1). Greedy is used for per-epoch dev eval (via
-        `cfg.eval_decode_greedy`); beam is used for the final eval (via
+        `cfg.eval_decode_greedy`). Beam is used for the final eval (via
         `cfg.num_beams`)."""
         if not texts:
             return []
@@ -643,7 +643,7 @@ class Seq2SeqSRParser(nn.Module):
     @torch.no_grad()
     def _predict_batch_greedy(self, texts: list[str]) -> list[RstTree]:
         """Batched greedy decoding. One decoder forward per step covers all
-        rows in parallel; the validity mask + COPY substitution work per-row."""
+        rows in parallel. The validity mask + COPY substitution work per-row."""
         self.eval()
         device = next(self.parameters()).device
 
@@ -661,9 +661,9 @@ class Seq2SeqSRParser(nn.Module):
 
         # Per-row source IDs (the subwords the decoder will paste in at
         # COPY positions). Strip leading BOS and trailing EOS / pad so the
-        # cursor tracks ONLY the content subwords — matching what
+        # cursor tracks ONLY the content subwords, matching what
         # `encode_target` substitutes at training (per-EDU tokenization with
-        # `add_special_tokens=False`). T5/mT5 add EOS at the tail; T5Gemma 2
+        # `add_special_tokens=False`). T5/mT5 add EOS at the tail. T5Gemma 2
         # prepends BOS at the head. Either or both can be present.
         bos_id = self.tokenizer.bos_token_id
         per_row_source_ids: list[list[int]] = []
@@ -742,7 +742,7 @@ class Seq2SeqSRParser(nn.Module):
                 )
                 past_key_values = out.past_key_values
                 # NOTE: `logits[:, -1, :]` is now [B, head_vocab_size], not
-                # [B, 262K] — the replaced lm_head emits only action logits.
+                # [B, 262K]. The replaced lm_head emits only action logits.
                 logits = out.logits[:, -1, :]  # [B, head_vocab_size]
 
                 # Per-row validity mask: only legal HEAD INDICES survive.
@@ -757,7 +757,7 @@ class Seq2SeqSRParser(nn.Module):
                         if not at_end:
                             masked[i, self.copy_head_idx] = logits[i, self.copy_head_idx]
                         # SHIFT legal iff the current EDU has at least
-                        # `min_edu_length` COPYs — OR we're at end-of-source
+                        # `min_edu_length` COPYs, OR we're at end-of-source
                         # with any content (need to commit the final EDU).
                         shift_ok = edu_lengths[i] >= min_edu_len or (at_end and edu_lengths[i] >= 1)
                         if shift_ok:
@@ -790,7 +790,7 @@ class Seq2SeqSRParser(nn.Module):
                             cursors[i] += 1
                             edu_lengths[i] += 1
                         else:
-                            # Constraint should have prevented this; bail.
+                            # Constraint should have prevented this. Bail.
                             done[i] = True
                     elif full_id == self.shift_token_id:
                         stacks[i] += 1
@@ -854,7 +854,7 @@ class Seq2SeqSRParser(nn.Module):
     def _predict_one_beam(self, text: str, num_beams: int) -> RstTree:
         """Beam search for a single document with `num_beams` parallel beams.
         Each beam carries its own (cursor, stack, edu_length, action_seq,
-        pred_edu_ranges, edu_start) state. The encoder runs once; the
+        pred_edu_ranges, edu_start) state. The encoder runs once, the
         decoder forward at each step processes all K beams in parallel
         (one batch of size K). KV cache is reordered when beams change
         parents via `self.model._reorder_cache`.
@@ -903,7 +903,7 @@ class Seq2SeqSRParser(nn.Module):
         if gc_active:
             self._set_grad_checkpointing(False)
         try:
-            # Encoder pass — once for the single doc, then expand to K beams.
+            # Encoder pass, once for the single doc, then expand to K beams.
             encoder = self.model.get_encoder()
             enc_out = encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], return_dict=True)
             from transformers.modeling_outputs import BaseModelOutput
@@ -953,7 +953,7 @@ class Seq2SeqSRParser(nn.Module):
                 masked = torch.full_like(logits, float("-inf"))
                 for j in range(K):
                     if done[j]:
-                        # Done beams are frozen in `finished_beams`; their
+                        # Done beams are frozen in `finished_beams`. Their
                         # row stays all -inf so they can never re-enter the
                         # top-K and crowd out active beams.
                         continue
@@ -986,7 +986,7 @@ class Seq2SeqSRParser(nn.Module):
                 #     (cross-attn slots that aren't populated yet).
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
                 if past_key_values is not None:
-                    past_key_values = _reorder_pkv(past_key_values, parent_tensor, self._underlying_model())
+                    past_key_values = reorder_past_key_values(past_key_values, parent_tensor, self._underlying_model())
                 # Reorder decoder_input_ids by parent.
                 decoder_input_ids = decoder_input_ids[parent_tensor]
 
@@ -1070,7 +1070,7 @@ class Seq2SeqSRParser(nn.Module):
                 # EDU if max_output_length cut us off mid-EDU. Mirror the
                 # greedy-path fix so seg eval sees the truncated EDU. The
                 # action sequence gets a synthetic <shift> via
-                # `_repair_actions` downstream; appending here keeps the
+                # `_repair_actions` downstream. Appending here keeps the
                 # two data structures consistent.
                 ranges = list(pred_edu_ranges[j])
                 if cursors[j] > edu_starts[j]:
@@ -1093,7 +1093,7 @@ class Seq2SeqSRParser(nn.Module):
         # beams (every emitted token has log-prob <= 0, so sum-log-prob
         # monotonically favors fewer-token = fewer-EDU trajectories).
         # alpha=0.6 is the GNMT default (alpha=1.0 is mean log-prob, also
-        # defensible; 0.6 is the standard mitigation).
+        # defensible, 0.6 is the standard mitigation).
         length_penalty_alpha = 0.6
         best = max(
             candidates,
@@ -1114,7 +1114,7 @@ class Seq2SeqSRParser(nn.Module):
     def predict_with_gold_edus(self, tree: RstTree) -> RstTree:
         """Greedy decode with gold EDU boundaries forced at the copy/shift
         positions. The model still freely chooses every `<reduce_*>`, so
-        binarization + labeling stay model-driven; only segmentation is
+        binarization + labeling stay model-driven, only segmentation is
         supplied. Used by training-time eval when `cfg.eval_gold_edu`."""
         return self._predict_one_gold_edu(tree)
 
@@ -1155,7 +1155,7 @@ class Seq2SeqSRParser(nn.Module):
             return _empty_tree(self.config.relation_types)
 
         # Clamp gold ranges to the (possibly truncated) source length. An EDU
-        # whose start fell beyond truncation is dropped; one straddling the
+        # whose start fell beyond truncation is dropped. One straddling the
         # boundary gets shortened.
         clamped_ranges: list[tuple[int, int]] = []
         for s, e in gold_ranges:
@@ -1334,7 +1334,7 @@ class Seq2SeqSRParser(nn.Module):
         actions, malformed_reason = self._repair_actions(strings)
         if malformed_reason is not None:
             warn(
-                f"Malformed decoder output ({malformed_reason}); falling back to "
+                f"Malformed decoder output ({malformed_reason}), falling back to "
                 f"single-EDU tree. Likely an undertrained model or max_output_length too low."
             )
             full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
@@ -1367,7 +1367,7 @@ class Seq2SeqSRParser(nn.Module):
                 if fallback is None:
                     return actions, "no fallback reduce token available"
                 actions = list(actions) + [fallback] * needed
-            return actions, "max_length hit mid-EDU; appended closing shift/reduces"
+            return actions, "max_length hit mid-EDU, appended closing shift/reduces"
         # No exception: still need to verify shift/reduce balance.
         n_shifts = sum(1 for a in actions if isinstance(a, Shift))
         n_reduces = sum(1 for a in actions if isinstance(a, Reduce))
@@ -1380,12 +1380,12 @@ class Seq2SeqSRParser(nn.Module):
             fallback = self._fallback_reduce()
             if fallback is None:
                 return actions, "stack underdrained and no fallback reduce available"
-            return list(actions) + [fallback] * needed, "stack underdrained; appended closing reduces"
+            return list(actions) + [fallback] * needed, "stack underdrained, appended closing reduces"
         return actions, None
 
     def _fallback_reduce(self) -> "Reduce | None":
         """A Reduce action we can use to close an unfinished tree. Prefers
-        NS-elaboration if available; falls back to the first reduce in the
+        NS-elaboration if available, falls back to the first reduce in the
         vocabulary."""
         for token_str, (nuc, rel) in self.reduce_token_map.items():
             if (nuc, rel) == ("NS", "elaboration"):
@@ -1412,7 +1412,7 @@ def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
     """Per-EDU `(start, end_exclusive)` token-position ranges in the encoder's
     whole-doc tokenization space, tiling it exactly. Mirrors
     `_gold_edu_token_mapping` in train_seq2seq_sr.py (both via
-    `align_edus_to_tokens`) — duplicated so the predict path doesn't pull the
+    `align_edus_to_tokens`), duplicated so the predict path doesn't pull the
     trainer into module-load."""
     text = _reconstruct_text(tree)
     _, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
@@ -1424,45 +1424,3 @@ def _empty_tree(relation_types, text: str = "") -> RstTree:
     # becomes one EDU so downstream callers (to_rs4_string, eval) work.
     actions: list[ShiftReduceAction] = [Shift(edu_text=text or "")]
     return RstTree.from_shift_reduce(actions, relation_types=relation_types)
-
-
-def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
-    """Reorder a HF past_key_values cache along the beam dimension. Handles
-    three layouts:
-      1. Underlying model exposes `_reorder_cache(pkv, beam_idx)` (T5/T5Gemma2
-         and most HF seq2seq models).
-      2. `past_key_values` is a `DynamicCache`-like object with its own
-         `reorder_cache` method (newer transformers).
-      3. Tuple-of-tuple of Tensors (older HF), possibly with `None` entries
-         for unfilled cross-attention slots.
-    """
-    # Path 1: canonical HF helper on the base model. T5Gemma 2's inherited
-    # `_reorder_cache` assumes the legacy tuple-of-tuple layout; newer HF
-    # versions may hand us a DynamicCache instead, which makes that call
-    # blow up. Catch and fall through to the next path on type/attribute
-    # mismatches.
-    reorder = getattr(underlying_model, "_reorder_cache", None)
-    if callable(reorder):
-        try:
-            result = reorder(past_key_values, beam_idx)
-            # Modern HF cache classes mutate in place and return None;
-            # blindly returning None drops the cache on the next step.
-            return result if result is not None else past_key_values
-        except (TypeError, AttributeError) as e:
-            import warnings
-
-            warnings.warn(
-                f"{type(underlying_model).__name__}._reorder_cache failed on "
-                f"{type(past_key_values).__name__} ({type(e).__name__}: {e}); "
-                "falling back to object/tuple cache reordering.",
-                stacklevel=2,
-            )
-    # Path 2: DynamicCache or similar object-style cache.
-    if hasattr(past_key_values, "reorder_cache"):
-        result = past_key_values.reorder_cache(beam_idx)
-        return result if result is not None else past_key_values
-    # Path 3: manual tuple walk; handle Nones gracefully.
-    return tuple(
-        tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
-        for layer in past_key_values
-    )

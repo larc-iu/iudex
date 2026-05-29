@@ -35,7 +35,7 @@ from iudex.rst.data.metrics import compute_parseval_metrics, f1, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
 from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
 from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.common.encoding import align_edus_to_tokens
+from iudex.rst.parsers.common.seqgen import align_edus_to_tokens
 from iudex.rst.parsers.decoder_only_sexp.configuration_decoder_only_sexp import (
     DecoderOnlySexpConfig,
 )
@@ -88,7 +88,7 @@ def _build_optimizer(model: DecoderOnlySexpParser, cfg: DecoderOnlySexpConfig):
             relative_step=False,
             warmup_init=False,
         )
-    raise ValueError(f"Unknown optimizer {cfg.optimizer!r}; expected 'adamw' or 'adafactor'.")
+    raise ValueError(f"Unknown optimizer {cfg.optimizer!r}, expected 'adamw' or 'adafactor'.")
 
 
 def _make_collator(pad_id: int):
@@ -346,7 +346,7 @@ def train(cfg: DecoderOnlySexpConfig) -> None:
     training_complete = start_epoch >= cfg.max_epochs or stale >= cfg.patience
     if training_complete:
         reason = "max_epochs reached" if start_epoch >= cfg.max_epochs else "patience exhausted"
-        dim(f"Skipping training: {reason} on prior run; jumping to final evaluation.")
+        dim(f"Skipping training: {reason} on prior run. Jumping to final evaluation.")
 
     recent_losses: deque = deque(maxlen=200)
     recent_action_losses: deque = deque(maxlen=200)

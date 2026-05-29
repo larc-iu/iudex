@@ -6,7 +6,7 @@ import os
 import pytest
 
 from iudex.rst.data.reader import read_rst_dir
-from iudex.rst.parsers.common.encoding import align_edus_to_tokens
+from iudex.rst.parsers.common.seqgen import align_edus_to_tokens
 
 DATA_ROOT = os.path.join(os.path.dirname(__file__), "..", "data")
 TOKENIZER_NAME = "google/t5gemma-2-1b-1b"

@@ -17,14 +17,13 @@
     max_output_length: 5120,
     gradient_checkpointing: false,
 
-    // S-expression knobs.
-    traversal_order: 'postorder',
-    use_copy: true,
-    // Only meaningful when use_copy=false. true = hard-mask content
-    // positions to source_ids[cursor] (COPY-via-constraint). false =
-    // free content generation (Hu and Wan 2023's apparent setup).
-    constrain_content: true,
-
+    // LoRA on the causal LM. When use_copy=true the lm_head is replaced at
+    // parser init with a small fresh head over the action vocab; when
+    // use_copy=false the full pretrained head stays (source subwords need
+    // to be scored). The two embedding knobs below (modules_to_save,
+    // train_only_new_embedding_rows) are honored only under use_copy=false.
+    // Under the default use_copy=true they are no-ops (the carve-out trains
+    // only the new-token rows regardless).
     peft: {
         r: 8,
         alpha: 16,
@@ -69,4 +68,12 @@
     use_validity_constraints: true,
     eval_decode_greedy: true,
     min_edu_length: 1,
+
+    // Sexp-specific. `use_copy` is the registry's signature_field.
+    traversal_order: 'postorder',
+    use_copy: true,
+    // Only meaningful when use_copy=false. true = hard-mask content
+    // positions to source_ids[cursor] (COPY-via-constraint). false =
+    // free content generation (Hu and Wan 2023's apparent setup).
+    constrain_content: true,
 }

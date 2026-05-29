@@ -31,7 +31,7 @@ from iudex.common.training import (
     write_run_config,
 )
 from iudex.rst import HASH_EXCLUDE
-from iudex.rst.parsers.common.encoding import align_edus_to_tokens
+from iudex.rst.parsers.common.seqgen import align_edus_to_tokens
 from iudex.rst.data.metrics import compute_parseval_metrics, f1, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
 from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
@@ -86,13 +86,13 @@ def _build_optimizer(model: DecoderOnlySRParser, cfg: DecoderOnlySRConfig):
             relative_step=False,
             warmup_init=False,
         )
-    raise ValueError(f"Unknown optimizer {cfg.optimizer!r}; expected 'adamw' or 'adafactor'.")
+    raise ValueError(f"Unknown optimizer {cfg.optimizer!r}. Expected 'adamw' or 'adafactor'.")
 
 
 def _make_collator(pad_id: int):
     """Right-pad the single-stream input. Labels pad with -100 so HF cross-
     entropy (after the manual shift in `DecoderOnlySRParser.forward`)
-    ignores those positions; input_ids pad with `pad_id` and the attention
+    ignores those positions. input_ids pad with `pad_id` and the attention
     mask zeroes those positions out of the causal attention."""
 
     def collate(batch: list[dict]) -> dict[str, torch.Tensor]:
@@ -181,8 +181,8 @@ def _evaluate_on_dev(
     eval_gold_edu: bool = False,
 ) -> dict[str, float]:
     """End-to-end Parseval + segmentation F1 over the dev/test pairs.
-    Mirrors `seq2seq_sr.train_seq2seq_sr._evaluate_on_dev` — same metric
-    contract, same per-batch logging."""
+    Mirrors `seq2seq_sr.train_seq2seq_sr._evaluate_on_dev` (same metric
+    contract, same per-batch logging)."""
     model.eval()
     gold_trees: list[RstTree] = []
     seg_data: list[dict] = []
@@ -355,7 +355,7 @@ def train(cfg: DecoderOnlySRConfig) -> None:
     training_complete = start_epoch >= cfg.max_epochs or stale >= cfg.patience
     if training_complete:
         reason = "max_epochs reached" if start_epoch >= cfg.max_epochs else "patience exhausted"
-        dim(f"Skipping training: {reason} on prior run; jumping to final evaluation.")
+        dim(f"Skipping training: {reason} on prior run. Jumping to final evaluation.")
 
     recent_losses: deque = deque(maxlen=200)
     recent_action_losses: deque = deque(maxlen=200)

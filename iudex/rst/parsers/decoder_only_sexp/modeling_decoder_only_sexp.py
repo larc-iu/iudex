@@ -13,15 +13,15 @@ plus the trailing EOS.
 
 Two action-vocab modes:
 
-  use_copy=True:  action vocab = {<sexp_open>, <sexp_close>, <copy>, <eos>}
-                  union relation labels. The lm_head is replaced with a small
-                  fresh `Linear(hidden, head_vocab_size)`. At inference COPY
-                  triggers substitution of the current source subword into the
-                  next-step input (same flow as decoder_only_sr).
+  use_copy=True: action vocab = {<sexp_open>, <sexp_close>, <copy>, <eos>}
+    union relation labels. The lm_head is replaced with a small fresh
+    `Linear(hidden, head_vocab_size)`. At inference COPY triggers substitution
+    of the current source subword into the next-step input (same flow as
+    decoder_only_sr).
   use_copy=False: action vocab = {<sexp_open>, <sexp_close>, <eos>} union
-                  relation labels. Source subwords appear in-stream as native
-                  tokenizer ids. The full pretrained lm_head is kept (we have
-                  to score arbitrary subword ids).
+    relation labels. Source subwords appear in-stream as native tokenizer ids.
+    The full pretrained lm_head is kept (we have to score arbitrary subword
+    ids).
 """
 
 import contextlib
@@ -35,7 +35,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.common.encoding import align_edus_to_tokens
+from iudex.rst.parsers.common.seqgen import align_edus_to_tokens, reorder_past_key_values
 from iudex.rst.parsers.common.sexp_constraints import (
     FORCE_CONTENT,
     GoldEduForcer,
@@ -74,7 +74,7 @@ class DecoderOnlySexpParser(nn.Module):
         self.close_token_id: int | None = None
         self.copy_token_id: int | None = None
         if config.relation_types is not None:
-            self._install_action_vocab()
+            self._install_label_vocab()
 
         if config.peft is not None:
             self._install_peft(config.peft)
@@ -206,7 +206,7 @@ class DecoderOnlySexpParser(nn.Module):
         if retied_groups:
             logger.info(f"Re-tied trainable weight Parameters across modules_to_save groups: {retied_groups}")
 
-    def _install_action_vocab(self) -> None:
+    def _install_label_vocab(self) -> None:
         label_vocab = self._build_label_vocab()
         self._original_vocab_size = len(self.tokenizer)
         existing = set(self.tokenizer.get_vocab().keys())
@@ -287,8 +287,8 @@ class DecoderOnlySexpParser(nn.Module):
 
         if not hasattr(base, "lm_head"):
             raise RuntimeError(
-                f"Don't know how to replace lm_head on {type(base).__name__}; "
-                f"expected an `lm_head` attribute (Linear or PEFT-wrapped Linear)."
+                f"Don't know how to replace lm_head on {type(base).__name__}. "
+                f"Expected an `lm_head` attribute (Linear or PEFT-wrapped Linear)."
             )
         old = base.lm_head
         weight = getattr(old, "weight", None)
@@ -345,7 +345,7 @@ class DecoderOnlySexpParser(nn.Module):
                 patched += 1
         logger.info(
             f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
-            f"(base {n_total}x{full_weight.shape[1]} frozen); patched {patched} embedding lookup(s)."
+            f"(base {n_total}x{full_weight.shape[1]} frozen). Patched {patched} embedding lookup(s)."
         )
 
     @property
@@ -589,7 +589,7 @@ class DecoderOnlySexpParser(nn.Module):
         """
         if self.open_token_id is None or self.sep_token_id is None:
             raise RuntimeError(
-                "encode_target called before action vocab was installed; did you forget to set cfg.relation_types?"
+                "encode_target called before action vocab was installed. Did you forget to set cfg.relation_types?"
             )
 
         source_ids, edu_subword_ids = self._edu_subword_ids(tree)
@@ -652,7 +652,7 @@ class DecoderOnlySexpParser(nn.Module):
             ids.add(int(self.sep_token_id))
         return frozenset(ids)
 
-    def _state_for_source(self, source_ids: list[int]) -> SexpDecodingState:
+    def _initial_state(self, source_ids: list[int]) -> SexpDecodingState:
         return SexpDecodingState(
             source_len=len(source_ids),
             traversal_order=self.config.traversal_order,
@@ -760,7 +760,7 @@ class DecoderOnlySexpParser(nn.Module):
             return _empty_tree(self.config.relation_types)
         prefix_ids = self._build_prefix_ids(source_ids)
         source_len = len(source_ids)
-        state = self._state_for_source(source_ids)
+        state = self._initial_state(source_ids)
 
         with self._inference_mode():
             input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
@@ -876,7 +876,7 @@ class DecoderOnlySexpParser(nn.Module):
             past_key_values = out.past_key_values
             logits = out.logits[:, -1, :]  # [K, V]
 
-            states: list[SexpDecodingState] = [self._state_for_source(source_ids) for _ in range(K)]
+            states: list[SexpDecodingState] = [self._initial_state(source_ids) for _ in range(K)]
             done = [False] * K
             emitted_seqs: list[list[int]] = [[] for _ in range(K)]
             pred_edu_ranges: list[list[tuple[int, int]]] = [[] for _ in range(K)]
@@ -911,7 +911,7 @@ class DecoderOnlySexpParser(nn.Module):
                 is_identity = parent_of_new == list(range(K))
                 needs_reorder = past_key_values is not None and not (is_step0_uniform or is_identity)
                 if needs_reorder:
-                    past_key_values = _reorder_pkv(past_key_values, parent_tensor, self._underlying_model())
+                    past_key_values = reorder_past_key_values(past_key_values, parent_tensor, self._underlying_model())
 
                 new_states = [states[p] for p in parent_of_new]
                 new_done = [done[p] for p in parent_of_new]
@@ -1069,7 +1069,7 @@ class DecoderOnlySexpParser(nn.Module):
         n_edus = len(clamped_ranges)
         forcer = GoldEduForcer(n_edus, clamped_ranges)
 
-        state = dataclasses.replace(self._state_for_source(source_ids), min_edu_length=1)
+        state = dataclasses.replace(self._initial_state(source_ids), min_edu_length=1)
 
         with self._inference_mode():
             input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
@@ -1237,7 +1237,7 @@ class DecoderOnlySexpParser(nn.Module):
                 relation_types=self.config.relation_types,
             )
         except Exception as e:
-            warn(f"Malformed sexp output ({type(e).__name__}: {e}); falling back to single-EDU tree.")
+            warn(f"Malformed sexp output ({type(e).__name__}: {e}). Falling back to single-EDU tree.")
             full_text = self.tokenizer.decode(source_ids, skip_special_tokens=True)
             tree = _empty_tree(self.config.relation_types, text=full_text)
             # Mark the fallback so callers null out `_pred_edu_source_ranges`
@@ -1277,31 +1277,3 @@ def _dedup_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
         if not out or out[-1] != r:
             out.append(r)
     return out
-
-
-def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
-    """Reorder a HF `past_key_values` cache along the beam dimension.
-    Mirrors `decoder_only_sr._reorder_pkv` (DynamicCache.reorder_cache
-    mutates in place and returns None — fall back to the mutated object
-    in that case)."""
-    reorder = getattr(underlying_model, "_reorder_cache", None)
-    if callable(reorder):
-        try:
-            result = reorder(past_key_values, beam_idx)
-            return result if result is not None else past_key_values
-        except (TypeError, AttributeError) as e:
-            import warnings
-
-            warnings.warn(
-                f"{type(underlying_model).__name__}._reorder_cache failed on "
-                f"{type(past_key_values).__name__} ({type(e).__name__}: {e}); "
-                "falling back to object/tuple cache reordering.",
-                stacklevel=2,
-            )
-    if hasattr(past_key_values, "reorder_cache"):
-        result = past_key_values.reorder_cache(beam_idx)
-        return result if result is not None else past_key_values
-    return tuple(
-        tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
-        for layer in past_key_values
-    )

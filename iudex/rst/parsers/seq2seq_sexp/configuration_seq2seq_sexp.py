@@ -11,7 +11,7 @@ class _PeftConfig(FromParams):
 
     Under `use_copy=True` the lm_head is replaced with a small fresh Linear
     over the action vocab and the input embedding freezes its base + trains a
-    small new-rows Parameter (`_carve_new_token_embeddings`); `modules_to_save`
+    small new-rows Parameter (`_carve_new_token_embeddings`). `modules_to_save`
     / `train_only_new_embedding_rows` have no effect.
 
     Under `use_copy=False` the full pretrained tied lm_head is kept (source
@@ -130,7 +130,7 @@ class Seq2SeqSexpConfig(FromParams):
     # The action head is small (~100 classes) and GUM has ~150 train docs,
     # so hard targets overfit fast. 0.1 is the conventional default. Applied
     # uniformly at its configured value in both use_copy modes (no auto-
-    # scaling); under use_copy=False this is a known confound across the
+    # scaling). Under use_copy=False this is a known confound across the
     # ~100-class head and the full-vocab head.
     label_smoothing: float = 0.1
 
@@ -142,8 +142,8 @@ class Seq2SeqSexpConfig(FromParams):
     # positions to `source_ids[cursor]` (COPY-via-constraint, current
     # behavior). False admits any non-structural id at content positions
     # (free generation, closer to Hu and Wan 2023's apparent setup where
-    # the model learns to copy via attention). Requires `use_copy=False`;
-    # raises if both are True.
+    # the model learns to copy via attention). Requires `use_copy=False`.
+    # Raises if both are True.
     constrain_content: bool = True
     # When True (default), action vocab includes a `<copy>` token, source
     # subwords are replaced by `<copy>` at training time, the lm_head is

@@ -89,10 +89,10 @@ class Seq2SeqSRConfig(FromParams):
     eval_decode_greedy: bool = True
 
     # Minimum number of `<copy>` actions required before `<shift>` becomes
-    # legal at decode time (inference-only — has no effect on training). 1
+    # legal at decode time (inference-only, has no effect on training). 1
     # is no constraint. Bump to 2 or 3 to suppress over-segmentation
-    # (splits like "Education" + "and early loves" out of one gold EDU);
-    # the model trained on real EDUs of length >=1 may still want to shift
+    # (splits like "Education" + "and early loves" out of one gold EDU).
+    # The model trained on real EDUs of length >=1 may still want to shift
     # after a single copy, but the constraint forces it to continue copying.
     # Exception: at the end of the source, shift is always legal regardless
     # of this setting (otherwise the final EDU can't be committed).
@@ -100,7 +100,7 @@ class Seq2SeqSRConfig(FromParams):
 
     # Cap per-epoch dev eval to the first N documents (in directory order) to
     # speed up training-time validation. Autoregressive generation at L≈3K on
-    # a 1B decoder is ~1 min/doc even with KV cache; full GUM dev (32 docs)
+    # a 1B decoder is ~1 min/doc even with KV cache. Full GUM dev (32 docs)
     # costs ~30 min/epoch. None = use the full dev set every epoch. The FINAL
     # dev/test eval always runs on the full split regardless of this setting.
     dev_max_docs: int | None = None
@@ -114,16 +114,16 @@ class Seq2SeqSRConfig(FromParams):
     # Multiplier on the gradient contribution of structural-action positions
     # (`<shift>`, `<reduce_*>`) in the training loss. Default 1.0 (no
     # rebalance) since the replacement lm_head projects to ~100 action
-    # classes — copy CE is on the same scale as structural CE and the old
+    # classes, copy CE is on the same scale as structural CE and the old
     # 262K-vocab justification for upweighting structurals doesn't apply.
     # Bump above 1.0 only if action positions are demonstrably starved
-    # (e.g. copy CE near zero but structural CE high); higher values bias
+    # (e.g. copy CE near zero but structural CE high). Higher values bias
     # the model toward over-emitting `<shift>` at inference.
     action_loss_weight: float = 1.0
 
     # Label smoothing on the CE loss. Standard seq2seq fine-tuning trick.
     # The action head is small (~100 classes) and GUM has ~150 train docs,
-    # so hard targets overfit fast; 0.1 is the conventional default.
+    # so hard targets overfit fast. 0.1 is the conventional default.
     label_smoothing: float = 0.1
 
     @classmethod

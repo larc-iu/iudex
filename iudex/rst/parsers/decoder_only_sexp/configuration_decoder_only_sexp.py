@@ -73,32 +73,6 @@ class DecoderOnlySexpConfig(FromParams):
     # pulls this config into the decoder-only column.
     causal_mode: bool = True
 
-    # S-expression knobs. `use_copy` is the registry's signature_field.
-    traversal_order: str = "postorder"
-    # Controls how content positions are masked at decode time. Only
-    # applies when `use_copy=False`. True (default) hard-masks content
-    # positions to `source_ids[cursor]` (COPY-via-constraint, current
-    # behavior). False admits any non-structural id at content positions
-    # (free generation, closer to Hu and Wan 2023's apparent setup where
-    # the model learns to copy via attention). Requires `use_copy=False`;
-    # raises if both are True.
-    constrain_content: bool = True
-    # When True (default), action vocab includes a `<copy>` token, source
-    # subwords are replaced by `<copy>` at training time, the lm_head is
-    # replaced with a small fresh `Linear(hidden, head_vocab_size)` over
-    # the action vocab (~100 classes), and the predict path substitutes
-    # the current source id into the next decoder input when `<copy>` is
-    # emitted. When False, source subwords appear verbatim in-stream and
-    # the full pretrained lm_head is kept so source ids are scorable
-    # natively. This mirrors Hu and Wan 2023 (TASLP, "RST Discourse
-    # Parsing as Text-to-Text Generation"). Note the inherent asymmetry:
-    # the head architecture differs across modes by design (no-copy
-    # MUST keep the full head to score source ids), so a COPY ablation
-    # conflates "having COPY" with "enables a small head". This is a
-    # property of the COPY mechanism itself, not a confound we can
-    # eliminate without breaking one mode or the other.
-    use_copy: bool = True
-
     # LoRA. Null = full fine-tuning. When set, the base causal LM is frozen
     # and only LoRA adapters + the modules in `peft.modules_to_save` train.
     # For Gemma3 1B and up this is the practical default since full FT
@@ -164,6 +138,32 @@ class DecoderOnlySexpConfig(FromParams):
     # head is the full vocab rather than ~100 action classes, a known
     # head-size confound on the per-off-class smoothing mass.
     label_smoothing: float = 0.1
+
+    # S-expression knobs. `use_copy` is the registry's signature_field.
+    traversal_order: str = "postorder"
+    # Controls how content positions are masked at decode time. Only
+    # applies when `use_copy=False`. True (default) hard-masks content
+    # positions to `source_ids[cursor]` (COPY-via-constraint, current
+    # behavior). False admits any non-structural id at content positions
+    # (free generation, closer to Hu and Wan 2023's apparent setup where
+    # the model learns to copy via attention). Requires `use_copy=False`.
+    # Raises if both are True.
+    constrain_content: bool = True
+    # When True (default), action vocab includes a `<copy>` token, source
+    # subwords are replaced by `<copy>` at training time, the lm_head is
+    # replaced with a small fresh `Linear(hidden, head_vocab_size)` over
+    # the action vocab (~100 classes), and the predict path substitutes
+    # the current source id into the next decoder input when `<copy>` is
+    # emitted. When False, source subwords appear verbatim in-stream and
+    # the full pretrained lm_head is kept so source ids are scorable
+    # natively. This mirrors Hu and Wan 2023 (TASLP, "RST Discourse
+    # Parsing as Text-to-Text Generation"). Note the inherent asymmetry:
+    # the head architecture differs across modes by design (no-copy
+    # MUST keep the full head to score source ids), so a COPY ablation
+    # conflates "having COPY" with "enables a small head". This is a
+    # property of the COPY mechanism itself, not a confound we can
+    # eliminate without breaking one mode or the other.
+    use_copy: bool = True
 
     def __post_init__(self):
         if self.traversal_order not in ("preorder", "postorder"):

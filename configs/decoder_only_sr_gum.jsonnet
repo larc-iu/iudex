@@ -22,8 +22,9 @@
     gradient_checkpointing: false,
 
     // LoRA on the causal LM. lm_head is replaced at parser init with a
-    // small fresh head over just the action vocab. Same `embed_tokens`
-    // story as seq2seq_sr: only the new action-token rows update.
+    // small fresh head over just the action vocab. The input embedding
+    // freezes its pretrained base and trains a small new-rows Parameter,
+    // so only the new action-token rows update.
     peft: {
         r: 8,
         alpha: 16,
@@ -31,6 +32,9 @@
         target_modules: 'all-linear',
         bias: 'none',
         dora: false,
+        // No-ops for this parser, kept so existing jsonnets load. SR carves
+        // the new embedding rows unconditionally (frozen base + small new-rows
+        // Parameter), so neither field has any effect on training.
         modules_to_save: ['embed_tokens'],
         train_only_new_embedding_rows: true,
     },

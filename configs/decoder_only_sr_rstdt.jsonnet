@@ -17,7 +17,7 @@
     gradient_checkpointing: false,
 
     // LoRA on the causal LM. lm_head replaced with a small action-vocab
-    // head; only new action-token rows of embed_tokens update.
+    // head. Only new action-token rows of embed_tokens update.
     peft: {
         r: 8,
         alpha: 16,
@@ -25,6 +25,9 @@
         target_modules: 'all-linear',
         bias: 'none',
         dora: false,
+        // No-ops for this parser, kept so existing jsonnets load. SR carves
+        // the new embedding rows unconditionally (frozen base + small new-rows
+        // Parameter), so neither field has any effect on training.
         modules_to_save: ['embed_tokens'],
         train_only_new_embedding_rows: true,
     },

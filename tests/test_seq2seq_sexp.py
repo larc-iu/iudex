@@ -15,9 +15,6 @@ pytest.importorskip("transformers")
 from iudex.rst.data.tree import Reduce, RstTree, Shift
 from iudex.rst.parsers.seq2seq_sexp.configuration_seq2seq_sexp import Seq2SeqSexpConfig
 from iudex.rst.parsers.seq2seq_sexp.modeling_seq2seq_sexp import (
-    COPY_TOKEN,
-    SEXP_CLOSE_TOKEN,
-    SEXP_OPEN_TOKEN,
     Seq2SeqSexpParser,
     _gold_edu_source_ranges,
     _reconstruct_text,
@@ -113,7 +110,7 @@ def _reconstruct_sexp_from_labels(parser: Seq2SeqSexpParser, labels: list[int], 
             if kinds:
                 kinds.pop()
             depth -= 1
-        elif tok in parser.reduce_token_ids:
+        elif tok in parser.label_id_set:
             token_str = parser.tokenizer.convert_ids_to_tokens(tok)
             pieces.append(_reduce_token_to_label(token_str))
             if kinds:
@@ -138,15 +135,15 @@ def _labels_action_only(parser: Seq2SeqSexpParser, labels: list[int]) -> list[st
     out: list[str] = []
     for tok in labels:
         if tok == parser.open_token_id:
-            out.append(SEXP_OPEN_TOKEN)
+            out.append(parser.OPEN_TOKEN)
         elif tok == parser.close_token_id:
-            out.append(SEXP_CLOSE_TOKEN)
-        elif tok in parser.reduce_token_ids:
+            out.append(parser.CLOSE_TOKEN)
+        elif tok in parser.label_id_set:
             out.append(parser.tokenizer.convert_ids_to_tokens(tok))
         elif tok == parser.tokenizer.eos_token_id:
             out.append("</s>")
         elif parser.config.use_copy and tok == parser.copy_token_id:
-            out.append(COPY_TOKEN)
+            out.append(parser.COPY_TOKEN)
         # source ids in use_copy=False mode: drop
     return out
 
@@ -189,19 +186,19 @@ def test_encode_target_label_shape(traversal_order, use_copy):
     labels, _ = parser.encode_target(tree)
     seq = _labels_action_only(parser, labels)
     # 2 EDUs + 1 internal node => 3 opens and 3 closes (+ EOS at the end).
-    assert seq.count(SEXP_OPEN_TOKEN) == 3
-    assert seq.count(SEXP_CLOSE_TOKEN) == 3
+    assert seq.count(parser.OPEN_TOKEN) == 3
+    assert seq.count(parser.CLOSE_TOKEN) == 3
     assert seq[-1] == "</s>"
     label_str = Reduce(nuc="NS", rel="elaboration").to_token()
     assert seq.count(label_str) == 1
     if traversal_order == "preorder":
         # First open is root; next token is the label.
-        assert seq[0] == SEXP_OPEN_TOKEN
+        assert seq[0] == parser.OPEN_TOKEN
         assert seq[1] == label_str
     else:
         # Label appears just before the root close.
         # Root close is the second-to-last structural token (EOS is last).
-        assert seq[-2] == SEXP_CLOSE_TOKEN
+        assert seq[-2] == parser.CLOSE_TOKEN
         assert seq[-3] == label_str
 
 
@@ -363,7 +360,7 @@ def test_use_copy_false_loss_is_finite_and_flows_to_lm_head(traversal_order):
     inp = parser.encode_input(text)
     # Confirm the label stream contains at least one non-structural id (a
     # source subword). Without that the test would degenerate.
-    structural = {parser.open_token_id, parser.close_token_id, parser.tokenizer.eos_token_id} | parser.reduce_token_ids
+    structural = {parser.open_token_id, parser.close_token_id, parser.tokenizer.eos_token_id} | parser.label_id_set
     has_source_label = any(t not in structural for t in labels)
     assert has_source_label, "test fixture invariant: at least one leaf-content position must exist"
 

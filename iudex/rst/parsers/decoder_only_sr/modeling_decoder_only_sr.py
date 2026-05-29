@@ -15,7 +15,7 @@ by the current source-cursor subword (mechanism reused verbatim from
 seq2seq_sr).
 
 Per-document inference only (the `_predict_batch_greedy` API is preserved
-but loops row-by-row internally; the per-row variable-prefix-length
+but loops row-by-row internally. The per-row variable-prefix-length
 padding story isn't worth the speedup for smoke-test scale).
 """
 
@@ -29,7 +29,10 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from iudex.common.log import warn
-from iudex.rst.parsers.common.encoding import align_edus_to_tokens
+from iudex.rst.parsers.common.seqgen import (
+    align_edus_to_tokens,
+    reorder_past_key_values,
+)
 from iudex.rst.data.tree import (
     Reduce,
     RstTree,
@@ -105,7 +108,7 @@ class DecoderOnlySRParser(nn.Module):
     def _install_peft(self, peft_cfg) -> None:
         """Wrap `self.model` in LoRA adapters. The input embedding is NOT in
         PEFT `modules_to_save` (that would duplicate the vocab x hidden matrix
-        to train ~100 new rows); we freeze the base and train a small new-rows
+        to train ~100 new rows). We freeze the base and train a small new-rows
         Parameter instead (`_carve_new_token_embeddings`)."""
         from peft import LoraConfig, TaskType, get_peft_model
 
@@ -138,7 +141,7 @@ class DecoderOnlySRParser(nn.Module):
         backward pass actually recomputes activations. Some submodules and
         PEFT wrappers consult `self.config.use_cache` directly to decide
         whether to populate `past_key_values`, so toggling only the kwarg
-        on the forward call isn't enough — leaving the config flag at
+        on the forward call isn't enough. Leaving the config flag at
         False during predict silently kills the KV cache and forces every
         step to re-encode the prefix from scratch. Restores both flags on
         exit so a subsequent training step is unaffected."""
@@ -221,11 +224,11 @@ class DecoderOnlySRParser(nn.Module):
         """Replace the model's lm_head (tied to embed_tokens for Gemma)
         with a small fresh `Linear(hidden -> head_vocab_size)`. Done AFTER
         PEFT wrap so any LoRA adapter PEFT attached to lm_head gets
-        discarded — we want this small head fully trainable, not LoRA.
+        discarded (we want this small head fully trainable, not LoRA).
 
         Warm-init copies each head row from `embed_tokens[full_id]`. This
         is only meaningfully informative for rows whose `full_id` was
-        already in the pretrained vocab (here that's EOS — every other
+        already in the pretrained vocab (here that's EOS, every other
         head row is for a token added via `resize_token_embeddings` and
         therefore has a freshly-random embedding). For those new rows the
         warm-init is effectively just re-randomization, but it's harmless
@@ -241,8 +244,8 @@ class DecoderOnlySRParser(nn.Module):
 
         if not hasattr(base, "lm_head"):
             raise RuntimeError(
-                f"Don't know how to replace lm_head on {type(base).__name__}; "
-                f"expected an `lm_head` attribute (Linear or PEFT-wrapped Linear)."
+                f"Don't know how to replace lm_head on {type(base).__name__}. "
+                f"Expected an `lm_head` attribute (Linear or PEFT-wrapped Linear)."
             )
         old = base.lm_head
         weight = getattr(old, "weight", None)
@@ -264,7 +267,7 @@ class DecoderOnlySRParser(nn.Module):
         regardless of whether PEFT is enabled. The discriminator is `PEFT`-
         module-origin rather than attribute presence, because HF's
         `PreTrainedModel.base_model` shortcut ALSO returns the inner
-        transformer (`Gemma3TextModel`) — so attribute-only walking would
+        transformer (`Gemma3TextModel`), so attribute-only walking would
         descend past the LM head on no-PEFT setups."""
         m = self.model
         if type(m).__module__.startswith("peft"):
@@ -278,7 +281,7 @@ class DecoderOnlySRParser(nn.Module):
         embedding into a small trainable `self.new_token_embeddings`
         Parameter, freeze the base matrix, and splice the two at lookup time.
         See `Seq2SeqSRParser._carve_new_token_embeddings` for the full
-        rationale. Gradient flows only to `new_token_embeddings`; the frozen
+        rationale. Gradient flows only to `new_token_embeddings`. The frozen
         base weight's `.grad` stays None."""
         n_old = int(self._original_vocab_size)
         embed = self._underlying_model().get_input_embeddings()
@@ -306,7 +309,7 @@ class DecoderOnlySRParser(nn.Module):
                 patched += 1
         logger.info(
             f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
-            f"(base {n_total}x{full_weight.shape[1]} frozen); patched {patched} embedding lookup(s)."
+            f"(base {n_total}x{full_weight.shape[1]} frozen). Patched {patched} embedding lookup(s)."
         )
 
     @property
@@ -353,7 +356,7 @@ class DecoderOnlySRParser(nn.Module):
 
         `batch` carries `input_ids [B, L]`, `attention_mask [B, L]`, and
         `labels [B, L]` with the prefix `[BOS source SEP]` already masked
-        to -100. Labels in the action region are full-vocab IDs; we map
+        to -100. Labels in the action region are full-vocab IDs. We map
         them to head indices here so the small replacement `lm_head` can
         score them.
 
@@ -456,7 +459,7 @@ class DecoderOnlySRParser(nn.Module):
         """
         if self.shift_token_id is None or self.sep_token_id is None:
             raise RuntimeError(
-                "encode_target called before action vocab was installed; did you forget to set cfg.relation_types?"
+                "encode_target called before action vocab was installed. Did you forget to set cfg.relation_types?"
             )
 
         text = _reconstruct_text(tree)
@@ -558,7 +561,7 @@ class DecoderOnlySRParser(nn.Module):
 
     @torch.no_grad()
     def _predict_batch_greedy(self, texts: list[str]) -> list[RstTree]:
-        """Per-document greedy decoding. Loops row-by-row; the single-stream
+        """Per-document greedy decoding. Loops row-by-row. The single-stream
         layout means each row's prefix length is different, and the padding
         + position-id bookkeeping to truly batch this isn't worth the
         speedup at smoke-test scale. Public API matches seq2seq_sr."""
@@ -675,10 +678,10 @@ class DecoderOnlySRParser(nn.Module):
     def _predict_one_beam(self, text: str, num_beams: int) -> RstTree:
         """Per-document beam search with K parallel beams. Replicates the
         prefix across the batch dim so the prefix forward seeds K identical
-        KV caches; only beam 0 is alive at step 0 so beams diverge after the
+        KV caches. Only beam 0 is alive at step 0 so beams diverge after the
         first decoding step (same trick as seq2seq_sr.`_predict_one_beam`).
-        Reorders the KV cache through `_reorder_pkv` when beams switch
-        parents."""
+        Reorders the KV cache through `reorder_past_key_values` when beams
+        switch parents."""
         self.eval()
         device = next(self.parameters()).device
         K = int(num_beams)
@@ -748,13 +751,13 @@ class DecoderOnlySRParser(nn.Module):
                 # Skip the reorder when it's provably a no-op: step 0
                 # has `parent_of_new == [0]*K` because only beam 0 was
                 # alive, and the prefix forward already replicated K
-                # identical cache rows; later steps where parents form
+                # identical cache rows. Later steps where parents form
                 # the identity permutation are also no-ops.
                 is_step0_uniform = step == 0 and all(p == 0 for p in parent_of_new)
                 is_identity = parent_of_new == list(range(K))
                 needs_reorder = past_key_values is not None and not (is_step0_uniform or is_identity)
                 if needs_reorder:
-                    past_key_values = _reorder_pkv(past_key_values, parent_tensor, self._underlying_model())
+                    past_key_values = reorder_past_key_values(past_key_values, parent_tensor, self._underlying_model())
 
                 new_cursors = [cursors[p] for p in parent_of_new]
                 new_stacks = [stacks[p] for p in parent_of_new]
@@ -866,7 +869,7 @@ class DecoderOnlySRParser(nn.Module):
     @torch.no_grad()
     def predict_with_gold_edus(self, tree: RstTree) -> RstTree:
         """Greedy decode with gold EDU boundaries forced at the copy/shift
-        positions. Reduces stay model-driven; only segmentation is supplied.
+        positions. Reduces stay model-driven, only segmentation is supplied.
         Used by the trainer's final-eval path (gold-EDU eval is gated by the
         `eval_gold_edu` parameter of `_evaluate_on_dev`, not a config field)."""
         return self._predict_one_gold_edu(tree)
@@ -1029,7 +1032,7 @@ class DecoderOnlySRParser(nn.Module):
 
         actions, malformed_reason = self._repair_actions(strings)
         if malformed_reason is not None:
-            warn(f"Malformed decoder output ({malformed_reason}); falling back to single-EDU tree.")
+            warn(f"Malformed decoder output ({malformed_reason}). Falling back to single-EDU tree.")
             full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
             return _empty_tree(self.config.relation_types, text=full_text)
         return RstTree.from_shift_reduce(actions, relation_types=self.config.relation_types)
@@ -1051,7 +1054,7 @@ class DecoderOnlySRParser(nn.Module):
                 if fallback is None:
                     return actions, "no fallback reduce token available"
                 actions = list(actions) + [fallback] * needed
-            return actions, "max_length hit mid-EDU; appended closing shift/reduces"
+            return actions, "max_length hit mid-EDU, appended closing shift/reduces"
         n_shifts = sum(1 for a in actions if isinstance(a, Shift))
         n_reduces = sum(1 for a in actions if isinstance(a, Reduce))
         if n_shifts == 0:
@@ -1063,7 +1066,7 @@ class DecoderOnlySRParser(nn.Module):
             fallback = self._fallback_reduce()
             if fallback is None:
                 return actions, "stack underdrained and no fallback reduce available"
-            return list(actions) + [fallback] * needed, "stack underdrained; appended closing reduces"
+            return list(actions) + [fallback] * needed, "stack underdrained, appended closing reduces"
         return actions, None
 
     def _fallback_reduce(self) -> "Reduce | None":
@@ -1098,35 +1101,3 @@ def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
 def _empty_tree(relation_types, text: str = "") -> RstTree:
     actions: list[ShiftReduceAction] = [Shift(edu_text=text or "")]
     return RstTree.from_shift_reduce(actions, relation_types=relation_types)
-
-
-def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
-    """Reorder a HF `past_key_values` cache along the beam dimension.
-    Tries (1) the underlying model's `_reorder_cache`, (2) a `DynamicCache`-
-    style `reorder_cache` method, then (3) manual tuple-of-tuple walk.
-
-    Modern HF `DynamicCache.reorder_cache(beam_idx)` mutates in place and
-    returns `None`; if we returned the call result blindly we'd assign
-    `past_key_values = None` and silently kill the cache on the next step.
-    Fall back to the (mutated) original whenever a path returns `None`."""
-    reorder = getattr(underlying_model, "_reorder_cache", None)
-    if callable(reorder):
-        try:
-            result = reorder(past_key_values, beam_idx)
-            return result if result is not None else past_key_values
-        except (TypeError, AttributeError) as e:
-            import warnings
-
-            warnings.warn(
-                f"{type(underlying_model).__name__}._reorder_cache failed on "
-                f"{type(past_key_values).__name__} ({type(e).__name__}: {e}); "
-                "falling back to object/tuple cache reordering.",
-                stacklevel=2,
-            )
-    if hasattr(past_key_values, "reorder_cache"):
-        result = past_key_values.reorder_cache(beam_idx)
-        return result if result is not None else past_key_values
-    return tuple(
-        tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
-        for layer in past_key_values
-    )

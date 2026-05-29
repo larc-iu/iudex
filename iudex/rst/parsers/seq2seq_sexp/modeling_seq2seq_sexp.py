@@ -9,7 +9,7 @@ Action vocabulary (use_copy=True):
     <reduce_nn_*>} U {<copy>}
 
 In use_copy=False mode the `<copy>` token is dropped from the head and
-the source subwords appear in-stream as their actual tokenizer IDs; the
+the source subwords appear in-stream as their actual tokenizer IDs. The
 small action head still emits structural tokens, but source positions
 are predicted by the (untouched) backbone's lm_head over its full input
 vocab. Since we replace the lm_head with a small Linear, we expand the
@@ -17,7 +17,7 @@ head's output dim to cover ALL source subwords seen during training, OR
 we constrain ourselves to the full vocab. Implementation choice: the
 head projects to {<sexp_open>, <sexp_close>, <eos>, labels} (no copy)
 PLUS the full input vocabulary, in head-index space. For practicality
-we keep `use_copy=True` as the canonical / well-tested path; the
+we keep `use_copy=True` as the canonical / well-tested path. The
 `use_copy=False` branch is supported in `encode_target` and decoding
 but uses the full backbone lm_head (no head replacement) so the source
 vocab is naturally available. This trades the memory benefit of the
@@ -36,7 +36,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import Reduce, RstTree
-from iudex.rst.parsers.common.encoding import align_edus_to_tokens
+from iudex.rst.parsers.common.seqgen import align_edus_to_tokens, reorder_past_key_values
 from iudex.rst.parsers.common.sexp_constraints import (
     FORCE_CONTENT,
     GoldEduForcer,
@@ -45,14 +45,6 @@ from iudex.rst.parsers.common.sexp_constraints import (
 from iudex.rst.parsers.seq2seq_sexp.configuration_seq2seq_sexp import Seq2SeqSexpConfig
 
 logger = logging.getLogger(__name__)
-
-
-# Structural special tokens added to the tokenizer. New, not SentencePiece
-# `(` / `)`, to avoid the family's whitespace/escape quirks around bare
-# punctuation.
-SEXP_OPEN_TOKEN = "<sexp_open>"
-SEXP_CLOSE_TOKEN = "<sexp_close>"
-COPY_TOKEN = "<copy>"
 
 
 def _reduce_token_to_label(token: str) -> str:
@@ -66,6 +58,13 @@ def _reduce_token_to_label(token: str) -> str:
 
 
 class Seq2SeqSexpParser(nn.Module):
+    # Structural special tokens added to the tokenizer. New, not SentencePiece
+    # `(` / `)`, to avoid the family's whitespace/escape quirks around bare
+    # punctuation.
+    OPEN_TOKEN: str = "<sexp_open>"
+    CLOSE_TOKEN: str = "<sexp_close>"
+    COPY_TOKEN: str = "<copy>"
+
     def __init__(self, config: Seq2SeqSexpConfig, *, compile_encoder: bool = False):
         super().__init__()
         self.config = config
@@ -75,11 +74,11 @@ class Seq2SeqSexpParser(nn.Module):
         torch_dtype = torch.bfloat16 if config.amp else torch.float32
         self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, torch_dtype=torch_dtype)
 
-        self.action_token_ids: dict[str, int] = {}
-        self.reduce_token_ids: set[int] = set()
-        self.reduce_token_map: dict[str, Tuple[str, str]] = {}
+        self.label_token_ids: dict[str, int] = {}
+        self.label_id_set: set[int] = set()
+        self.label_token_map: dict[str, Tuple[str, str]] = {}
         if config.relation_types is not None:
-            self._install_action_vocab()
+            self._install_label_vocab()
 
         if config.peft is not None:
             self._install_peft(config.peft)
@@ -103,21 +102,21 @@ class Seq2SeqSexpParser(nn.Module):
     # Action vocabulary installation
     # -----------------------------------------------------------------
 
-    def _build_action_vocab(self) -> List[str]:
+    def _build_label_vocab(self) -> List[str]:
         """Specials + per-(rel, kind) reduces (same `<reduce_*>` tokens as
         seq2seq_sr) + optional copy token."""
         assert self.config.relation_types is not None
         reduces: list[str] = []
-        self.reduce_token_map = {}
+        self.label_token_map = {}
         for rel, kind in self.config.relation_types:
             nucs = ("NN",) if kind == "multinuc" else ("NS", "SN")
             for nuc in nucs:
                 token = Reduce(nuc=nuc, rel=rel).to_token()
                 reduces.append(token)
-                self.reduce_token_map[token] = (nuc, rel)
-        tokens = [SEXP_OPEN_TOKEN, SEXP_CLOSE_TOKEN] + reduces
+                self.label_token_map[token] = (nuc, rel)
+        tokens = [self.OPEN_TOKEN, self.CLOSE_TOKEN] + reduces
         if self.config.use_copy:
-            tokens.append(COPY_TOKEN)
+            tokens.append(self.COPY_TOKEN)
         return tokens
 
     def _install_peft(self, peft_cfg) -> None:
@@ -214,8 +213,8 @@ class Seq2SeqSexpParser(nn.Module):
                 return int(bos)
         return int(self.tokenizer.pad_token_id)
 
-    def _install_action_vocab(self) -> None:
-        action_vocab = self._build_action_vocab()
+    def _install_label_vocab(self) -> None:
+        action_vocab = self._build_label_vocab()
         self._original_vocab_size = len(self.tokenizer)
         existing = set(self.tokenizer.get_vocab().keys())
         new_tokens = [t for t in action_vocab if t not in existing]
@@ -223,15 +222,15 @@ class Seq2SeqSexpParser(nn.Module):
             self.tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
             self.model.resize_token_embeddings(len(self.tokenizer))
 
-        self.action_token_ids = {t: self.tokenizer.convert_tokens_to_ids(t) for t in action_vocab}
-        self.open_token_id = self.action_token_ids[SEXP_OPEN_TOKEN]
-        self.close_token_id = self.action_token_ids[SEXP_CLOSE_TOKEN]
-        self.copy_token_id = self.action_token_ids[COPY_TOKEN] if self.config.use_copy else None
+        self.label_token_ids = {t: self.tokenizer.convert_tokens_to_ids(t) for t in action_vocab}
+        self.open_token_id = self.label_token_ids[self.OPEN_TOKEN]
+        self.close_token_id = self.label_token_ids[self.CLOSE_TOKEN]
+        self.copy_token_id = self.label_token_ids[self.COPY_TOKEN] if self.config.use_copy else None
         self.decoder_start_token_id = self._resolve_decoder_start_token_id()
-        self.reduce_token_ids = {
+        self.label_id_set = {
             tok_id
-            for token_str, tok_id in self.action_token_ids.items()
-            if token_str not in (SEXP_OPEN_TOKEN, SEXP_CLOSE_TOKEN, COPY_TOKEN)
+            for token_str, tok_id in self.label_token_ids.items()
+            if token_str not in (self.OPEN_TOKEN, self.CLOSE_TOKEN, self.COPY_TOKEN)
         }
 
         eos_id = int(self.tokenizer.eos_token_id)
@@ -242,7 +241,7 @@ class Seq2SeqSexpParser(nn.Module):
             head_ids: list[int] = [
                 self.open_token_id,
                 self.close_token_id,
-                *sorted(self.reduce_token_ids),
+                *sorted(self.label_id_set),
                 eos_id,
                 self.copy_token_id,
             ]
@@ -253,9 +252,9 @@ class Seq2SeqSexpParser(nn.Module):
             self.close_head_idx = self.head_idx_for_full_id[self.close_token_id]
             self.eos_head_idx = self.head_idx_for_full_id[eos_id]
             self.copy_head_idx = self.head_idx_for_full_id[self.copy_token_id]
-            self.reduce_head_indices = {self.head_idx_for_full_id[fid] for fid in self.reduce_token_ids}
+            self.label_head_indices = {self.head_idx_for_full_id[fid] for fid in self.label_id_set}
 
-            structural_head_ids = sorted(self.reduce_head_indices | {self.open_head_idx, self.close_head_idx})
+            structural_head_ids = sorted(self.label_head_indices | {self.open_head_idx, self.close_head_idx})
             self.register_buffer(
                 "_structural_token_ids_buf",
                 torch.tensor(structural_head_ids, dtype=torch.long),
@@ -268,7 +267,7 @@ class Seq2SeqSexpParser(nn.Module):
             self.register_buffer("_label_to_head_lookup", lookup, persistent=False)
             self.register_buffer(
                 "_reduce_head_ids_buf",
-                torch.tensor(sorted(self.reduce_head_indices), dtype=torch.long),
+                torch.tensor(sorted(self.label_head_indices), dtype=torch.long),
                 persistent=False,
             )
         else:
@@ -280,8 +279,8 @@ class Seq2SeqSexpParser(nn.Module):
             self.full_id_for_head_idx = []
             self.head_idx_for_full_id = {}
             self.head_vocab_size = int(len(self.tokenizer))
-            self.reduce_head_indices = set()
-            structural_full_ids = sorted(self.reduce_token_ids | {self.open_token_id, self.close_token_id})
+            self.label_head_indices = set()
+            structural_full_ids = sorted(self.label_id_set | {self.open_token_id, self.close_token_id})
             self.register_buffer(
                 "_structural_full_ids_buf",
                 torch.tensor(structural_full_ids, dtype=torch.long),
@@ -320,7 +319,7 @@ class Seq2SeqSexpParser(nn.Module):
             base.lm_head = new
         else:
             raise RuntimeError(
-                f"Don't know how to replace lm_head on {type(base).__name__}; expected "
+                f"Don't know how to replace lm_head on {type(base).__name__}, expected "
                 f"`lm_head` as Linear or `lm_head.out_proj` as Linear."
             )
         logger.info(f"Replaced lm_head with fresh Linear(hidden={hidden}, head_vocab_size={self.head_vocab_size}).")
@@ -340,7 +339,7 @@ class Seq2SeqSexpParser(nn.Module):
         Only called under `use_copy=True` (the small action head makes the
         full embedding redundant on the output side). See
         `Seq2SeqSRParser._carve_new_token_embeddings` for the full rationale.
-        Gradient flows only to `new_token_embeddings`; the frozen base
+        Gradient flows only to `new_token_embeddings`. The frozen base
         weight's `.grad` stays None."""
         n_old = int(self._original_vocab_size)
         embed = self._underlying_model().get_input_embeddings()
@@ -368,7 +367,7 @@ class Seq2SeqSexpParser(nn.Module):
                 patched += 1
         logger.info(
             f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
-            f"(base {n_total}x{full_weight.shape[1]} frozen); patched {patched} embedding lookup(s)."
+            f"(base {n_total}x{full_weight.shape[1]} frozen). Patched {patched} embedding lookup(s)."
         )
 
     @property
@@ -436,7 +435,7 @@ class Seq2SeqSexpParser(nn.Module):
             )
             structural_buf = self._structural_token_ids_buf
         else:
-            # Identity mapping: labels are already full-vocab ids; only -100
+            # Identity mapping: labels are already full-vocab ids, only -100
             # is special (the structural buffer is in full-vocab ids).
             scored_labels_flat = labels_flat
             structural_buf = self._structural_full_ids_buf
@@ -504,7 +503,7 @@ class Seq2SeqSexpParser(nn.Module):
 
     def encode_target(self, tree: RstTree) -> tuple[list[int], list[int]] | None:
         """Build `(labels, decoder_input_ids)` by walking the tree's sexp
-        serialization. Both streams are length-aligned; `decoder_input_ids`
+        serialization. Both streams are length-aligned. `decoder_input_ids`
         is the shift-right of the substituted "seen" stream.
 
         - `<sexp_open>` / `<sexp_close>` and relation labels are predicted
@@ -517,8 +516,8 @@ class Seq2SeqSexpParser(nn.Module):
           seen alike carry the actual source subword id.
         - EOS terminates both streams.
         """
-        if not self.action_token_ids:
-            raise RuntimeError("encode_target called before action vocab was installed; set cfg.relation_types first.")
+        if not self.label_token_ids:
+            raise RuntimeError("encode_target called before action vocab was installed. Set cfg.relation_types first.")
         _text, edu_subwords = self._edu_subword_ids(tree)
 
         # The target references source subwords from the FULL (untruncated) doc
@@ -550,9 +549,9 @@ class Seq2SeqSexpParser(nn.Module):
 
         def emit_label(nuc: str, rel: str):
             token = Reduce(nuc=nuc, rel=rel).to_token()
-            if token not in self.action_token_ids:
-                raise ValueError(f"encode_target: label token {token!r} missing from vocab; check cfg.relation_types.")
-            tid = self.action_token_ids[token]
+            if token not in self.label_token_ids:
+                raise ValueError(f"encode_target: label token {token!r} missing from vocab. Check cfg.relation_types.")
+            tid = self.label_token_ids[token]
             label_ids.append(tid)
             seen_ids.append(tid)
 
@@ -654,7 +653,7 @@ class Seq2SeqSexpParser(nn.Module):
             open_id=self.open_token_id,
             close_id=self.close_token_id,
             eos_id=int(self.tokenizer.eos_token_id),
-            label_ids=frozenset(int(x) for x in self.reduce_token_ids),
+            label_ids=frozenset(int(x) for x in self.label_id_set),
             copy_id=self.copy_token_id if self.config.use_copy else None,
             source_ids=tuple(source_ids) if not self.config.use_copy else (),
             min_edu_length=int(self.config.min_edu_length),
@@ -662,12 +661,12 @@ class Seq2SeqSexpParser(nn.Module):
             tokenizer_special_ids=self._tokenizer_special_ids(),
         )
 
-    def _full_ids_to_head_mask(self, state: SexpDecodingState, head_V: int) -> torch.Tensor:
+    def _mask_logits_for_state(self, state: SexpDecodingState, head_V: int) -> torch.Tensor:
         """Boolean mask over the scoring vocab of legal actions at this state.
 
         `use_copy=True`: scoring vocab is the small action head, so map legal
             full-vocab ids through `head_idx_for_full_id`.
-        `use_copy=False`: scoring vocab IS the full tokenizer vocab; legal
+        `use_copy=False`: scoring vocab IS the full tokenizer vocab, legal
             ids are used directly as positions in the mask. When the state
             says content is wildcarded, admit any non-structural id.
         """
@@ -762,7 +761,7 @@ class Seq2SeqSexpParser(nn.Module):
 
                 V = int(logits.size(-1))
                 if self.config.use_validity_constraints:
-                    mask = self._full_ids_to_head_mask(state, V).to(device)
+                    mask = self._mask_logits_for_state(state, V).to(device)
                     masked = torch.where(mask, logits, torch.full_like(logits, float("-inf")))
                 else:
                     masked = logits
@@ -805,7 +804,7 @@ class Seq2SeqSexpParser(nn.Module):
             source_ids,
             self,
         )
-        tree = self._tree_from_action_sequence(action_seq, source_ids)
+        tree = self._tree_from_emitted(action_seq, source_ids)
         if getattr(tree, "_from_sexp_failed", False):
             edu_ranges = []
         tree._pred_edu_source_ranges = edu_ranges  # type: ignore[attr-defined]
@@ -876,7 +875,7 @@ class Seq2SeqSexpParser(nn.Module):
                 for j in range(K):
                     if done[j]:
                         continue
-                    mask = self._full_ids_to_head_mask(states[j], head_V).to(device)
+                    mask = self._mask_logits_for_state(states[j], head_V).to(device)
                     masked[j] = torch.where(mask, logits[j], torch.full_like(logits[j], float("-inf")))
                 log_probs = F.log_softmax(masked.float(), dim=-1)
                 cum = beam_scores.unsqueeze(1) + log_probs
@@ -889,14 +888,14 @@ class Seq2SeqSexpParser(nn.Module):
                 action_of_new = (top_idx % head_V).tolist()
 
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
-                # Skip _reorder_pkv when no rearrangement is needed: step 0
+                # Skip reorder_past_key_values when no rearrangement is needed: step 0
                 # produces K identical rows from one starting beam (all
                 # parents are 0), and identity permutations are no-ops.
                 is_step0_uniform = step == 0 and all(p == 0 for p in parent_of_new)
                 is_identity = parent_of_new == list(range(K))
                 needs_reorder = past_key_values is not None and not (is_step0_uniform or is_identity)
                 if needs_reorder:
-                    past_key_values = _reorder_pkv(past_key_values, parent_tensor, self._underlying_model())
+                    past_key_values = reorder_past_key_values(past_key_values, parent_tensor, self._underlying_model())
                 decoder_input_ids = decoder_input_ids[parent_tensor]
 
                 new_states = [states[p] for p in parent_of_new]
@@ -971,7 +970,7 @@ class Seq2SeqSexpParser(nn.Module):
                 f"max_output_length={self.config.max_output_length}."
             )
         edu_ranges = _edu_ranges_from_actions(best["action_seq"], source_ids, self)
-        tree = self._tree_from_action_sequence(best["action_seq"], source_ids)
+        tree = self._tree_from_emitted(best["action_seq"], source_ids)
         if getattr(tree, "_from_sexp_failed", False):
             edu_ranges = []
         tree._pred_edu_source_ranges = edu_ranges  # type: ignore[attr-defined]
@@ -1076,7 +1075,7 @@ class Seq2SeqSexpParser(nn.Module):
                             if 0 <= int(fid) < V:
                                 mask[int(fid)] = False
                     else:
-                        mask = self._full_ids_to_head_mask(state, V).to(logits.device)
+                        mask = self._mask_logits_for_state(state, V).to(logits.device)
                         if isinstance(narrowed, frozenset):
                             # Multi-element narrowing (e.g. label slot). Intersect.
                             keep = torch.zeros_like(mask)
@@ -1121,7 +1120,7 @@ class Seq2SeqSexpParser(nn.Module):
                 f"{self.config.max_output_length} without EOS."
             )
         edu_ranges = _edu_ranges_from_actions(action_seq, source_ids, self)
-        tree_out = self._tree_from_action_sequence(action_seq, source_ids)
+        tree_out = self._tree_from_emitted(action_seq, source_ids)
         if getattr(tree_out, "_from_sexp_failed", False):
             edu_ranges = []
         tree_out._pred_edu_source_ranges = edu_ranges  # type: ignore[attr-defined]
@@ -1142,7 +1141,7 @@ class Seq2SeqSexpParser(nn.Module):
     # Tree reconstruction
     # -----------------------------------------------------------------
 
-    def _tree_from_action_sequence(self, action_ids: list[int], source_ids: list[int]) -> RstTree:
+    def _tree_from_emitted(self, action_ids: list[int], source_ids: list[int]) -> RstTree:
         """Turn the emitted action sequence into an `RstTree` by building a
         sexp string and running it through `RstTree.from_sexp`. Falls back
         to an empty tree on any parse failure. Empty-tree fallbacks carry
@@ -1158,7 +1157,7 @@ class Seq2SeqSexpParser(nn.Module):
                 relation_types=self.config.relation_types,
             )
         except (ValueError, IndexError) as e:
-            warn(f"Malformed decoder sexp output ({e!r}); falling back to single-EDU tree.")
+            warn(f"Malformed decoder sexp output ({e!r}). Falling back to single-EDU tree.")
             full_text = " ".join(edu_texts) if edu_texts else ""
             tree = _empty_tree(self.config.relation_types, text=full_text)
             tree._from_sexp_failed = True  # type: ignore[attr-defined]
@@ -1205,7 +1204,7 @@ class Seq2SeqSexpParser(nn.Module):
                 if kind_stack and kind_stack[-1] == "leaf":
                     # Emit the placeholder for this leaf, drop the open we
                     # previously appended for it.
-                    # The open is the most recent "(" in pieces; remove it
+                    # The open is the most recent "(" in pieces, remove it
                     # and replace with `<edu>`.
                     # Search back for last "(":
                     for k in range(len(pieces) - 1, -1, -1):
@@ -1213,14 +1212,14 @@ class Seq2SeqSexpParser(nn.Module):
                             pieces[k] = "<edu>"
                             break
                     flush_leaf()
-                    # The interior open is collapsed; no matching close needed.
+                    # The interior open is collapsed, no matching close needed.
                 else:
                     pieces.append(")")
                 if kind_stack:
                     kind_stack.pop()
                 depth = max(0, depth - 1)
                 leaf_open = bool(kind_stack) and kind_stack[-1] == "leaf"
-            elif tok in self.reduce_token_ids:
+            elif tok in self.label_id_set:
                 token_str = self.tokenizer.convert_ids_to_tokens(tok)
                 label = _reduce_token_to_label(token_str)
                 pieces.append(label)
@@ -1262,7 +1261,7 @@ class Seq2SeqSexpParser(nn.Module):
             kind_stack.pop()
 
         if not edu_texts:
-            # No leaves were emitted; produce a degenerate single-EDU sexp.
+            # No leaves were emitted, produce a degenerate single-EDU sexp.
             edu_texts = [""]
             return "<edu>", edu_texts
         return " ".join(pieces), edu_texts
@@ -1331,45 +1330,3 @@ def _empty_tree(relation_types, text: str = "") -> RstTree:
 
     edu_nodes = [RstNode("1", "terminal", text or "")]
     return RstTree(edu_nodes, [], relation_types=relation_types)
-
-
-def _reorder_pkv(past_key_values, beam_idx: torch.Tensor, underlying_model):
-    """Reorder a HF past_key_values cache along the beam dimension. Handles
-    three layouts:
-      1. Underlying model exposes `_reorder_cache(pkv, beam_idx)` (T5/T5Gemma2
-         and most HF seq2seq models).
-      2. `past_key_values` is a `DynamicCache`-like object with its own
-         `reorder_cache` method (newer transformers).
-      3. Tuple-of-tuple of Tensors (older HF), possibly with `None` entries
-         for unfilled cross-attention slots.
-    """
-    # Path 1: canonical HF helper on the base model. T5Gemma 2's inherited
-    # `_reorder_cache` assumes the legacy tuple-of-tuple layout. Newer HF
-    # versions may hand us a DynamicCache instead, which makes that call
-    # blow up. Catch and fall through to the next path on type/attribute
-    # mismatches.
-    reorder = getattr(underlying_model, "_reorder_cache", None)
-    if callable(reorder):
-        try:
-            result = reorder(past_key_values, beam_idx)
-            # Modern HF cache classes mutate in place and return None.
-            # Blindly returning None drops the cache on the next step.
-            return result if result is not None else past_key_values
-        except (TypeError, AttributeError) as e:
-            import warnings
-
-            warnings.warn(
-                f"{type(underlying_model).__name__}._reorder_cache failed on "
-                f"{type(past_key_values).__name__} ({type(e).__name__}: {e}); "
-                "falling back to object/tuple cache reordering.",
-                stacklevel=2,
-            )
-    # Path 2: DynamicCache or similar object-style cache.
-    if hasattr(past_key_values, "reorder_cache"):
-        result = past_key_values.reorder_cache(beam_idx)
-        return result if result is not None else past_key_values
-    # Path 3: manual tuple walk, handles Nones gracefully.
-    return tuple(
-        tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
-        for layer in past_key_values
-    )

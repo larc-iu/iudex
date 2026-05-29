@@ -1,5 +1,5 @@
-"""Fix 4 regression: when `_tree_from_emitted` / `_tree_from_action_sequence`
-falls back to `_empty_tree` (because `RstTree.from_sexp` raised), the
+"""Fix 4 regression: when `_tree_from_emitted` falls back to `_empty_tree`
+(because `RstTree.from_sexp` raised), the
 predict path must null out `_pred_edu_source_ranges` so downstream
 gold-EDU eval doesn't see action-derived ranges that disagree with the
 single-EDU fallback (which would silently filter the doc out of the
@@ -58,7 +58,7 @@ def test_seq2seq_sexp_fallback_attaches_marker():
 
     from iudex.rst.parsers.seq2seq_sexp.modeling_seq2seq_sexp import Seq2SeqSexpParser
 
-    src_make = inspect.getsource(Seq2SeqSexpParser._tree_from_action_sequence)
+    src_make = inspect.getsource(Seq2SeqSexpParser._tree_from_emitted)
     assert "_from_sexp_failed = True" in src_make
     for name in ("_predict_one_greedy", "_predict_one_beam", "_predict_one_gold_edu"):
         src = inspect.getsource(getattr(Seq2SeqSexpParser, name))
