@@ -123,6 +123,24 @@ def _resolve_run_id(checkpoint_dir: str, partial: str) -> str:
     return matches[0]
 
 
+def _read_parser_kind(run_dir: str) -> str | None:
+    """Parser kind stamped into a JSON sidecar at train time (`save_checkpoint`
+    forwards `parser_kind` into `best_model.json` / `last.json`). Preferred over
+    `_infer_parser_kind`, whose config field-set heuristic is ambiguous for the
+    generative-parser cluster. Returns None for older runs that predate the
+    stamp, so callers fall back to inference."""
+    for sidecar in ("best_model.json", "last.json"):
+        path = os.path.join(run_dir, sidecar)
+        try:
+            with open(path, encoding="utf-8") as f:
+                kind = json.load(f).get("parser_kind")
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(kind, str) and kind:
+            return kind
+    return None
+
+
 def _read_best_meta(run_dir: str) -> tuple[str, str]:
     """(best_val_str, step_str) from `best_model.json`. ("-", "-") if absent
     or unreadable. "(no best)" if no `best_model.pt` exists at all."""
@@ -193,7 +211,7 @@ def list_runs(checkpoint_dir: str) -> None:
                 cfg = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-        kind = _infer_parser_kind(cfg, parsers)
+        kind = _read_parser_kind(run_dir) or _infer_parser_kind(cfg, parsers)
         run_name = cfg.get("run_name") or "-"
         model_name = cfg.get("model_name", "?")
         train_dir = cfg.get("train_dir") or "?"
@@ -234,7 +252,7 @@ def show_run(checkpoint_dir: str, partial: str) -> None:
     with open(os.path.join(run_dir, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
 
-    kind = _infer_parser_kind(cfg, parsers)
+    kind = _read_parser_kind(run_dir) or _infer_parser_kind(cfg, parsers)
     best_val_str, step_str = _read_best_meta(run_dir)
     size = _format_size(_dir_size(run_dir))
     modified = datetime.fromtimestamp(_latest_mtime(run_dir)).strftime("%Y-%m-%d %H:%M")
@@ -393,7 +411,7 @@ def _summarize_run(checkpoint_dir: str, run_id: str, parsers: dict) -> str:
             cfg = json.load(f)
     except (OSError, json.JSONDecodeError):
         cfg = {}
-    kind = _infer_parser_kind(cfg, parsers)
+    kind = _read_parser_kind(run_dir) or _infer_parser_kind(cfg, parsers)
     run_name = cfg.get("run_name") or "-"
     best_val_str, _ = _read_best_meta(run_dir)
     size = _format_size(_dir_size(run_dir))

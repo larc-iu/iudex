@@ -1,4 +1,2 @@
 from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
 from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import Seq2SeqSRParser
-
-__all__ = ["Seq2SeqSRConfig", "Seq2SeqSRParser"]

@@ -30,6 +30,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.parsers.common.seqgen import (
+    ShiftReduceDecodeState,
     align_edus_to_tokens,
     reorder_past_key_values,
 )
@@ -54,6 +55,8 @@ class DecoderOnlySRParser(nn.Module):
     def __init__(self, config: DecoderOnlySRConfig, *, compile_encoder: bool = False):
         super().__init__()
         self.config = config
+        # compile_encoder is accepted for parser-CLI uniformity but has no
+        # effect here. The HF causal LM has its own compilation story.
         del compile_encoder
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
@@ -313,7 +316,13 @@ class DecoderOnlySRParser(nn.Module):
         )
 
     @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
     def segmenter(self):
+        # Truthy → predict_cli._require_segmenter accepts text input. This
+        # parser always segments via the model's own output.
         return self
 
     # -----------------------------------------------------------------
@@ -571,7 +580,7 @@ class DecoderOnlySRParser(nn.Module):
     @torch.no_grad()
     def _predict_one_greedy(self, text: str) -> RstTree:
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
         eos_id = int(self.tokenizer.eos_token_id)
         min_edu_len = max(1, int(self.config.min_edu_length))
 
@@ -579,7 +588,6 @@ class DecoderOnlySRParser(nn.Module):
         if not source_ids:
             return _empty_tree(self.config.relation_types)
         prefix_ids = self._build_prefix_ids(source_ids)
-        source_len = len(source_ids)
 
         with self._inference_mode():
             input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
@@ -593,13 +601,8 @@ class DecoderOnlySRParser(nn.Module):
             past_key_values = out.past_key_values
             logits = out.logits[0, -1, :]
 
-            cursor = 0
-            stack = 0
-            edu_length = 0
-            edu_start = 0
+            st = ShiftReduceDecodeState(source_len=len(source_ids), min_edu_length=min_edu_len)
             action_seq: list[int] = []
-            pred_edu_ranges: list[tuple[int, int]] = []
-            done = False
             hit_max_len = False
 
             # The total number of model steps is bounded by the action stream
@@ -608,15 +611,13 @@ class DecoderOnlySRParser(nn.Module):
             for step in range(self.config.max_output_length):
                 if self.config.use_validity_constraints:
                     masked = torch.full_like(logits, float("-inf"))
-                    at_end = cursor >= source_len
-                    if not at_end:
+                    if st.copy_ok:
                         masked[self.copy_head_idx] = logits[self.copy_head_idx]
-                    shift_ok = edu_length >= min_edu_len or (at_end and edu_length >= 1)
-                    if shift_ok:
+                    if st.shift_ok:
                         masked[self.shift_head_idx] = logits[self.shift_head_idx]
-                    if stack >= 2:
+                    if st.reduce_ok:
                         masked[self._reduce_head_ids_buf] = logits[self._reduce_head_ids_buf]
-                    if at_end and stack == 1 and edu_length == 0:
+                    if st.eos_ok:
                         masked[self.eos_head_idx] = logits[self.eos_head_idx]
                     step_logits = masked
                 else:
@@ -627,26 +628,20 @@ class DecoderOnlySRParser(nn.Module):
                 action_seq.append(full_id)
 
                 if full_id == eos_id:
-                    done = True
+                    st.step_eos()
                     break
                 if full_id == self.copy_token_id:
-                    if cursor >= source_len:
-                        done = True
+                    if not st.step_copy():
                         break
-                    next_input = source_ids[cursor]
-                    cursor += 1
-                    edu_length += 1
+                    next_input = source_ids[st.cursor - 1]
                 elif full_id == self.shift_token_id:
-                    stack += 1
-                    pred_edu_ranges.append((edu_start, cursor))
-                    edu_start = cursor
-                    edu_length = 0
+                    st.step_shift()
                     next_input = full_id
                 elif full_id in self.reduce_token_ids:
-                    stack -= 1
+                    st.step_reduce()
                     next_input = full_id
                 else:
-                    done = True
+                    st.done = True
                     break
 
                 step_input = torch.tensor([[next_input]], dtype=torch.long, device=device)
@@ -659,7 +654,7 @@ class DecoderOnlySRParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[0, -1, :]
             else:
-                hit_max_len = not done
+                hit_max_len = not st.done
 
         if hit_max_len:
             warn(
@@ -667,10 +662,10 @@ class DecoderOnlySRParser(nn.Module):
                 f"max_output_length={self.config.max_output_length} without EOS. "
                 f"Tree closed by best-effort repair."
             )
-        if cursor > edu_start:
-            pred_edu_ranges.append((edu_start, cursor))
+        if st.cursor > st.edu_start:
+            st.pred_edu_ranges.append((st.edu_start, st.cursor))
         tree = self._tree_from_action_sequence(action_seq, source_ids)
-        tree._pred_edu_source_ranges = pred_edu_ranges  # type: ignore[attr-defined]
+        tree._pred_edu_source_ranges = st.pred_edu_ranges  # type: ignore[attr-defined]
         tree._source_ids = source_ids  # type: ignore[attr-defined]
         return tree
 
@@ -683,7 +678,7 @@ class DecoderOnlySRParser(nn.Module):
         Reorders the KV cache through `reorder_past_key_values` when beams
         switch parents."""
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
         K = int(num_beams)
         eos_id = int(self.tokenizer.eos_token_id)
         head_V = self.head_vocab_size
@@ -693,7 +688,6 @@ class DecoderOnlySRParser(nn.Module):
         if not source_ids:
             return _empty_tree(self.config.relation_types)
         prefix_ids = self._build_prefix_ids(source_ids)
-        source_len = len(source_ids)
 
         with self._inference_mode():
             prefix_t = torch.tensor([prefix_ids], dtype=torch.long, device=device).expand(K, -1).contiguous()
@@ -707,35 +701,30 @@ class DecoderOnlySRParser(nn.Module):
             past_key_values = out.past_key_values
             logits = out.logits[:, -1, :]  # [K, head_V]
 
-            cursors = [0] * K
-            stacks = [0] * K
-            edu_lengths = [0] * K
-            done = [False] * K
+            # Per-beam state. One ShiftReduceDecodeState per beam, cloned from
+            # the chosen parent before each beam's transition is applied.
+            states = [ShiftReduceDecodeState(source_len=len(source_ids), min_edu_length=min_edu_len) for _ in range(K)]
             action_seqs: list[list[int]] = [[] for _ in range(K)]
-            pred_edu_ranges: list[list[tuple[int, int]]] = [[] for _ in range(K)]
-            edu_starts = [0] * K
             finished_beams: list[dict] = []
 
             beam_scores = torch.full((K,), float("-inf"), device=device)
             beam_scores[0] = 0.0
 
             for step in range(self.config.max_output_length):
-                if all(done):
+                if all(st.done for st in states):
                     break
 
                 masked = torch.full_like(logits, float("-inf"))
-                for j in range(K):
-                    if done[j]:
+                for j, st in enumerate(states):
+                    if st.done:
                         continue
-                    at_end = cursors[j] >= source_len
-                    if not at_end:
+                    if st.copy_ok:
                         masked[j, self.copy_head_idx] = logits[j, self.copy_head_idx]
-                    shift_ok = edu_lengths[j] >= min_edu_len or (at_end and edu_lengths[j] >= 1)
-                    if shift_ok:
+                    if st.shift_ok:
                         masked[j, self.shift_head_idx] = logits[j, self.shift_head_idx]
-                    if stacks[j] >= 2:
+                    if st.reduce_ok:
                         masked[j, self._reduce_head_ids_buf] = logits[j, self._reduce_head_ids_buf]
-                    if at_end and stacks[j] == 1 and edu_lengths[j] == 0:
+                    if st.eos_ok:
                         masked[j, self.eos_head_idx] = logits[j, self.eos_head_idx]
                 log_probs = F.log_softmax(masked.float(), dim=-1)
                 cum = beam_scores.unsqueeze(1) + log_probs
@@ -743,6 +732,9 @@ class DecoderOnlySRParser(nn.Module):
                 # rows. topk ranks NaN above any finite negative, so without this
                 # the dead beam's children would crowd out live beams.
                 cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
+                # `cum` is [K, head_V]; flattening to [K*head_V] and decoding the
+                # flat index splits it back into (parent_beam, action) via
+                # flat = parent_beam * head_V + action.
                 top_scores, top_idx = cum.view(-1).topk(K)
                 parent_of_new = (top_idx // head_V).tolist()
                 action_of_new = (top_idx % head_V).tolist()
@@ -759,66 +751,56 @@ class DecoderOnlySRParser(nn.Module):
                 if needs_reorder:
                     past_key_values = reorder_past_key_values(past_key_values, parent_tensor, self._underlying_model())
 
-                new_cursors = [cursors[p] for p in parent_of_new]
-                new_stacks = [stacks[p] for p in parent_of_new]
-                new_edu_lengths = [edu_lengths[p] for p in parent_of_new]
-                new_done = [done[p] for p in parent_of_new]
+                # Carry per-beam state from parents. Each child gets its OWN
+                # cloned state so sibling beams expanded from the same parent
+                # don't share (and mutate) one object.
+                new_states = [states[p].clone() for p in parent_of_new]
                 new_action_seqs = [list(action_seqs[p]) for p in parent_of_new]
-                new_pred_edu_ranges = [list(pred_edu_ranges[p]) for p in parent_of_new]
-                new_edu_starts = [edu_starts[p] for p in parent_of_new]
 
                 pad_id = int(self.tokenizer.pad_token_id)
                 next_inputs = [pad_id] * K
                 for j in range(K):
-                    if new_done[j]:
+                    st = new_states[j]
+                    if st.done:
                         continue
                     head_idx = action_of_new[j]
                     full_id = self.full_id_for_head_idx[head_idx]
                     new_action_seqs[j].append(full_id)
                     if full_id == eos_id:
-                        new_done[j] = True
+                        st.step_eos()
                     elif full_id == self.copy_token_id:
-                        if new_cursors[j] < source_len:
-                            next_inputs[j] = source_ids[new_cursors[j]]
-                            new_cursors[j] += 1
-                            new_edu_lengths[j] += 1
-                        else:
-                            new_done[j] = True
+                        if st.step_copy():
+                            next_inputs[j] = source_ids[st.cursor - 1]
+                        # else st.done already set; next_inputs stays pad
                     elif full_id == self.shift_token_id:
-                        new_stacks[j] += 1
-                        new_edu_lengths[j] = 0
-                        new_pred_edu_ranges[j].append((new_edu_starts[j], new_cursors[j]))
-                        new_edu_starts[j] = new_cursors[j]
+                        st.step_shift()
                         next_inputs[j] = full_id
                     elif full_id in self.reduce_token_ids:
-                        new_stacks[j] -= 1
+                        st.step_reduce()
                         next_inputs[j] = full_id
                     else:
-                        new_done[j] = True
+                        st.done = True
 
-                cursors, stacks, edu_lengths = new_cursors, new_stacks, new_edu_lengths
-                done = new_done
+                states = new_states
                 action_seqs = new_action_seqs
-                pred_edu_ranges = new_pred_edu_ranges
-                edu_starts = new_edu_starts
                 beam_scores = top_scores
 
-                for j in range(K):
-                    if done[j] and torch.isfinite(beam_scores[j]):
+                for j, st in enumerate(states):
+                    if st.done and torch.isfinite(beam_scores[j]):
                         finished_beams.append(
                             {
                                 "action_seq": list(action_seqs[j]),
-                                "pred_edu_ranges": list(pred_edu_ranges[j]),
+                                "pred_edu_ranges": list(st.pred_edu_ranges),
                                 "score": float(beam_scores[j].item()),
                                 "length": len(action_seqs[j]),
-                                "cursor": cursors[j],
-                                "edu_start": edu_starts[j],
+                                "cursor": st.cursor,
+                                "edu_start": st.edu_start,
                                 "finished": True,
                             }
                         )
                         beam_scores[j] = float("-inf")
 
-                if all(done):
+                if all(st.done for st in states):
                     break
 
                 step_input = torch.tensor(next_inputs, dtype=torch.long, device=device).unsqueeze(1)
@@ -832,11 +814,11 @@ class DecoderOnlySRParser(nn.Module):
                 logits = out.logits[:, -1, :]
 
         candidates: list[dict] = list(finished_beams)
-        for j in range(K):
-            if not done[j] and torch.isfinite(beam_scores[j]):
-                ranges = list(pred_edu_ranges[j])
-                if cursors[j] > edu_starts[j]:
-                    ranges.append((edu_starts[j], cursors[j]))
+        for j, st in enumerate(states):
+            if not st.done and torch.isfinite(beam_scores[j]):
+                ranges = list(st.pred_edu_ranges)
+                if st.cursor > st.edu_start:
+                    ranges.append((st.edu_start, st.cursor))
                 candidates.append(
                     {
                         "action_seq": list(action_seqs[j]),
@@ -877,7 +859,7 @@ class DecoderOnlySRParser(nn.Module):
     @torch.no_grad()
     def _predict_one_gold_edu(self, tree: RstTree) -> RstTree:
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
         eos_id = int(self.tokenizer.eos_token_id)
 
         text = _reconstruct_text(tree)
@@ -910,14 +892,15 @@ class DecoderOnlySRParser(nn.Module):
             past_key_values = out.past_key_values
             logits = out.logits[0, -1, :]
 
-            cursor = 0
-            stack = 0
+            min_edu_len = max(1, int(self.config.min_edu_length))
+            # Gold-EDU decode forces the COPY/SHIFT positions, so the mask is
+            # driven by `edu_idx` over the gold boundaries rather than the
+            # state's validity predicates. The state still tracks cursor/stack/
+            # EDU ranges and runs the shared transitions. `st.edu_length` is the
+            # copies-since-last-shift buffer.
+            st = ShiftReduceDecodeState(source_len=source_len, min_edu_length=min_edu_len)
             edu_idx = 0
-            in_edu_buffer = 0
             action_seq: list[int] = []
-            pred_edu_ranges: list[tuple[int, int]] = []
-            edu_start = 0
-            done = False
             hit_max_len = False
 
             for step in range(self.config.max_output_length):
@@ -925,17 +908,17 @@ class DecoderOnlySRParser(nn.Module):
                 more_edus = edu_idx < n_edus
                 current_end = edu_ends[edu_idx] if more_edus else source_len
 
-                if more_edus and cursor < current_end:
+                if more_edus and st.cursor < current_end:
                     masked[self.copy_head_idx] = logits[self.copy_head_idx]
-                elif more_edus and cursor == current_end and in_edu_buffer > 0:
+                elif more_edus and st.cursor == current_end and st.edu_length > 0:
                     masked[self.shift_head_idx] = logits[self.shift_head_idx]
                 else:
-                    if stack >= 2:
+                    if st.stack_size >= 2:
                         masked[self._reduce_head_ids_buf] = logits[self._reduce_head_ids_buf]
                     if more_edus:
                         masked[self.copy_head_idx] = logits[self.copy_head_idx]
                     else:
-                        if stack == 1:
+                        if st.stack_size == 1:
                             masked[self.eos_head_idx] = logits[self.eos_head_idx]
 
                 head_idx = int(masked.argmax(-1).item())
@@ -943,28 +926,21 @@ class DecoderOnlySRParser(nn.Module):
                 action_seq.append(full_id)
 
                 if full_id == eos_id:
-                    done = True
+                    st.step_eos()
                     break
                 if full_id == self.copy_token_id:
-                    if cursor < source_len:
-                        next_input = source_ids[cursor]
-                        cursor += 1
-                        in_edu_buffer += 1
-                    else:
-                        done = True
+                    if not st.step_copy():
                         break
+                    next_input = source_ids[st.cursor - 1]
                 elif full_id == self.shift_token_id:
-                    stack += 1
-                    pred_edu_ranges.append((edu_start, cursor))
-                    edu_start = cursor
-                    in_edu_buffer = 0
+                    st.step_shift()
                     edu_idx += 1
                     next_input = full_id
                 elif full_id in self.reduce_token_ids:
-                    stack -= 1
+                    st.step_reduce()
                     next_input = full_id
                 else:
-                    done = True
+                    st.done = True
                     break
 
                 step_input = torch.tensor([[next_input]], dtype=torch.long, device=device)
@@ -977,7 +953,7 @@ class DecoderOnlySRParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[0, -1, :]
             else:
-                hit_max_len = not done
+                hit_max_len = not st.done
 
         if hit_max_len:
             warn(
@@ -985,10 +961,10 @@ class DecoderOnlySRParser(nn.Module):
                 f"max_output_length={self.config.max_output_length} without EOS. "
                 f"Tree closed by best-effort repair."
             )
-        if cursor > edu_start:
-            pred_edu_ranges.append((edu_start, cursor))
+        if st.cursor > st.edu_start:
+            st.pred_edu_ranges.append((st.edu_start, st.cursor))
         tree_out = self._tree_from_action_sequence(action_seq, source_ids)
-        tree_out._pred_edu_source_ranges = pred_edu_ranges  # type: ignore[attr-defined]
+        tree_out._pred_edu_source_ranges = st.pred_edu_ranges  # type: ignore[attr-defined]
         tree_out._source_ids = source_ids  # type: ignore[attr-defined]
         return tree_out
 

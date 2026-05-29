@@ -68,11 +68,13 @@ class Seq2SeqSexpParser(nn.Module):
     def __init__(self, config: Seq2SeqSexpConfig, *, compile_encoder: bool = False):
         super().__init__()
         self.config = config
+        # compile_encoder is accepted for parser-CLI uniformity but has no
+        # effect here. The HF seq2seq model has its own compilation story.
         del compile_encoder
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        torch_dtype = torch.bfloat16 if config.amp else torch.float32
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, torch_dtype=torch_dtype)
+        model_dtype = torch.bfloat16 if config.amp else torch.float32
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, dtype=model_dtype)
 
         self.label_token_ids: dict[str, int] = {}
         self.label_id_set: set[int] = set()
@@ -201,7 +203,7 @@ class Seq2SeqSexpParser(nn.Module):
                 return int(tok)
         prepare = getattr(self.model, "prepare_decoder_input_ids_from_labels", None)
         if prepare is not None:
-            stub = torch.zeros((1, 1), dtype=torch.long, device=next(self.model.parameters()).device)
+            stub = torch.zeros((1, 1), dtype=torch.long, device=self.device)
             shifted = prepare(labels=stub) if "labels" in prepare.__code__.co_varnames else prepare(stub)
             return int(shifted[0, 0].item())
         for src in (
@@ -369,6 +371,10 @@ class Seq2SeqSexpParser(nn.Module):
             f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
             f"(base {n_total}x{full_weight.shape[1]} frozen). Patched {patched} embedding lookup(s)."
         )
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     @property
     def segmenter(self):
@@ -715,7 +721,7 @@ class Seq2SeqSexpParser(nn.Module):
     @torch.no_grad()
     def _predict_one_greedy(self, text: str) -> RstTree:
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
 
         enc = self.tokenizer(
             text,
@@ -814,7 +820,7 @@ class Seq2SeqSexpParser(nn.Module):
     @torch.no_grad()
     def _predict_one_beam(self, text: str, num_beams: int) -> RstTree:
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
         K = int(num_beams)
         # In use_copy=False mode the scoring vocab IS the model's full output
         # vocab (the pretrained lm_head). In use_copy=True it's the small
@@ -883,6 +889,8 @@ class Seq2SeqSexpParser(nn.Module):
                 # rows. topk ranks NaN above any finite negative, so without this
                 # the dead beam's children would crowd out live beams.
                 cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
+                # cum is [K, head_V]; the flat top-k index decomposes back to
+                # (parent_beam, action) via integer-div / mod by head_V.
                 top_scores, top_idx = cum.view(-1).topk(K)
                 parent_of_new = (top_idx // head_V).tolist()
                 action_of_new = (top_idx % head_V).tolist()
@@ -1004,7 +1012,7 @@ class Seq2SeqSexpParser(nn.Module):
         come from the model. Segmentation is gold by construction.
         """
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
         text = _reconstruct_text(tree)
         gold_ranges = _gold_edu_source_ranges(self.tokenizer, tree)
 

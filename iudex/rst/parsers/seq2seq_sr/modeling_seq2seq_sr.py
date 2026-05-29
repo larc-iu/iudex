@@ -29,7 +29,11 @@ from iudex.rst.data.tree import (
     ShiftReduceAction,
     strings_to_actions,
 )
-from iudex.rst.parsers.common.seqgen import align_edus_to_tokens, reorder_past_key_values
+from iudex.rst.parsers.common.seqgen import (
+    ShiftReduceDecodeState,
+    align_edus_to_tokens,
+    reorder_past_key_values,
+)
 from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
 
 logger = logging.getLogger(__name__)
@@ -54,8 +58,8 @@ class Seq2SeqSRParser(nn.Module):
         # in iudex.rst.HASH_EXCLUDE, so flipping it keeps the same run hash. A
         # bf16 checkpoint resuming into an fp32 model (or vice versa) under an
         # existing run dir is unsupported. Start a fresh run dir if you change amp.
-        torch_dtype = torch.bfloat16 if config.amp else torch.float32
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, torch_dtype=torch_dtype)
+        model_dtype = torch.bfloat16 if config.amp else torch.float32
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, dtype=model_dtype)
 
         # Built only after relation inference. Predict-time loads from a
         # checkpoint that has cfg.relation_types populated, so the action
@@ -177,7 +181,7 @@ class Seq2SeqSRParser(nn.Module):
                 return int(tok)
         prepare = getattr(self.model, "prepare_decoder_input_ids_from_labels", None)
         if prepare is not None:
-            stub = torch.zeros((1, 1), dtype=torch.long, device=next(self.model.parameters()).device)
+            stub = torch.zeros((1, 1), dtype=torch.long, device=self.device)
             shifted = prepare(labels=stub) if "labels" in prepare.__code__.co_varnames else prepare(stub)
             return int(shifted[0, 0].item())
         for src in (
@@ -376,6 +380,10 @@ class Seq2SeqSRParser(nn.Module):
             f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
             f"(base {n_total}x{full_weight.shape[1]} frozen). Patched {patched} embedding lookup(s)."
         )
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     @property
     def segmenter(self):
@@ -645,7 +653,7 @@ class Seq2SeqSRParser(nn.Module):
         """Batched greedy decoding. One decoder forward per step covers all
         rows in parallel. The validity mask + COPY substitution work per-row."""
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
 
         enc = self.tokenizer(
             texts,
@@ -703,31 +711,26 @@ class Seq2SeqSRParser(nn.Module):
             B = enc["input_ids"].shape[0]
             decoder_start = self.decoder_start_token_id
 
-            # Per-row state
-            cursors = [0] * B
-            stacks = [0] * B
-            # Number of COPYs in the currently-building EDU. Replaces the
-            # earlier `edu_has_content` flag so we can enforce
-            # `min_edu_length` (each shift requires the EDU to have at
-            # least that many copies, except at end-of-source).
-            edu_lengths = [0] * B
-            done = [i in empty_rows for i in range(B)]
+            min_edu_len = max(1, int(self.config.min_edu_length))
+            # Per-row decode state. `st.pred_edu_ranges` live in source_ids
+            # token space (the same space as the encoder's tokenization), so
+            # eval metrics can use them without a lossy decode→split→re-tokenize
+            # round trip. Empty rows start done so they're skipped throughout.
+            states = [
+                ShiftReduceDecodeState(source_len=len(per_row_source_ids[i]), min_edu_length=min_edu_len)
+                for i in range(B)
+            ]
+            for i in empty_rows:
+                states[i].done = True
             action_seqs: list[list[int]] = [[] for _ in range(B)]
             hit_max_len = [False] * B
-            # Per-row pred EDU ranges in source_ids token space (the same
-            # space as the encoder's tokenization). Tracked directly off
-            # the cursor here so eval metrics can use these without going
-            # through a lossy decode→split→re-tokenize round trip.
-            pred_edu_ranges: list[list[tuple[int, int]]] = [[] for _ in range(B)]
-            edu_starts = [0] * B
-            min_edu_len = max(1, int(self.config.min_edu_length))
 
             # Decoder input + KV cache
             decoder_input_ids = torch.full((B, 1), decoder_start, device=device, dtype=torch.long)
             past_key_values = None
 
             for step in range(self.config.max_output_length):
-                if all(done):
+                if all(st.done for st in states):
                     break
 
                 # Feed only the last token after step 0 (cache holds the rest).
@@ -748,25 +751,16 @@ class Seq2SeqSRParser(nn.Module):
                 # Per-row validity mask: only legal HEAD INDICES survive.
                 if self.config.use_validity_constraints:
                     masked = torch.full_like(logits, float("-inf"))
-                    for i in range(B):
-                        if done[i]:
+                    for i, st in enumerate(states):
+                        if st.done:
                             continue
-                        source_len = len(per_row_source_ids[i])
-                        at_end = cursors[i] >= source_len
-                        # COPY legal iff cursor < source_len
-                        if not at_end:
+                        if st.copy_ok:
                             masked[i, self.copy_head_idx] = logits[i, self.copy_head_idx]
-                        # SHIFT legal iff the current EDU has at least
-                        # `min_edu_length` COPYs, OR we're at end-of-source
-                        # with any content (need to commit the final EDU).
-                        shift_ok = edu_lengths[i] >= min_edu_len or (at_end and edu_lengths[i] >= 1)
-                        if shift_ok:
+                        if st.shift_ok:
                             masked[i, self.shift_head_idx] = logits[i, self.shift_head_idx]
-                        # REDUCE-* legal iff stack >= 2
-                        if stacks[i] >= 2:
+                        if st.reduce_ok:
                             masked[i, self._reduce_head_ids_buf] = logits[i, self._reduce_head_ids_buf]
-                        # EOS legal iff cursor at end, stack singleton, no pending content
-                        if at_end and stacks[i] == 1 and edu_lengths[i] == 0:
+                        if st.eos_ok:
                             masked[i, self.eos_head_idx] = logits[i, self.eos_head_idx]
                     logits = masked
 
@@ -778,43 +772,36 @@ class Seq2SeqSRParser(nn.Module):
                 # substituted at COPY), so we map head index → full ID here.
                 next_inputs = [pad_id] * B
                 for i, head_idx in enumerate(next_head_indices):
-                    if done[i]:
+                    st = states[i]
+                    if st.done:
                         continue
                     full_id = self.full_id_for_head_idx[head_idx]
                     action_seqs[i].append(full_id)
                     if full_id == eos_id:
-                        done[i] = True
+                        st.step_eos()
                     elif full_id == self.copy_token_id:
-                        if cursors[i] < len(per_row_source_ids[i]):
-                            next_inputs[i] = per_row_source_ids[i][cursors[i]]
-                            cursors[i] += 1
-                            edu_lengths[i] += 1
-                        else:
-                            # Constraint should have prevented this. Bail.
-                            done[i] = True
+                        if st.step_copy():
+                            next_inputs[i] = per_row_source_ids[i][st.cursor - 1]
+                        # else st.done already set; next_inputs stays pad
                     elif full_id == self.shift_token_id:
-                        stacks[i] += 1
-                        edu_lengths[i] = 0
-                        # Record this EDU's source-position range.
-                        pred_edu_ranges[i].append((edu_starts[i], cursors[i]))
-                        edu_starts[i] = cursors[i]
+                        st.step_shift()
                         next_inputs[i] = full_id
                     elif full_id in self.reduce_token_ids:
-                        stacks[i] -= 1
+                        st.step_reduce()
                         next_inputs[i] = full_id
                     else:
                         # Shouldn't happen under valid mask.
-                        done[i] = True
+                        st.done = True
 
-                if all(done):
+                if all(st.done for st in states):
                     break
 
                 new_step = torch.tensor(next_inputs, device=device, dtype=torch.long).unsqueeze(1)
                 decoder_input_ids = torch.cat([decoder_input_ids, new_step], dim=1)
             else:
                 # for-loop exhausted without `break`: max_output_length hit.
-                for i in range(B):
-                    if not done[i]:
+                for i, st in enumerate(states):
+                    if not st.done:
                         hit_max_len[i] = True
         finally:
             if gc_active:
@@ -833,19 +820,20 @@ class Seq2SeqSRParser(nn.Module):
                     f"max_output_length={self.config.max_output_length} without EOS. "
                     f"Tree closed by best-effort repair."
                 )
+            st = states[i]
             # If decoding stopped mid-EDU (uncommitted COPYs since the last
             # SHIFT), record the in-flight (start, cursor) range so seg eval
             # sees the truncated EDU. `_repair_actions` independently appends
             # a synthetic <shift> for trailing source tokens, so the action
             # sequence and pred_edu_ranges stay consistent.
-            if cursors[i] > edu_starts[i]:
-                pred_edu_ranges[i].append((edu_starts[i], cursors[i]))
+            if st.cursor > st.edu_start:
+                st.pred_edu_ranges.append((st.edu_start, st.cursor))
             tree = self._tree_from_action_sequence(action_seqs[i], per_row_source_ids[i])
             # Stash per-EDU source-position ranges on the tree so eval can
             # use them without re-tokenizing (which drifts vs the encoder's
             # whole-doc tokenization). Side-channel via a `_meta` attribute
             # since RstTree doesn't natively carry this.
-            tree._pred_edu_source_ranges = pred_edu_ranges[i]  # type: ignore[attr-defined]
+            tree._pred_edu_source_ranges = st.pred_edu_ranges  # type: ignore[attr-defined]
             tree._source_ids = per_row_source_ids[i]  # type: ignore[attr-defined]
             results.append(tree)
         return results
@@ -863,7 +851,7 @@ class Seq2SeqSRParser(nn.Module):
         stays bounded by K beams regardless of dev_batch_size. Wall-time
         roughly K× single-doc greedy."""
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
         K = int(num_beams)
         pad_id = self.tokenizer.pad_token_id
         eos_id = self.tokenizer.eos_token_id
@@ -912,14 +900,10 @@ class Seq2SeqSRParser(nn.Module):
             expanded_attn = enc["attention_mask"].expand(K, -1).contiguous()
             enc_out_K = BaseModelOutput(last_hidden_state=expanded_hidden)
 
-            # Per-beam state.
-            cursors = [0] * K
-            stacks = [0] * K
-            edu_lengths = [0] * K
-            done = [False] * K
+            # Per-beam state. One ShiftReduceDecodeState per beam, cloned from
+            # the chosen parent before each beam's transition is applied.
+            states = [ShiftReduceDecodeState(source_len=len(source_ids), min_edu_length=min_edu_len) for _ in range(K)]
             action_seqs: list[list[int]] = [[] for _ in range(K)]
-            pred_edu_ranges: list[list[tuple[int, int]]] = [[] for _ in range(K)]
-            edu_starts = [0] * K
             # Finished beams (EOS-terminated) are pulled out of the active
             # set so they don't crowd the top-K. Each entry is a snapshot at
             # the moment EOS fired.
@@ -932,10 +916,9 @@ class Seq2SeqSRParser(nn.Module):
             # so without this they'd all pick the same continuation).
             beam_scores = torch.full((K,), float("-inf"), device=device)
             beam_scores[0] = 0.0
-            source_len = len(source_ids)
 
             for step in range(self.config.max_output_length):
-                if all(done):
+                if all(st.done for st in states):
                     break
                 step_input = decoder_input_ids[:, -1:] if past_key_values is not None else decoder_input_ids
                 out = self.model(
@@ -951,21 +934,19 @@ class Seq2SeqSRParser(nn.Module):
 
                 # Per-beam validity mask.
                 masked = torch.full_like(logits, float("-inf"))
-                for j in range(K):
-                    if done[j]:
+                for j, st in enumerate(states):
+                    if st.done:
                         # Done beams are frozen in `finished_beams`. Their
                         # row stays all -inf so they can never re-enter the
                         # top-K and crowd out active beams.
                         continue
-                    at_end = cursors[j] >= source_len
-                    if not at_end:
+                    if st.copy_ok:
                         masked[j, self.copy_head_idx] = logits[j, self.copy_head_idx]
-                    shift_ok = edu_lengths[j] >= min_edu_len or (at_end and edu_lengths[j] >= 1)
-                    if shift_ok:
+                    if st.shift_ok:
                         masked[j, self.shift_head_idx] = logits[j, self.shift_head_idx]
-                    if stacks[j] >= 2:
+                    if st.reduce_ok:
                         masked[j, self._reduce_head_ids_buf] = logits[j, self._reduce_head_ids_buf]
-                    if at_end and stacks[j] == 1 and edu_lengths[j] == 0:
+                    if st.eos_ok:
                         masked[j, self.eos_head_idx] = logits[j, self.eos_head_idx]
                 log_probs = F.log_softmax(masked.float(), dim=-1)
                 # Add cumulative scores: [K, head_V]
@@ -974,7 +955,10 @@ class Seq2SeqSRParser(nn.Module):
                 # rows. topk ranks NaN above any finite negative, so without this
                 # the dead beam's children would crowd out live beams.
                 cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
-                # Top-K continuations from K beams × head_V actions.
+                # Top-K continuations from K beams × head_V actions. `cum` is
+                # [K, head_V]; flattening to [K*head_V] and decoding the flat
+                # index splits it back into (parent_beam, action):
+                # flat = parent_beam * head_V + action.
                 top_scores, top_idx = cum.view(-1).topk(K)
                 parent_of_new = (top_idx // head_V).tolist()
                 action_of_new = (top_idx % head_V).tolist()
@@ -990,64 +974,53 @@ class Seq2SeqSRParser(nn.Module):
                 # Reorder decoder_input_ids by parent.
                 decoder_input_ids = decoder_input_ids[parent_tensor]
 
-                # Carry per-beam state from parents.
-                new_cursors = [cursors[p] for p in parent_of_new]
-                new_stacks = [stacks[p] for p in parent_of_new]
-                new_edu_lengths = [edu_lengths[p] for p in parent_of_new]
-                new_done = [done[p] for p in parent_of_new]
+                # Carry per-beam state from parents. Each child gets its OWN
+                # cloned state so sibling beams expanded from the same parent
+                # don't share (and mutate) one object.
+                new_states = [states[p].clone() for p in parent_of_new]
                 new_action_seqs = [list(action_seqs[p]) for p in parent_of_new]
-                new_pred_edu_ranges = [list(pred_edu_ranges[p]) for p in parent_of_new]
-                new_edu_starts = [edu_starts[p] for p in parent_of_new]
 
                 # Apply each beam's chosen action.
                 next_inputs = [pad_id] * K
                 for j in range(K):
-                    if new_done[j]:
+                    st = new_states[j]
+                    if st.done:
                         continue
                     head_idx = action_of_new[j]
                     full_id = self.full_id_for_head_idx[head_idx]
                     new_action_seqs[j].append(full_id)
                     if full_id == eos_id:
-                        new_done[j] = True
+                        st.step_eos()
                     elif full_id == self.copy_token_id:
-                        if new_cursors[j] < source_len:
-                            next_inputs[j] = source_ids[new_cursors[j]]
-                            new_cursors[j] += 1
-                            new_edu_lengths[j] += 1
-                        else:
-                            new_done[j] = True
+                        if st.step_copy():
+                            next_inputs[j] = source_ids[st.cursor - 1]
+                        # else st.done already set; next_inputs stays pad
                     elif full_id == self.shift_token_id:
-                        new_stacks[j] += 1
-                        new_edu_lengths[j] = 0
-                        new_pred_edu_ranges[j].append((new_edu_starts[j], new_cursors[j]))
-                        new_edu_starts[j] = new_cursors[j]
+                        st.step_shift()
                         next_inputs[j] = full_id
                     elif full_id in self.reduce_token_ids:
-                        new_stacks[j] -= 1
+                        st.step_reduce()
                         next_inputs[j] = full_id
                     else:
-                        new_done[j] = True
+                        st.done = True
 
-                cursors, stacks, edu_lengths = new_cursors, new_stacks, new_edu_lengths
-                done = new_done
+                states = new_states
                 action_seqs = new_action_seqs
-                pred_edu_ranges = new_pred_edu_ranges
-                edu_starts = new_edu_starts
                 beam_scores = top_scores
 
                 # Snapshot any newly-finished beams into `finished_beams`,
                 # then freeze their active score to -inf so they can't win
                 # top-K again. Active beams keep their score and state.
-                for j in range(K):
-                    if done[j] and torch.isfinite(beam_scores[j]):
+                for j, st in enumerate(states):
+                    if st.done and torch.isfinite(beam_scores[j]):
                         finished_beams.append(
                             {
                                 "action_seq": list(action_seqs[j]),
-                                "pred_edu_ranges": list(pred_edu_ranges[j]),
+                                "pred_edu_ranges": list(st.pred_edu_ranges),
                                 "score": float(beam_scores[j].item()),
                                 "length": len(action_seqs[j]),
-                                "cursor": cursors[j],
-                                "edu_start": edu_starts[j],
+                                "cursor": st.cursor,
+                                "edu_start": st.edu_start,
                             }
                         )
                         beam_scores[j] = float("-inf")
@@ -1064,17 +1037,17 @@ class Seq2SeqSRParser(nn.Module):
         for fb in finished_beams:
             fb["finished"] = True
         candidates: list[dict] = list(finished_beams)
-        for j in range(K):
-            if not done[j] and torch.isfinite(beam_scores[j]):
+        for j, st in enumerate(states):
+            if not st.done and torch.isfinite(beam_scores[j]):
                 # Active beam: pred_edu_ranges may be missing an in-flight
                 # EDU if max_output_length cut us off mid-EDU. Mirror the
                 # greedy-path fix so seg eval sees the truncated EDU. The
                 # action sequence gets a synthetic <shift> via
                 # `_repair_actions` downstream. Appending here keeps the
                 # two data structures consistent.
-                ranges = list(pred_edu_ranges[j])
-                if cursors[j] > edu_starts[j]:
-                    ranges.append((edu_starts[j], cursors[j]))
+                ranges = list(st.pred_edu_ranges)
+                if st.cursor > st.edu_start:
+                    ranges.append((st.edu_start, st.cursor))
                 candidates.append(
                     {
                         "action_seq": list(action_seqs[j]),
@@ -1121,7 +1094,7 @@ class Seq2SeqSRParser(nn.Module):
     @torch.no_grad()
     def _predict_one_gold_edu(self, tree: RstTree) -> RstTree:
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
 
         text = _reconstruct_text(tree)
         # Re-derive the gold EDU spans in source-id space from the same
@@ -1175,21 +1148,22 @@ class Seq2SeqSRParser(nn.Module):
             enc_out = encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], return_dict=True)
 
             decoder_start = self.decoder_start_token_id
-            cursor = 0
-            stack = 0
+            min_edu_len = max(1, int(self.config.min_edu_length))
+            # Gold-EDU decode forces the COPY/SHIFT positions, so the mask is
+            # driven by `edu_idx` over the gold boundaries rather than the
+            # state's validity predicates. The state still tracks cursor/stack/
+            # EDU ranges and runs the shared transitions. `st.edu_length` is the
+            # copies-since-last-shift buffer.
+            st = ShiftReduceDecodeState(source_len=source_len, min_edu_length=min_edu_len)
             edu_idx = 0
-            in_edu_buffer = 0  # copies since last shift (or start)
             action_seq: list[int] = []
-            pred_edu_ranges: list[tuple[int, int]] = []
-            edu_start = 0
-            done = False
             hit_max_len = False
 
             decoder_input_ids = torch.full((1, 1), decoder_start, device=device, dtype=torch.long)
             past_key_values = None
 
             for step in range(self.config.max_output_length):
-                if done:
+                if st.done:
                     break
                 step_input = decoder_input_ids[:, -1:] if past_key_values is not None else decoder_input_ids
                 out = self.model(
@@ -1207,23 +1181,23 @@ class Seq2SeqSRParser(nn.Module):
                 more_edus = edu_idx < n_edus
                 current_end = edu_ends[edu_idx] if more_edus else source_len
 
-                if more_edus and cursor < current_end:
+                if more_edus and st.cursor < current_end:
                     # Inside the current gold EDU: force COPY.
                     masked[self.copy_head_idx] = logits[self.copy_head_idx]
-                elif more_edus and cursor == current_end and in_edu_buffer > 0:
+                elif more_edus and st.cursor == current_end and st.edu_length > 0:
                     # Reached the boundary with content buffered: force SHIFT.
                     masked[self.shift_head_idx] = logits[self.shift_head_idx]
                 else:
                     # Between EDUs (just shifted, buffer empty) or all EDUs
                     # exhausted. The model freely chooses REDUCE vs the next
                     # structural step.
-                    if stack >= 2:
+                    if st.stack_size >= 2:
                         masked[self._reduce_head_ids_buf] = logits[self._reduce_head_ids_buf]
                     if more_edus:
                         # Start of the next EDU: only COPY moves forward.
                         masked[self.copy_head_idx] = logits[self.copy_head_idx]
                     else:
-                        if stack == 1:
+                        if st.stack_size == 1:
                             masked[self.eos_head_idx] = logits[self.eos_head_idx]
 
                 head_idx = int(masked.argmax(-1).item())
@@ -1231,36 +1205,30 @@ class Seq2SeqSRParser(nn.Module):
                 action_seq.append(full_id)
 
                 if full_id == eos_id:
-                    done = True
+                    st.step_eos()
                     next_input = pad_id
                 elif full_id == self.copy_token_id:
-                    if cursor < source_len:
-                        next_input = source_ids[cursor]
-                        cursor += 1
-                        in_edu_buffer += 1
+                    if st.step_copy():
+                        next_input = source_ids[st.cursor - 1]
                     else:
-                        done = True
                         next_input = pad_id
                 elif full_id == self.shift_token_id:
-                    stack += 1
-                    pred_edu_ranges.append((edu_start, cursor))
-                    edu_start = cursor
-                    in_edu_buffer = 0
+                    st.step_shift()
                     edu_idx += 1
                     next_input = full_id
                 elif full_id in self.reduce_token_ids:
-                    stack -= 1
+                    st.step_reduce()
                     next_input = full_id
                 else:
-                    done = True
+                    st.done = True
                     next_input = pad_id
 
-                if done:
+                if st.done:
                     break
                 new_step = torch.tensor([[next_input]], device=device, dtype=torch.long)
                 decoder_input_ids = torch.cat([decoder_input_ids, new_step], dim=1)
             else:
-                hit_max_len = not done
+                hit_max_len = not st.done
         finally:
             if gc_active:
                 self._set_grad_checkpointing(True)
@@ -1271,10 +1239,10 @@ class Seq2SeqSRParser(nn.Module):
                 f"max_output_length={self.config.max_output_length} without EOS. "
                 f"Tree closed by best-effort repair."
             )
-        if cursor > edu_start:
-            pred_edu_ranges.append((edu_start, cursor))
+        if st.cursor > st.edu_start:
+            st.pred_edu_ranges.append((st.edu_start, st.cursor))
         tree_out = self._tree_from_action_sequence(action_seq, source_ids)
-        tree_out._pred_edu_source_ranges = pred_edu_ranges  # type: ignore[attr-defined]
+        tree_out._pred_edu_source_ranges = st.pred_edu_ranges  # type: ignore[attr-defined]
         tree_out._source_ids = source_ids  # type: ignore[attr-defined]
         return tree_out
 

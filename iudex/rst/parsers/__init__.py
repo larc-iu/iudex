@@ -20,9 +20,12 @@ class ParserSpec:
     # Runtime still checks `model.segmenter is not None` since the segmenter
     # may be disabled per-config even on a `supports_text=True` parser.
     supports_text: bool
-    # A config field present only on this parser. Used by `runs list` to tag
-    # a config.json with its parser kind without having to import any parser
-    # modules. Must be unique across registered parsers.
+    # A config field used by `runs list` to tag a config.json with its parser
+    # kind without importing parser modules. This is now the FALLBACK path:
+    # training stamps `parser_kind` into the JSON sidecar, which `runs` reads
+    # directly. The string should be distinct per parser, but the generative
+    # cluster (seq2seq_* / decoder_only_*) shares fields, so inference relies on
+    # a field-set heuristic when the sidecar stamp is absent (older runs).
     signature_field: str
 
     def load_config_cls(self) -> type:

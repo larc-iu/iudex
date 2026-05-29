@@ -57,6 +57,8 @@ class DecoderOnlySexpParser(nn.Module):
     def __init__(self, config: DecoderOnlySexpConfig, *, compile_encoder: bool = False):
         super().__init__()
         self.config = config
+        # compile_encoder is accepted for parser-CLI uniformity but has no
+        # effect here. The HF causal LM has its own compilation story.
         del compile_encoder
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
@@ -349,7 +351,13 @@ class DecoderOnlySexpParser(nn.Module):
         )
 
     @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
     def segmenter(self):
+        # Truthy → predict_cli._require_segmenter accepts text input. This
+        # parser always segments via the model's own output.
         return self
 
     # -----------------------------------------------------------------
@@ -752,7 +760,7 @@ class DecoderOnlySexpParser(nn.Module):
     @torch.no_grad()
     def _predict_one_greedy(self, text: str) -> RstTree:
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
         eos_id = int(self.tokenizer.eos_token_id)
 
         source_ids = self._tokenize_source(text)
@@ -840,10 +848,7 @@ class DecoderOnlySexpParser(nn.Module):
             )
         tree = self._tree_from_emitted(emitted_ids, source_ids)
         # Dedup adjacent identical ranges in case the loop double-counted.
-        clean_ranges: list[tuple[int, int]] = []
-        for r in pred_edu_ranges:
-            if not clean_ranges or clean_ranges[-1] != r:
-                clean_ranges.append(r)
+        clean_ranges = _dedup_ranges(pred_edu_ranges)
         if getattr(tree, "_from_sexp_failed", False):
             clean_ranges = []
         tree._pred_edu_source_ranges = clean_ranges  # type: ignore[attr-defined]
@@ -853,7 +858,7 @@ class DecoderOnlySexpParser(nn.Module):
     @torch.no_grad()
     def _predict_one_beam(self, text: str, num_beams: int) -> RstTree:
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
         K = int(num_beams)
         eos_id = int(self.tokenizer.eos_token_id)
 
@@ -902,6 +907,7 @@ class DecoderOnlySexpParser(nn.Module):
                 # rows. topk ranks NaN above any finite negative, so without this
                 # the dead beam's children would crowd out live beams.
                 cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
+                # cum is [K, head_V]; flat index decomposes to (parent_beam, action).
                 top_scores, top_idx = cum.view(-1).topk(K)
                 parent_of_new = (top_idx // head_V).tolist()
                 action_of_new = (top_idx % head_V).tolist()
@@ -1048,7 +1054,7 @@ class DecoderOnlySexpParser(nn.Module):
         Tree shape and labels come from the model.
         """
         self.eval()
-        device = next(self.parameters()).device
+        device = self.device
         eos_id = int(self.tokenizer.eos_token_id)
 
         text = _reconstruct_text(tree)

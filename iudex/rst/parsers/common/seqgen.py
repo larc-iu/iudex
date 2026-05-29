@@ -16,9 +16,16 @@ The encoder-based parsers (`dmrst`, `piudotto`, `topdown_biaffine`) do not use
 these; their shared token-encoding lives in `common/encoding.py`.
 """
 
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+
+from iudex.common.log import warn
+
+# GNMT length-normalization exponent for beam selection (Wu et al. 2016). Shared
+# default across the four generative parsers' beam loops.
+BEAM_LENGTH_PENALTY_ALPHA = 0.6
 
 
 def align_edus_to_tokens(
@@ -99,13 +106,10 @@ def reorder_past_key_values(past_key_values, beam_idx: torch.Tensor, model):
             # Blindly returning None drops the cache on the next step.
             return result if result is not None else past_key_values
         except (TypeError, AttributeError) as e:
-            import warnings
-
-            warnings.warn(
+            warn(
                 f"{type(model).__name__}._reorder_cache failed on "
                 f"{type(past_key_values).__name__} ({type(e).__name__}: {e}). "
-                "Falling back to object/tuple cache reordering.",
-                stacklevel=2,
+                "Falling back to object/tuple cache reordering."
             )
     # Path 2: DynamicCache or similar object-style cache.
     if hasattr(past_key_values, "reorder_cache"):
@@ -116,3 +120,90 @@ def reorder_past_key_values(past_key_values, beam_idx: torch.Tensor, model):
         tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
         for layer in past_key_values
     )
+
+
+@dataclass
+class ShiftReduceDecodeState:
+    """Bottom-up shift-reduce decode state for the SR generative parsers
+    (`seq2seq_sr`, `decoder_only_sr`), the shift-reduce analogue of the sexp
+    parsers' `SexpDecodingState`. Vocab-agnostic: it tracks the source cursor,
+    the constituent-stack size, and the current EDU's COPY count, exposing the
+    four validity predicates and the four transitions that the greedy, beam,
+    and gold-EDU loops share. The parser maps the predicates to its own action
+    head indices and classifies emitted ids back into the four action kinds, so
+    the vocab-specific glue stays per-parser while the automaton lives here.
+
+    The state machine over actions {COPY, SHIFT, REDUCE, EOS}:
+      COPY   advances the source cursor and extends the current EDU.
+      SHIFT  commits the current EDU (records its `(start, cursor)` source-token
+             range), pushes a leaf, and resets the EDU counter.
+      REDUCE pops two constituents and pushes one.
+      EOS    terminates.
+    """
+
+    source_len: int
+    min_edu_length: int = 1
+    cursor: int = 0
+    stack_size: int = 0
+    edu_length: int = 0
+    edu_start: int = 0
+    pred_edu_ranges: list[tuple[int, int]] = field(default_factory=list)
+    done: bool = False
+
+    def clone(self) -> "ShiftReduceDecodeState":
+        """Deep-enough copy for beam expansion (the only mutable field is the
+        ranges list)."""
+        return ShiftReduceDecodeState(
+            source_len=self.source_len,
+            min_edu_length=self.min_edu_length,
+            cursor=self.cursor,
+            stack_size=self.stack_size,
+            edu_length=self.edu_length,
+            edu_start=self.edu_start,
+            pred_edu_ranges=list(self.pred_edu_ranges),
+            done=self.done,
+        )
+
+    @property
+    def at_end(self) -> bool:
+        return self.cursor >= self.source_len
+
+    @property
+    def copy_ok(self) -> bool:
+        return not self.at_end
+
+    @property
+    def shift_ok(self) -> bool:
+        # At least `min_edu_length` COPYs, or end-of-source with any content so
+        # the final EDU can still be committed.
+        return self.edu_length >= self.min_edu_length or (self.at_end and self.edu_length >= 1)
+
+    @property
+    def reduce_ok(self) -> bool:
+        return self.stack_size >= 2
+
+    @property
+    def eos_ok(self) -> bool:
+        return self.at_end and self.stack_size == 1 and self.edu_length == 0
+
+    def step_copy(self) -> bool:
+        """Consume one source token. Returns False (and marks done) if the
+        source is already exhausted, which the validity mask should prevent."""
+        if self.cursor >= self.source_len:
+            self.done = True
+            return False
+        self.cursor += 1
+        self.edu_length += 1
+        return True
+
+    def step_shift(self) -> None:
+        self.stack_size += 1
+        self.pred_edu_ranges.append((self.edu_start, self.cursor))
+        self.edu_start = self.cursor
+        self.edu_length = 0
+
+    def step_reduce(self) -> None:
+        self.stack_size -= 1
+
+    def step_eos(self) -> None:
+        self.done = True

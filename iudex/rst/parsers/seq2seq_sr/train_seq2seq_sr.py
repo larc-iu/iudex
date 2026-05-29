@@ -277,7 +277,7 @@ def _evaluate_on_dev(
                 _write_rs4(pred, output_dir, basename)
     dim(f"  dev eval total: {time.monotonic() - eval_t0:.1f}s over {len(dev_pairs)} documents")
     if output_dir is not None:
-        dim(f"  Wrote {len(dev_pairs)} predictions to {os.path.abspath(output_dir)}")
+        console.print(f"[dim]Wrote {len(dev_pairs)} predictions under[/dim] [path]{os.path.abspath(output_dir)}[/path]")
     metrics = evaluate_seg_and_e2e(gold_trees, seg_data)
     if eval_gold_edu:
         metrics.update(_evaluate_gold_edu(model, dev_pairs))
@@ -381,6 +381,7 @@ def train(cfg: Seq2SeqSRConfig) -> None:
             epoch=epoch,
             best_val=best_val,
             stale_validations=stale,
+            parser_kind="seq2seq_sr",
         )
 
     dev_beams = 1 if cfg.eval_decode_greedy else cfg.num_beams

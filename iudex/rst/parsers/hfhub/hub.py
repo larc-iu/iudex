@@ -62,6 +62,34 @@ _PARSER_META: dict[str, dict[str, str]] = {
         "description": "an end-to-end span-based RST parser with joint EDU segmentation, biaffine span scoring, "
         "and an optional Transformer pointer decoder, greedy top-down decoding",
     },
+    "seq2seq_sr": {
+        "human_name": "seq2seq shift-reduce RST parser",
+        "module_path": "iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr",
+        "class_name": "Seq2SeqSRParser",
+        "description": "an end-to-end RST parser that fine-tunes a seq2seq LM to generate a bottom-up "
+        "shift-reduce action sequence, with COPY-sentinel source substitution and validity-constrained decoding",
+    },
+    "decoder_only_sr": {
+        "human_name": "decoder-only shift-reduce RST parser",
+        "module_path": "iudex.rst.parsers.decoder_only_sr.modeling_decoder_only_sr",
+        "class_name": "DecoderOnlySRParser",
+        "description": "an end-to-end RST parser that fine-tunes a causal LM to generate a bottom-up shift-reduce "
+        "action sequence in a single source+actions stream, with COPY-sentinel substitution",
+    },
+    "seq2seq_sexp": {
+        "human_name": "seq2seq s-expression RST parser",
+        "module_path": "iudex.rst.parsers.seq2seq_sexp.modeling_seq2seq_sexp",
+        "class_name": "Seq2SeqSexpParser",
+        "description": "an end-to-end RST parser that fine-tunes a seq2seq LM to generate a nested s-expression "
+        "linearization of the tree, with validity-constrained decoding",
+    },
+    "decoder_only_sexp": {
+        "human_name": "decoder-only s-expression RST parser",
+        "module_path": "iudex.rst.parsers.decoder_only_sexp.modeling_decoder_only_sexp",
+        "class_name": "DecoderOnlySexpParser",
+        "description": "an end-to-end RST parser that fine-tunes a causal LM to generate a nested s-expression "
+        "linearization in a single source+tree stream",
+    },
 }
 
 
@@ -287,14 +315,21 @@ def render_model_card(
     `{"dev": {...}, "test": {...}}`). It supersedes `checkpoint_meta['best_val']`
     for the displayed metrics table.
     """
+    from iudex.rst.parsers import PARSERS
+
     meta = _PARSER_META[parser_kind]
     encoder = config.get("model_name", "")
     train_dir = config.get("train_dir") or ""
 
-    # Any parser with a non-null `segmentation` sub-config exposes
-    # `predict_from_text`. Otherwise predictions require pre-segmented
-    # RS3/RS4 trees (the parser's `predict` takes an `RstTree`).
-    if config.get("segmentation") is not None:
+    # A parser exposes `predict_from_text` iff it `supports_text` AND, for the
+    # parsers gated on a `segmentation` sub-config (dmrst, piudotto), that
+    # sub-config is non-null. The generative parsers have no `segmentation`
+    # field and always support text, so absence of the key means text-capable.
+    spec = PARSERS.get(parser_kind)
+    supports_text = (spec.supports_text if spec is not None else True) and (
+        "segmentation" not in config or config["segmentation"] is not None
+    )
+    if supports_text:
         predict_snippet = (
             "tree = parser.predict_from_text(\n"
             '    "Although the experiment was carefully designed, "\n'
