@@ -30,9 +30,12 @@
         start_loss: true,
     },
 
-    // Detokenize corpus EDU text to natural form so the segmenter trains on the
-    // same kind of text `predict_from_text` sees. Only applied with segmentation.
-    detokenizer: { type: "sacremoses", lang: "en" },
+    // No detokenization: feed the corpus's word-tokenized EDU text straight to
+    // the tokenizer, matching the official DMRST preprocessing (which does not
+    // detokenize). With XLM-R (SentencePiece) this is also leak-free; a byte-level
+    // BPE encoder under per-EDU tokenization would flag EDU starts via the missing
+    // leading-space marker. Set a detokenizer only for real-world `predict_from_text`.
+    detokenizer: null,
 
     // Data
     train_dir: "data/rstdt/train",
