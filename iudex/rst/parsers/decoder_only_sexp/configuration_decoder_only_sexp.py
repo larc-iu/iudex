@@ -9,16 +9,15 @@ from iudex.rst.parsers.common.config import parse_config_dict
 class _PeftConfig(FromParams):
     """LoRA fine-tuning of the causal LM. Mirrors `DecoderOnlySRConfig._PeftConfig`.
 
-    Action-token embedding rows are added via `resize_token_embeddings` and
-    `modules_to_save=['embed_tokens']` keeps them trainable. The lm_head is
-    handled at parser init: when `use_copy=True` it's replaced with a small
-    fresh head over the action vocab. When `use_copy=False` the full
-    pretrained head is kept (source subwords are scored natively).
+    Under `use_copy=True` the lm_head is replaced with a small fresh head and
+    the input embedding freezes its base + trains a small new-rows Parameter
+    (`_carve_new_token_embeddings`); `modules_to_save` /
+    `train_only_new_embedding_rows` have no effect.
 
-    `train_only_new_embedding_rows` is auto-overridden to False when
-    `use_copy=False` (see `DecoderOnlySexpConfig.__post_init__`): the
-    full lm_head must learn to predict source ids, which requires all
-    embedding rows to remain trainable.
+    Under `use_copy=False` the full pretrained tied lm_head is kept (source
+    subwords scored natively), so `modules_to_save=['embed_tokens']` is honored
+    to keep all embedding rows trainable, and `train_only_new_embedding_rows`
+    is auto-overridden to False (see `DecoderOnlySexpConfig.__post_init__`).
     """
 
     r: int = 16
@@ -27,14 +26,11 @@ class _PeftConfig(FromParams):
     target_modules: str | list[str] = "all-linear"
     bias: str = "none"
     dora: bool = False
-    # Module names whose full weights train alongside the LoRA adapters.
-    # `embed_tokens` keeps the newly-added action-token rows trainable.
-    # Out of `modules_to_save` so PEFT doesn't wrap-and-copy it.
+    # Honored only under use_copy=False (keeps all embedding rows trainable so
+    # the full tied lm_head can score source ids). Ignored under use_copy=True.
     modules_to_save: list[str] = field(default_factory=lambda: ["embed_tokens"])
-    # When True (default), register a backward hook on the trainable
-    # embed_tokens Parameter that zeros gradients for rows < original
-    # vocab size. Only the newly-added action-token rows accumulate
-    # gradient, the pretrained vocabulary embeddings stay frozen.
+    # No-op under use_copy=True (the carve-out always trains only new rows).
+    # Auto-forced to False under use_copy=False by the config __post_init__.
     train_only_new_embedding_rows: bool = True
 
     def __post_init__(self):
@@ -163,16 +159,9 @@ class DecoderOnlySexpConfig(FromParams):
 
     # Label smoothing on the CE loss. Standard fine-tuning trick. The
     # action head is small (~100 classes) and GUM has ~150 train docs,
-    # so hard targets overfit fast. 0.1 is the conventional default.
-    #
-    # SCALE AUTO-ADJUST under use_copy=False (see __post_init__): when the
-    # head is the full backbone vocab (V~262K) instead of the small action
-    # head (V~100), a raw 0.1 puts ~0.1/V mass per off-class, which is two
-    # to three orders of magnitude less per off-class than the use_copy=True
-    # head sees. To keep the per-off-class smoothing mass roughly constant
-    # across modes, the post_init scales `label_smoothing` by
-    # (~ACTION_HEAD_SIZE / ~FULL_VOCAB_SIZE) ~ 100 / 262000 ~ 4e-4 when
-    # use_copy=False. Explicit 0.0 is left untouched (idempotent zero).
+    # so hard targets overfit fast. 0.1 is the conventional default and
+    # applies uniformly to all cells, full-vocab (use_copy=False) cells
+    # included.
     label_smoothing: float = 0.1
 
     def __post_init__(self):
@@ -183,22 +172,6 @@ class DecoderOnlySexpConfig(FromParams):
                 "constrain_content=False requires use_copy=False (free-content decoding "
                 "is only meaningful when source subwords are scored natively by the lm_head)."
             )
-        # Auto-scale label_smoothing across head sizes (see field docstring).
-        # ~ACTION_HEAD_SIZE / ~FULL_VOCAB_SIZE. Skip when the user explicitly
-        # set 0.0 so the override is idempotent.
-        if self.use_copy is False and self.label_smoothing != 0.0:
-            from iudex.common.log import warn as _warn
-
-            _APPROX_ACTION_HEAD_SIZE = 100
-            _APPROX_FULL_VOCAB_SIZE = 262_000
-            scaled = self.label_smoothing * (_APPROX_ACTION_HEAD_SIZE / _APPROX_FULL_VOCAB_SIZE)
-            _warn(
-                f"[CONFIG OVERRIDE] use_copy=False scales label_smoothing by "
-                f"~{_APPROX_ACTION_HEAD_SIZE}/{_APPROX_FULL_VOCAB_SIZE} to keep per-off-class "
-                f"smoothing mass comparable to the use_copy=True head: "
-                f"{self.label_smoothing} -> {scaled:.6f}. Set label_smoothing=0.0 to opt out."
-            )
-            self.label_smoothing = scaled
         if self.use_copy is False and self.peft is not None and self.peft.train_only_new_embedding_rows:
             # Mutates self.peft in place. The override is durable because
             # `dataclasses.asdict(self)` serializes the post-init state into

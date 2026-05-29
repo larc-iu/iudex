@@ -74,8 +74,9 @@ class DecoderOnlySRParser(nn.Module):
 
         if config.relation_types is not None:
             self._install_action_head()
-            if config.peft is not None and getattr(config.peft, "train_only_new_embedding_rows", True):
-                self._mask_old_embedding_gradients()
+            # Freeze the base input embedding and train only a small new-rows
+            # Parameter (see `_carve_new_token_embeddings`).
+            self._carve_new_token_embeddings()
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -101,16 +102,11 @@ class DecoderOnlySRParser(nn.Module):
         return [self.COPY_TOKEN, shift_token] + reduces
 
     def _install_peft(self, peft_cfg) -> None:
+        """Wrap `self.model` in LoRA adapters. The input embedding is NOT in
+        PEFT `modules_to_save` (that would duplicate the vocab x hidden matrix
+        to train ~100 new rows); we freeze the base and train a small new-rows
+        Parameter instead (`_carve_new_token_embeddings`)."""
         from peft import LoraConfig, TaskType, get_peft_model
-
-        existing_module_names = {name.rsplit(".", 1)[-1] for name, _ in self.model.named_modules()}
-        missing = [m for m in peft_cfg.modules_to_save if m not in existing_module_names]
-        if missing:
-            raise ValueError(
-                f"peft.modules_to_save references modules not found on {self.config.model_name!r}: "
-                f"{missing}. Available leaf names include embedding/projection candidates like: "
-                f"{sorted(n for n in existing_module_names if 'embed' in n.lower() or 'head' in n.lower() or 'proj' in n.lower())}"
-            )
 
         lora_cfg = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -120,10 +116,8 @@ class DecoderOnlySRParser(nn.Module):
             target_modules=peft_cfg.target_modules,
             bias=peft_cfg.bias,
             use_dora=peft_cfg.dora,
-            modules_to_save=peft_cfg.modules_to_save,
         )
         self.model = get_peft_model(self.model, lora_cfg)
-        self._retie_modules_to_save()
 
     def _set_grad_checkpointing(self, enabled: bool) -> None:
         method = "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
@@ -166,41 +160,6 @@ class DecoderOnlySRParser(nn.Module):
                 self.model.config.use_cache = prev_use_cache
             if prev_base_use_cache is not None:
                 base_cfg.use_cache = prev_base_use_cache
-
-    def _retie_modules_to_save(self) -> None:
-        """Re-share weights across `ModulesToSaveWrapper` groups whose
-        originals shared storage (mirrors `Seq2SeqSRParser._retie_modules_to_save`).
-        For causal LMs with `tie_word_embeddings=True` the lm_head and
-        embed_tokens initially shared storage, but our `modules_to_save`
-        default is `['embed_tokens']` only (no lm_head wrapper), so the
-        group sizes are typically singletons here and this is a no-op.
-        Kept for defense-in-depth against configs that add more entries."""
-        by_ptr: dict[int, list[tuple[str, nn.Module]]] = {}
-        for name, mod in self.model.named_modules():
-            if type(mod).__name__ != "ModulesToSaveWrapper":
-                continue
-            original = getattr(mod, "original_module", None)
-            trainable_dict = getattr(mod, "modules_to_save", None)
-            if original is None or trainable_dict is None or "default" not in trainable_dict:
-                continue
-            trainable = trainable_dict["default"]
-            ow = getattr(original, "weight", None)
-            tw = getattr(trainable, "weight", None)
-            if not (isinstance(ow, nn.Parameter) and isinstance(tw, nn.Parameter)):
-                continue
-            by_ptr.setdefault(ow.data_ptr(), []).append((name, trainable))
-
-        retied_groups: list[list[str]] = []
-        for group in by_ptr.values():
-            if len(group) < 2:
-                continue
-            _, canonical = group[0]
-            for _, trainable in group[1:]:
-                trainable.weight = canonical.weight
-            retied_groups.append([name for name, _ in group])
-
-        if retied_groups:
-            logger.info(f"Re-tied trainable weight Parameters across modules_to_save groups: {retied_groups}")
 
     def _install_action_vocab(self) -> None:
         action_vocab = self._build_action_vocab()
@@ -313,58 +272,41 @@ class DecoderOnlySRParser(nn.Module):
                 m = m.model
         return m
 
-    def _mask_old_embedding_gradients(self) -> None:
-        canonical = self._find_canonical_embed_weight()
-        if canonical is None:
-            logger.info("_mask_old_embedding_gradients: no trainable embed_tokens Parameter found; nothing to mask.")
-            return
+    def _carve_new_token_embeddings(self) -> None:
+        """Carve the new (SEP + action) token rows out of the resized input
+        embedding into a small trainable `self.new_token_embeddings`
+        Parameter, freeze the base matrix, and splice the two at lookup time.
+        See `Seq2SeqSRParser._carve_new_token_embeddings` for the full
+        rationale. Gradient flows only to `new_token_embeddings`; the frozen
+        base weight's `.grad` stays None."""
         n_old = int(self._original_vocab_size)
+        embed = self._underlying_model().get_input_embeddings()
+        full_weight = embed.weight
+        n_total = full_weight.shape[0]
+        if n_total <= n_old:
+            return
 
-        def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
-            # Zero in place rather than clone-then-zero: the embed gradient is
-            # the largest trainable tensor in the model and cloning it doubles
-            # that allocation at backward peak. This hook is the sole consumer
-            # of the leaf Parameter's accumulation grad, so in-place is safe.
-            grad[:n_old].zero_()
-            return grad
+        self.new_token_embeddings = nn.Parameter(full_weight.data[n_old:].clone())
+        full_weight.requires_grad_(False)
+        self._embed_n_old = n_old
 
-        canonical.register_hook(_zero_old_rows)
+        target_ptr = full_weight.data_ptr()
+        new_param = self.new_token_embeddings
+
+        def _spliced_embedding_forward(input_ids: torch.Tensor) -> torch.Tensor:
+            base = F.embedding(input_ids.clamp(max=n_old - 1), full_weight)
+            new = F.embedding((input_ids - n_old).clamp(min=0), new_param)
+            return torch.where((input_ids >= n_old).unsqueeze(-1), new, base)
+
+        patched = 0
+        for mod in self.model.modules():
+            if isinstance(mod, nn.Embedding) and mod.weight.data_ptr() == target_ptr:
+                mod.forward = _spliced_embedding_forward
+                patched += 1
         logger.info(
-            f"Embed gradient mask: rows [0, {n_old}) frozen; only rows "
-            f"[{n_old}, {canonical.shape[0]}) ({canonical.shape[0] - n_old} new rows, including SEP and actions) update."
+            f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
+            f"(base {n_total}x{full_weight.shape[1]} frozen); patched {patched} embedding lookup(s)."
         )
-
-        canonical_ptr = canonical.data_ptr()
-        leaky_paths: list[str] = []
-        for name, mod in self.model.named_modules():
-            if type(mod).__name__ != "ModulesToSaveWrapper":
-                continue
-            trainable_dict = getattr(mod, "modules_to_save", None)
-            if trainable_dict is None or "default" not in trainable_dict:
-                continue
-            trainable = trainable_dict["default"]
-            if not isinstance(trainable, nn.Embedding):
-                continue
-            if trainable.weight.data_ptr() != canonical_ptr:
-                leaky_paths.append(name)
-        if leaky_paths:
-            raise RuntimeError(
-                "retie didn't catch all embed wrappers — gradient mask is "
-                f"leaky on these paths: {leaky_paths}. Canonical embed at "
-                f"data_ptr={canonical_ptr:x} is not shared by the above wrappers."
-            )
-
-    def _find_canonical_embed_weight(self) -> torch.nn.Parameter | None:
-        for name, mod in self.model.named_modules():
-            if type(mod).__name__ != "ModulesToSaveWrapper":
-                continue
-            trainable_dict = getattr(mod, "modules_to_save", None)
-            if trainable_dict is None or "default" not in trainable_dict:
-                continue
-            trainable = trainable_dict["default"]
-            if isinstance(trainable, nn.Embedding):
-                return trainable.weight
-        return None
 
     @property
     def segmenter(self):

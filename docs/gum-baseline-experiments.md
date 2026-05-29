@@ -177,7 +177,7 @@ For context when interpreting cluster-run numbers.
 
 ## Known confounds
 
-- **`label_smoothing` scale across `use_copy` modes**: when `use_copy=True` the action head projects to ~100 classes; when `use_copy=False` it projects to the full backbone vocabulary (~262K classes). A raw `label_smoothing=0.1` puts wildly different per-off-class mass in the two regimes (0.1/100 vs 0.1/262000), which silently amplifies any apparent gap between the modes. The sexp configs `__post_init__` now scales `label_smoothing` by `~ACTION_HEAD_SIZE / ~FULL_VOCAB_SIZE` (~100/262000 ~ 4e-4) when `use_copy=False`, so the per-off-class smoothing mass stays comparable across modes. Setting `label_smoothing=0.0` explicitly is treated as idempotent (no override) so a paper-reader who wants raw zero smoothing gets it.
+- **`label_smoothing` scale across `use_copy` modes**: when `use_copy=True` the action head projects to ~100 classes; when `use_copy=False` it projects to the full backbone vocabulary (~262K classes), so a fixed `label_smoothing=0.1` distributes very different per-off-class mass in the two regimes. We hold `label_smoothing` at 0.1 across both modes (it applies uniformly to all cells, full-vocab cells included). There is no auto-scaling.
 - **Head architecture is bound to `use_copy`**: with `use_copy=True` we replace the lm_head with a small fresh `Linear(hidden, ~100)`. With `use_copy=False` we keep the full pretrained lm_head. So a `use_copy` ablation conflates "having COPY" with "tiny vs full head". This is a property of the COPY mechanism itself and not a confound we can remove without breaking one mode or the other (see the `use_copy` field docstring in both sexp configs).
 
 ## Takeaways for cluster runs

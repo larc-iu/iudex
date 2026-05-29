@@ -62,10 +62,6 @@ class Seq2SeqSRParser(nn.Module):
         if config.relation_types is not None:
             self._install_action_vocab()
 
-        # PEFT wrapping happens AFTER action-vocab install so the newly-resized
-        # embedding/lm_head rows are part of the base model when peft sees it,
-        # and `modules_to_save` can mark them for full training. Wrapping
-        # before would leave new-token embeddings frozen at their random init.
         if config.peft is not None:
             self._install_peft(config.peft)
 
@@ -76,11 +72,12 @@ class Seq2SeqSRParser(nn.Module):
         # memory and decouples input (full vocab) from output (action vocab).
         if config.relation_types is not None:
             self._install_action_head()
-            # With old embedding rows no longer doing double duty as the
-            # output projection, freezing them is the simple regularization
-            # play — only the new action-token rows of embed_tokens train.
-            if config.peft is not None and getattr(config.peft, "train_only_new_embedding_rows", True):
-                self._mask_old_embedding_gradients()
+            # Carve the newly-added action-token rows out of the resized
+            # embedding into a small trainable Parameter, freeze the base
+            # matrix, and splice the two at lookup time. Only the ~100 new
+            # rows train; we never materialize a full trainable copy or a
+            # dense full-vocab gradient.
+            self._carve_new_token_embeddings()
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -124,26 +121,14 @@ class Seq2SeqSRParser(nn.Module):
         return [self.COPY_TOKEN, shift_token] + reduces
 
     def _install_peft(self, peft_cfg) -> None:
-        """Wrap `self.model` in a PeftModel with LoRA adapters + full-training
-        of `peft_cfg.modules_to_save` (the embedding and lm_head's out_proj,
-        by default). Verifies the requested `modules_to_save` names actually
-        exist on the underlying model so a typo fails loud at init, not
-        silently at train.
-
-        Also restores tied-weight semantics that PEFT's modules_to_save breaks
-        when wrapping tied modules — see `_retie_modules_to_save` for details.
-        """
+        """Wrap `self.model` in a PeftModel with LoRA adapters. The input
+        embedding is NOT handed to PEFT `modules_to_save`: PEFT would keep a
+        frozen original copy plus a full trainable copy of the vocab x hidden
+        matrix (~600 MB each at 1B scale) only to train ~100 new rows. We
+        instead freeze the base embedding and train a small new-rows
+        Parameter (`_carve_new_token_embeddings`). The lm_head is likewise
+        out of `modules_to_save` (replaced wholesale by a small fresh head)."""
         from peft import LoraConfig, TaskType, get_peft_model
-
-        existing_module_names = {name.rsplit(".", 1)[-1] for name, _ in self.model.named_modules()}
-        missing = [m for m in peft_cfg.modules_to_save if m not in existing_module_names]
-        if missing:
-            raise ValueError(
-                f"peft.modules_to_save references modules not found on {self.config.model_name!r}: "
-                f"{missing}. Inspect `model.named_modules()` and update the config. Available leaf "
-                f"names include embedding/projection candidates like: "
-                f"{sorted(n for n in existing_module_names if 'embed' in n.lower() or 'head' in n.lower() or 'shared' in n.lower() or 'proj' in n.lower())}"
-            )
 
         lora_cfg = LoraConfig(
             task_type=TaskType.SEQ_2_SEQ_LM,
@@ -153,10 +138,8 @@ class Seq2SeqSRParser(nn.Module):
             target_modules=peft_cfg.target_modules,
             bias=peft_cfg.bias,
             use_dora=peft_cfg.dora,
-            modules_to_save=peft_cfg.modules_to_save,
         )
         self.model = get_peft_model(self.model, lora_cfg)
-        self._retie_modules_to_save()
 
     def _set_grad_checkpointing(self, enabled: bool) -> None:
         """Toggle gradient checkpointing on the underlying base model. PEFT
@@ -170,60 +153,6 @@ class Seq2SeqSRParser(nn.Module):
         for mod in self.model.modules():
             if hasattr(mod, "gradient_checkpointing"):
                 mod.gradient_checkpointing = enabled
-
-    def _retie_modules_to_save(self) -> None:
-        """Restore tied-weight semantics broken by PEFT's modules_to_save.
-
-        PEFT wraps each `modules_to_save` target in a `ModulesToSaveWrapper`
-        that keeps the original (frozen) module at `.original_module` and an
-        independent trainable copy at `.modules_to_save["default"]`. For
-        modules whose originals shared storage — e.g. T5Gemma 2 ties
-        `encoder.text_model.embed_tokens`, `decoder.embed_tokens`, and
-        `lm_head.out_proj` to one weight tensor under
-        `tie_word_embeddings=True` — PEFT silently de-ties them, creating
-        N independent trainable copies of what's logically one tensor. This
-        wastes ~(N-1) × tensor_size of weight + grad memory AND breaks the
-        inductive bias the model was pretrained with (input/output embeddings
-        decouple during fine-tuning).
-
-        Here we group wrappers by their original `.weight.data_ptr()` (which
-        reflects the pre-PEFT tying), then rebind every trainable copy in a
-        group to share one canonical `nn.Parameter`. Backward accumulates
-        gradients from all attachment points into that single tensor and
-        the optimizer updates it once.
-        """
-        by_ptr: dict[int, list[tuple[str, nn.Module]]] = {}
-        for name, mod in self.model.named_modules():
-            if type(mod).__name__ != "ModulesToSaveWrapper":
-                continue
-            original = getattr(mod, "original_module", None)
-            trainable_dict = getattr(mod, "modules_to_save", None)
-            if original is None or trainable_dict is None or "default" not in trainable_dict:
-                continue
-            trainable = trainable_dict["default"]
-            ow = getattr(original, "weight", None)
-            tw = getattr(trainable, "weight", None)
-            if not (isinstance(ow, nn.Parameter) and isinstance(tw, nn.Parameter)):
-                continue
-            by_ptr.setdefault(ow.data_ptr(), []).append((name, trainable))
-
-        retied_groups: list[list[str]] = []
-        for group in by_ptr.values():
-            if len(group) < 2:
-                continue
-            _, canonical = group[0]
-            for _, trainable in group[1:]:
-                # Reassign the .weight Parameter so all trainable copies share
-                # one tensor. nn.Module.__setattr__ detects nn.Parameter and
-                # re-registers it under the same name.
-                trainable.weight = canonical.weight
-            retied_groups.append([name for name, _ in group])
-
-        if retied_groups:
-            logger.info(
-                f"Re-tied trainable weight Parameters across modules_to_save "
-                f"groups (preserving the backbone's tie_word_embeddings): {retied_groups}"
-            )
 
     def _resolve_decoder_start_token_id(self) -> int:
         """Find the decoder start token in a model-family-portable way.
@@ -392,131 +321,56 @@ class Seq2SeqSRParser(nn.Module):
             m = m.model
         return m
 
-    def _mask_old_embedding_gradients(self) -> None:
-        """Restrict gradient updates on the trainable embed_tokens to ONLY
-        the newly-added action-token rows. Old rows (the pretrained 262K
-        vocabulary) stay frozen at their pretrained values; only the ~100
-        new rows accumulate gradient. Drops the model's overfit surface
-        area by ~600 MB of trainable parameter space at no quality cost
-        (the old embeddings were already well-pretrained on trillions of
-        tokens; fine-tuning them on ~150 GUM docs is mostly noise).
+    def _carve_new_token_embeddings(self) -> None:
+        """Carve the action-token rows out of the resized input embedding into
+        a small trainable `self.new_token_embeddings` Parameter, freeze the
+        base matrix, and splice the two at lookup time.
 
-        Implementation: register a backward hook on every unique trainable
-        embedding Parameter exposed by `modules_to_save`. For models with
-        tied encoder/decoder embeddings (e.g. T5Gemma 2 1B-1B),
-        `_retie_modules_to_save` has already collapsed every wrapper to
-        share one Parameter — we observe one unique data_ptr and hook it
-        once. For models with un-tied embeddings (e.g. the original
-        T5Gemma 2B-2B-ul2), each wrapper still owns its own weight; we
-        hook each unique Parameter so old-row gradient is zeroed on every
-        path. The hook zeros gradient rows < `self._original_vocab_size`,
-        leaving only the action-token rows trainable.
+        After `resize_token_embeddings` the embedding is `vocab x hidden`
+        (~600 MB bf16 at 1B scale) but only the ~100 new rows ever need to
+        train. The old modules_to_save scheme paid for a frozen copy, a full
+        trainable copy, and a dense (99.96%-zeroed) full-vocab gradient. Here
+        the base weight stays frozen (`requires_grad=False`, no duplicate)
+        and only `new_token_embeddings` (n_new x hidden, ~0.2 MB) carries
+        gradient. The patched forward does a two-lookup splice:
+          old ids (< n_old) -> frozen base, new ids (>= n_old) -> small param.
+        Gradient flows only to `new_token_embeddings`; the base weight's
+        `.grad` stays None.
+
+        T5/T5Gemma 2 tie encoder + decoder input embeddings (one weight, one
+        `nn.Embedding` object aliased under several names), so patching every
+        `nn.Embedding` whose weight shares the input-embedding storage covers
+        both sides with one Parameter. Untied backbones expose distinct
+        objects sharing the same storage; both get patched.
         """
         n_old = int(self._original_vocab_size)
-
-        def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
-            # Zero in place rather than `grad.clone()` then zero: the embed
-            # gradient is the largest trainable tensor in the model (full
-            # vocab x hidden, ~600 MB bf16 for T5Gemma 2 1B-1B), and cloning
-            # it doubles that allocation at backward peak. This hook is the
-            # sole consumer of the leaf Parameter's accumulation grad (one
-            # tied Parameter after `_retie_modules_to_save`, hooked once), so
-            # the incoming grad isn't aliased elsewhere and in-place is safe.
-            grad[:n_old].zero_()
-            return grad
-
-        hooked: dict[int, tuple[str, nn.Parameter]] = {}
-        for name, mod in self.model.named_modules():
-            if type(mod).__name__ != "ModulesToSaveWrapper":
-                continue
-            trainable_dict = getattr(mod, "modules_to_save", None)
-            if trainable_dict is None or "default" not in trainable_dict:
-                continue
-            trainable = trainable_dict["default"]
-            if not isinstance(trainable, nn.Embedding):
-                continue
-            ptr = trainable.weight.data_ptr()
-            if ptr in hooked:
-                continue
-            trainable.weight.register_hook(_zero_old_rows)
-            hooked[ptr] = (name, trainable.weight)
-
-        if not hooked:
-            logger.info("_mask_old_embedding_gradients: no trainable embed_tokens Parameter found; nothing to mask.")
+        embed = self._underlying_model().get_input_embeddings()
+        full_weight = embed.weight
+        n_total = full_weight.shape[0]
+        if n_total <= n_old:
             return
 
-        if len(hooked) == 1:
-            name, weight = next(iter(hooked.values()))
-            logger.info(
-                f"Embed gradient mask: rows [0, {n_old}) frozen; only rows "
-                f"[{n_old}, {weight.shape[0]}) (the {weight.shape[0] - n_old} action-token rows) update."
-            )
-        else:
-            paths = [name for name, _ in hooked.values()]
-            logger.info(
-                f"Embed gradient mask: hooked {len(hooked)} independent embed Parameters "
-                f"(backbone has un-tied embeddings); old-row gradient zeroed on each. Paths: {paths}"
-            )
+        self.new_token_embeddings = nn.Parameter(full_weight.data[n_old:].clone())
+        full_weight.requires_grad_(False)
+        self._embed_n_old = n_old
 
-    def _verify_embedding_mask(self) -> None:
-        """One-time sanity check: run a forward+backward on a tiny dummy
-        batch, then assert that the gradient on the old-row indices of the
-        canonical embed Parameter is exactly zero. Not meant for routine
-        training; call manually (e.g. via `python -c`) to confirm the hook
-        plumbed through correctly after init."""
-        canonical = self._find_canonical_embed_weight()
-        if canonical is None:
-            logger.info("_verify_embedding_mask: no trainable embed Parameter; nothing to verify.")
-            return
-        n_old = int(self._original_vocab_size)
-        device = canonical.device
-        # Tiny dummy batch: feed a single short sequence of action tokens
-        # (so they touch both old and new rows of the embed).
-        input_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long, device=device)
-        # Decoder input: a single new-vocab row (so the gradient on at least
-        # one new row is non-zero, proving the hook isn't just zeroing
-        # everything).
-        new_row_id = n_old  # first new row
-        decoder_input_ids = torch.tensor([[new_row_id]], dtype=torch.long, device=device)
-        labels = torch.tensor([[0]], dtype=torch.long, device=device)
-        self.zero_grad(set_to_none=True)
-        out = self.model(
-            input_ids=input_ids,
-            decoder_input_ids=decoder_input_ids,
-            labels=labels,
-        )
-        loss = out.loss if hasattr(out, "loss") and out.loss is not None else out.logits.sum()
-        loss.backward()
-        grad = canonical.grad
-        if grad is None:
-            raise RuntimeError("_verify_embedding_mask: canonical embed received no gradient at all.")
-        old_grad_norm = grad[:n_old].abs().sum().item()
-        new_grad_norm = grad[n_old:].abs().sum().item()
-        if old_grad_norm != 0.0:
-            raise RuntimeError(
-                f"_verify_embedding_mask: old-row gradient is nonzero "
-                f"(|grad[:{n_old}]|.sum() = {old_grad_norm}). The hook didn't fire on the right Parameter."
-            )
+        target_ptr = full_weight.data_ptr()
+        new_param = self.new_token_embeddings
+
+        def _spliced_embedding_forward(input_ids: torch.Tensor) -> torch.Tensor:
+            base = F.embedding(input_ids.clamp(max=n_old - 1), full_weight)
+            new = F.embedding((input_ids - n_old).clamp(min=0), new_param)
+            return torch.where((input_ids >= n_old).unsqueeze(-1), new, base)
+
+        patched = 0
+        for mod in self.model.modules():
+            if isinstance(mod, nn.Embedding) and mod.weight.data_ptr() == target_ptr:
+                mod.forward = _spliced_embedding_forward
+                patched += 1
         logger.info(
-            f"_verify_embedding_mask OK: |grad[:{n_old}]|.sum() = 0, "
-            f"|grad[{n_old}:]|.sum() = {new_grad_norm:.4e} (nonzero, as expected)."
+            f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
+            f"(base {n_total}x{full_weight.shape[1]} frozen); patched {patched} embedding lookup(s)."
         )
-        self.zero_grad(set_to_none=True)
-
-    def _find_canonical_embed_weight(self) -> torch.nn.Parameter | None:
-        """Find the shared trainable embedding Parameter set up by
-        `_retie_modules_to_save`. Returns None if no embed module is in
-        `modules_to_save` (i.e., the user disabled the full-FT path)."""
-        for name, mod in self.model.named_modules():
-            if type(mod).__name__ != "ModulesToSaveWrapper":
-                continue
-            trainable_dict = getattr(mod, "modules_to_save", None)
-            if trainable_dict is None or "default" not in trainable_dict:
-                continue
-            trainable = trainable_dict["default"]
-            if isinstance(trainable, nn.Embedding):
-                return trainable.weight
-        return None
 
     @property
     def segmenter(self):

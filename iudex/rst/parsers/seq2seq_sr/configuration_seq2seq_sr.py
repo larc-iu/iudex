@@ -9,13 +9,10 @@ from iudex.rst.parsers.common.config import parse_config_dict
 class _PeftConfig(FromParams):
     """LoRA fine-tuning of the seq2seq stack. Mirrors `DMRSTConfig._PeftConfig`.
 
-    The lm_head is replaced at parser-init with a fresh, small Linear
-    projecting to just the action vocab (~100 dims), so the old tied-weight
-    issue between `embed_tokens` and `lm_head.out_proj` is gone — only
-    `embed_tokens` needs `modules_to_save` to keep the newly-added action-
-    token rows trainable. By default we also mask gradients on the old
-    pretrained rows of `embed_tokens` so only the ~100 new rows update
-    (see `Seq2SeqSRParser._mask_old_embedding_gradients`).
+    The lm_head is replaced at parser-init with a fresh, small Linear over
+    the action vocab. The input embedding is handled by carving the new
+    action-token rows into a small trainable Parameter and freezing the
+    pretrained base matrix (see `Seq2SeqSRParser._carve_new_token_embeddings`).
     """
 
     r: int = 16
@@ -24,19 +21,10 @@ class _PeftConfig(FromParams):
     target_modules: str | list[str] = "all-linear"
     bias: str = "none"
     dora: bool = False
-    # Module names whose full weights train alongside the LoRA adapters.
-    # `embed_tokens` covers the input embedding (shared encoder/decoder via
-    # `_retie_modules_to_save`). The lm_head is no longer in this list
-    # because we replace it with a fresh small head and train it fully on
-    # its own. Out of `modules_to_save` so PEFT doesn't wrap-and-copy it.
+    # No-ops, kept so existing jsonnets load. The input embedding is no longer
+    # routed through PEFT modules_to_save (it carries a frozen base + small
+    # trainable new-rows Parameter instead), so neither field has any effect.
     modules_to_save: list[str] = field(default_factory=lambda: ["embed_tokens"])
-    # When True (default), register a backward hook on the trainable
-    # embed_tokens Parameter that zeros gradients for rows < original
-    # vocab size. Only the newly-added action-token rows accumulate
-    # gradient; the pretrained vocabulary embeddings stay frozen. Massive
-    # regularization win on small datasets — old embeddings have been
-    # trained on trillions of tokens and shouldn't drift under fine-tuning
-    # on ~150 docs.
     train_only_new_embedding_rows: bool = True
 
     def __post_init__(self):

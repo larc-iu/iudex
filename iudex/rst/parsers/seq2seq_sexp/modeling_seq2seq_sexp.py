@@ -84,13 +84,12 @@ class Seq2SeqSexpParser(nn.Module):
 
         if config.relation_types is not None and config.use_copy:
             self._install_action_head()
-        if (
-            config.relation_types is not None
-            and config.use_copy
-            and config.peft is not None
-            and getattr(config.peft, "train_only_new_embedding_rows", True)
-        ):
-            self._mask_old_embedding_gradients()
+            # use_copy=True: small action head, so the input embedding can
+            # freeze its base and train only the new-token rows. use_copy=False
+            # keeps the full tied lm_head, which must train all embedding rows
+            # to score source ids, so we leave that path on the old PEFT
+            # modules_to_save scheme.
+            self._carve_new_token_embeddings()
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -120,16 +119,24 @@ class Seq2SeqSexpParser(nn.Module):
         return tokens
 
     def _install_peft(self, peft_cfg) -> None:
+        """Wrap in LoRA adapters. Under `use_copy=True` the input embedding is
+        kept OUT of PEFT modules_to_save (frozen base + small new-rows
+        Parameter via `_carve_new_token_embeddings`). Under `use_copy=False`
+        the full tied lm_head must learn source ids, so the embedding is
+        wrapped in modules_to_save and re-tied like before."""
         from peft import LoraConfig, TaskType, get_peft_model
 
-        existing_module_names = {name.rsplit(".", 1)[-1] for name, _ in self.model.named_modules()}
-        missing = [m for m in peft_cfg.modules_to_save if m not in existing_module_names]
-        if missing:
-            raise ValueError(
-                f"peft.modules_to_save references modules not found on {self.config.model_name!r}: "
-                f"{missing}. Available leaf names include: "
-                f"{sorted(n for n in existing_module_names if 'embed' in n.lower() or 'head' in n.lower() or 'shared' in n.lower() or 'proj' in n.lower())}"
-            )
+        use_modules_to_save = not self.config.use_copy
+        modules_to_save = peft_cfg.modules_to_save if use_modules_to_save else None
+        if use_modules_to_save:
+            existing_module_names = {name.rsplit(".", 1)[-1] for name, _ in self.model.named_modules()}
+            missing = [m for m in peft_cfg.modules_to_save if m not in existing_module_names]
+            if missing:
+                raise ValueError(
+                    f"peft.modules_to_save references modules not found on {self.config.model_name!r}: "
+                    f"{missing}. Available leaf names include: "
+                    f"{sorted(n for n in existing_module_names if 'embed' in n.lower() or 'head' in n.lower() or 'shared' in n.lower() or 'proj' in n.lower())}"
+                )
         lora_cfg = LoraConfig(
             task_type=TaskType.SEQ_2_SEQ_LM,
             r=peft_cfg.r,
@@ -138,10 +145,11 @@ class Seq2SeqSexpParser(nn.Module):
             target_modules=peft_cfg.target_modules,
             bias=peft_cfg.bias,
             use_dora=peft_cfg.dora,
-            modules_to_save=peft_cfg.modules_to_save,
+            modules_to_save=modules_to_save,
         )
         self.model = get_peft_model(self.model, lora_cfg)
-        self._retie_modules_to_save()
+        if use_modules_to_save:
+            self._retie_modules_to_save()
 
     def _set_grad_checkpointing(self, enabled: bool) -> None:
         method = "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
@@ -323,38 +331,43 @@ class Seq2SeqSexpParser(nn.Module):
             m = m.model
         return m
 
-    def _mask_old_embedding_gradients(self) -> None:
+    def _carve_new_token_embeddings(self) -> None:
+        """Carve the new (structural + label) token rows out of the resized
+        input embedding into a small trainable `self.new_token_embeddings`
+        Parameter, freeze the base matrix, and splice the two at lookup time.
+        Only called under `use_copy=True` (the small action head makes the
+        full embedding redundant on the output side). See
+        `Seq2SeqSRParser._carve_new_token_embeddings` for the full rationale.
+        Gradient flows only to `new_token_embeddings`; the frozen base
+        weight's `.grad` stays None."""
         n_old = int(self._original_vocab_size)
-
-        def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
-            # Zero in place rather than clone-then-zero: the embed gradient is
-            # the largest trainable tensor in the model and cloning it doubles
-            # that allocation at backward peak. This hook is the sole consumer
-            # of the leaf Parameter's accumulation grad, so in-place is safe.
-            grad[:n_old].zero_()
-            return grad
-
-        hooked: dict[int, tuple[str, nn.Parameter]] = {}
-        for name, mod in self.model.named_modules():
-            if type(mod).__name__ != "ModulesToSaveWrapper":
-                continue
-            trainable_dict = getattr(mod, "modules_to_save", None)
-            if trainable_dict is None or "default" not in trainable_dict:
-                continue
-            trainable = trainable_dict["default"]
-            if not isinstance(trainable, nn.Embedding):
-                continue
-            ptr = trainable.weight.data_ptr()
-            if ptr in hooked:
-                continue
-            trainable.weight.register_hook(_zero_old_rows)
-            hooked[ptr] = (name, trainable.weight)
-        if not hooked:
-            logger.info("_mask_old_embedding_gradients: no trainable embed_tokens Parameter found.")
+        embed = self._underlying_model().get_input_embeddings()
+        full_weight = embed.weight
+        n_total = full_weight.shape[0]
+        if n_total <= n_old:
             return
-        if len(hooked) == 1:
-            name, weight = next(iter(hooked.values()))
-            logger.info(f"Embed gradient mask: rows [0, {n_old}) frozen; only [{n_old}, {weight.shape[0]}) update.")
+
+        self.new_token_embeddings = nn.Parameter(full_weight.data[n_old:].clone())
+        full_weight.requires_grad_(False)
+        self._embed_n_old = n_old
+
+        target_ptr = full_weight.data_ptr()
+        new_param = self.new_token_embeddings
+
+        def _spliced_embedding_forward(input_ids: torch.Tensor) -> torch.Tensor:
+            base = F.embedding(input_ids.clamp(max=n_old - 1), full_weight)
+            new = F.embedding((input_ids - n_old).clamp(min=0), new_param)
+            return torch.where((input_ids >= n_old).unsqueeze(-1), new, base)
+
+        patched = 0
+        for mod in self.model.modules():
+            if isinstance(mod, nn.Embedding) and mod.weight.data_ptr() == target_ptr:
+                mod.forward = _spliced_embedding_forward
+                patched += 1
+        logger.info(
+            f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
+            f"(base {n_total}x{full_weight.shape[1]} frozen); patched {patched} embedding lookup(s)."
+        )
 
     @property
     def segmenter(self):

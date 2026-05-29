@@ -9,11 +9,10 @@ from iudex.rst.parsers.common.config import parse_config_dict
 class _PeftConfig(FromParams):
     """LoRA fine-tuning of the causal LM. Mirrors `Seq2SeqSRConfig._PeftConfig`.
 
-    The lm_head is replaced at parser-init with a fresh, small Linear
-    projecting to just the action vocab (~100 dims). Tied-weight quirks
-    are decoder-only-flavored but otherwise the same story: only the
-    newly-added action-token rows of `embed_tokens` update; pretrained
-    rows are frozen via `train_only_new_embedding_rows`.
+    The lm_head is replaced at parser-init with a fresh, small Linear over
+    the action vocab. The input embedding freezes its pretrained base and
+    trains a small new-rows Parameter (see
+    `DecoderOnlySRParser._carve_new_token_embeddings`).
     """
 
     r: int = 16
@@ -22,6 +21,9 @@ class _PeftConfig(FromParams):
     target_modules: str | list[str] = "all-linear"
     bias: str = "none"
     dora: bool = False
+    # No-ops, kept so existing jsonnets load. The input embedding is no longer
+    # routed through PEFT modules_to_save (frozen base + small new-rows
+    # Parameter instead), so neither field has any effect.
     modules_to_save: list[str] = field(default_factory=lambda: ["embed_tokens"])
     train_only_new_embedding_rows: bool = True
 
