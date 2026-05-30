@@ -30,16 +30,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.parsers.common.seqgen import (
+    BEAM_LENGTH_PENALTY_ALPHA,
     ShiftReduceDecodeState,
     align_edus_to_tokens,
+    empty_tree,
+    gold_edu_source_ranges,
+    reconstruct_text,
     reorder_past_key_values,
+    repair_actions,
 )
 from iudex.rst.data.tree import (
     Reduce,
     RstTree,
     Shift,
-    ShiftReduceAction,
-    strings_to_actions,
 )
 from iudex.rst.parsers.decoder_only_sr.configuration_decoder_only_sr import (
     DecoderOnlySRConfig,
@@ -471,7 +474,7 @@ class DecoderOnlySRParser(nn.Module):
                 "encode_target called before action vocab was installed. Did you forget to set cfg.relation_types?"
             )
 
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         source_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
 
         if len(source_ids) > self.config.max_input_length:
@@ -586,7 +589,7 @@ class DecoderOnlySRParser(nn.Module):
 
         source_ids = self._tokenize_source(text)
         if not source_ids:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
         prefix_ids = self._build_prefix_ids(source_ids)
 
         with self._inference_mode():
@@ -681,12 +684,13 @@ class DecoderOnlySRParser(nn.Module):
         device = self.device
         K = int(num_beams)
         eos_id = int(self.tokenizer.eos_token_id)
+        pad_id = int(self.tokenizer.pad_token_id)
         head_V = self.head_vocab_size
         min_edu_len = max(1, int(self.config.min_edu_length))
 
         source_ids = self._tokenize_source(text)
         if not source_ids:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
         prefix_ids = self._build_prefix_ids(source_ids)
 
         with self._inference_mode():
@@ -757,7 +761,6 @@ class DecoderOnlySRParser(nn.Module):
                 new_states = [states[p].clone() for p in parent_of_new]
                 new_action_seqs = [list(action_seqs[p]) for p in parent_of_new]
 
-                pad_id = int(self.tokenizer.pad_token_id)
                 next_inputs = [pad_id] * K
                 for j in range(K):
                     st = new_states[j]
@@ -793,8 +796,6 @@ class DecoderOnlySRParser(nn.Module):
                                 "pred_edu_ranges": list(st.pred_edu_ranges),
                                 "score": float(beam_scores[j].item()),
                                 "length": len(action_seqs[j]),
-                                "cursor": st.cursor,
-                                "edu_start": st.edu_start,
                                 "finished": True,
                             }
                         )
@@ -830,12 +831,11 @@ class DecoderOnlySRParser(nn.Module):
                 )
 
         if not candidates:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
 
-        length_penalty_alpha = 0.6
         best = max(
             candidates,
-            key=lambda c: c["score"] / max(c["length"], 1) ** length_penalty_alpha,
+            key=lambda c: c["score"] / max(c["length"], 1) ** BEAM_LENGTH_PENALTY_ALPHA,
         )
         if not best.get("finished", False):
             warn(
@@ -862,11 +862,11 @@ class DecoderOnlySRParser(nn.Module):
         device = self.device
         eos_id = int(self.tokenizer.eos_token_id)
 
-        text = _reconstruct_text(tree)
-        gold_ranges = _gold_edu_source_ranges(self.tokenizer, tree)
+        text = reconstruct_text(tree)
+        gold_ranges = gold_edu_source_ranges(self.tokenizer, tree)
         source_ids = self._tokenize_source(text)
         if not source_ids:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
         source_len = len(source_ids)
         prefix_ids = self._build_prefix_ids(source_ids)
 
@@ -876,7 +876,7 @@ class DecoderOnlySRParser(nn.Module):
                 break
             clamped_ranges.append((s, min(e, source_len)))
         if not clamped_ranges:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
         edu_ends = [end for _, end in clamped_ranges]
         n_edus = len(edu_ends)
 
@@ -910,6 +910,11 @@ class DecoderOnlySRParser(nn.Module):
 
                 if more_edus and st.cursor < current_end:
                     masked[self.copy_head_idx] = logits[self.copy_head_idx]
+                elif more_edus and st.cursor == current_end and st.edu_length == 0:
+                    # Empty-span gold EDU (shorter than a subword): commit it
+                    # immediately so edu_idx advances instead of drifting COPY
+                    # across the boundary.
+                    masked[self.shift_head_idx] = logits[self.shift_head_idx]
                 elif more_edus and st.cursor == current_end and st.edu_length > 0:
                     masked[self.shift_head_idx] = logits[self.shift_head_idx]
                 else:
@@ -970,12 +975,12 @@ class DecoderOnlySRParser(nn.Module):
 
     @torch.no_grad()
     def predict(self, tree: RstTree, *, num_beams: int | None = None) -> RstTree:
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         return self.predict_from_text(text, num_beams=num_beams)
 
     @torch.no_grad()
     def predict_batch(self, trees: list[RstTree], *, num_beams: int | None = None) -> list[RstTree]:
-        texts = [_reconstruct_text(t) for t in trees]
+        texts = [reconstruct_text(t) for t in trees]
         return self.predict_batch_from_texts(texts, num_beams=num_beams)
 
     def _tree_from_action_sequence(self, action_ids: list[int], source_ids: list[int]) -> RstTree:
@@ -1006,74 +1011,20 @@ class DecoderOnlySRParser(nn.Module):
                 strings.append(self.tokenizer.convert_ids_to_tokens(tok))
         flush_source()
 
-        actions, malformed_reason = self._repair_actions(strings)
+        actions, malformed_reason = repair_actions(strings, self.reduce_token_map)
         if malformed_reason is not None:
             warn(f"Malformed decoder output ({malformed_reason}). Falling back to single-EDU tree.")
             full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
-            return _empty_tree(self.config.relation_types, text=full_text)
-        return RstTree.from_shift_reduce(actions, relation_types=self.config.relation_types)
-
-    def _repair_actions(self, strings: list[str]) -> tuple[list[ShiftReduceAction], str | None]:
+            return empty_tree(self.config.relation_types, text=full_text)
         try:
-            actions = strings_to_actions(strings, self.reduce_token_map)
-        except ValueError:
-            repaired = list(strings) + [Shift().to_token()]
-            try:
-                actions = strings_to_actions(repaired, self.reduce_token_map)
-            except ValueError as e:
-                return [], str(e)
-            n_shifts = sum(1 for a in actions if isinstance(a, Shift))
-            n_reduces = sum(1 for a in actions if isinstance(a, Reduce))
-            needed = (n_shifts - 1) - n_reduces
-            if needed > 0:
-                fallback = self._fallback_reduce()
-                if fallback is None:
-                    return actions, "no fallback reduce token available"
-                actions = list(actions) + [fallback] * needed
-            return actions, "max_length hit mid-EDU, appended closing shift/reduces"
-        n_shifts = sum(1 for a in actions if isinstance(a, Shift))
-        n_reduces = sum(1 for a in actions if isinstance(a, Reduce))
-        if n_shifts == 0:
-            return actions, "no shifts in generated sequence"
-        if n_reduces != n_shifts - 1:
-            needed = (n_shifts - 1) - n_reduces
-            if needed < 0:
-                return actions, f"too many reduces ({n_reduces}) for {n_shifts} shifts"
-            fallback = self._fallback_reduce()
-            if fallback is None:
-                return actions, "stack underdrained and no fallback reduce available"
-            return list(actions) + [fallback] * needed, "stack underdrained, appended closing reduces"
-        return actions, None
-
-    def _fallback_reduce(self) -> "Reduce | None":
-        for token_str, (nuc, rel) in self.reduce_token_map.items():
-            if (nuc, rel) == ("NS", "elaboration"):
-                return Reduce(nuc=nuc, rel=rel)
-        for token_str, (nuc, rel) in self.reduce_token_map.items():
-            return Reduce(nuc=nuc, rel=rel)
-        return None
-
-
-def _reconstruct_text(tree: RstTree) -> str:
-    parts: list[str] = []
-    for i, edu in enumerate(tree.edus):
-        if i == 0:
-            parts.append(edu.text)
-            continue
-        prefix = edu.prefix if edu.prefix is not None else " "
-        parts.append(prefix + edu.text)
-    return "".join(parts)
-
-
-def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
-    """Per-EDU `(start, end_exclusive)` token-position ranges in the source
-    tokenizer's whole-doc tokenization space. Delegates to the shared
-    `align_edus_to_tokens` tiling helper so train and predict agree exactly."""
-    text = _reconstruct_text(tree)
-    _, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
-    return spans
-
-
-def _empty_tree(relation_types, text: str = "") -> RstTree:
-    actions: list[ShiftReduceAction] = [Shift(edu_text=text or "")]
-    return RstTree.from_shift_reduce(actions, relation_types=relation_types)
+            return RstTree.from_shift_reduce(actions, relation_types=self.config.relation_types)
+        except Exception as e:
+            # A balanced (repaired) action sequence can still build a
+            # pathologically deep tree from an undertrained model's over-
+            # segmented output, blowing Python's recursion limit in
+            # binarize_tree. Real trees are shallow (GUM maxes ~235 EDUs); only
+            # untrusted model output hits this, so degrade on ANY failure,
+            # matching the sexp parsers' _tree_from_emitted.
+            warn(f"Unbuildable shift-reduce tree ({type(e).__name__}: {e}). Falling back to single-EDU tree.")
+            full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
+            return empty_tree(self.config.relation_types, text=full_text)

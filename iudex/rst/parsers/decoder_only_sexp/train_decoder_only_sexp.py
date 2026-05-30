@@ -35,13 +35,12 @@ from iudex.rst.data.metrics import compute_parseval_metrics, f1, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
 from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
 from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.common.seqgen import align_edus_to_tokens
+from iudex.rst.parsers.common.seqgen import align_edus_to_tokens, reconstruct_text
 from iudex.rst.parsers.decoder_only_sexp.configuration_decoder_only_sexp import (
     DecoderOnlySexpConfig,
 )
 from iudex.rst.parsers.decoder_only_sexp.modeling_decoder_only_sexp import (
     DecoderOnlySexpParser,
-    _reconstruct_text,
 )
 
 setup_logging()
@@ -109,7 +108,7 @@ def _make_collator(pad_id: int):
 
 
 def _gold_edu_token_mapping(model: DecoderOnlySexpParser, tree: RstTree) -> tuple[list[int], list[tuple[int, int]]]:
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     _, mapping = align_edus_to_tokens(model.tokenizer, text, tree.edus)
     edu_ends = [end - 1 for _, end in mapping]
     return edu_ends, mapping
@@ -467,35 +466,38 @@ def train(cfg: DecoderOnlySexpConfig) -> None:
     if os.path.exists(best_path):
         checkpoint = torch.load(best_path, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
-        dev_m = _evaluate_on_dev(
+    else:
+        # No validation ran (e.g. validate_every suppressed for a final-eval-
+        # only run), so best_model.pt was never written. Evaluate the
+        # last-epoch model in memory rather than skipping the final eval.
+        warn("No best_model.pt found (no validation ran). Evaluating the final-epoch model.")
+    model.eval()
+    dev_m = _evaluate_on_dev(
+        model,
+        dev_pairs,
+        num_beams=cfg.num_beams,
+        batch_size=cfg.dev_batch_size,
+        output_dir=os.path.join(run_dir, "dev_predictions", "final"),
+        eval_gold_edu=True,
+    )
+    console.print(metrics_table(dev_m, title="Final Dev Results"))
+    final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
+    if test_pairs is not None:
+        test_m = _evaluate_on_dev(
             model,
-            dev_pairs,
+            test_pairs,
             num_beams=cfg.num_beams,
             batch_size=cfg.dev_batch_size,
-            output_dir=os.path.join(run_dir, "dev_predictions", "final"),
+            output_dir=os.path.join(run_dir, "test_predictions", "final"),
             eval_gold_edu=True,
         )
-        console.print(metrics_table(dev_m, title="Final Dev Results"))
-        final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
-        if test_pairs is not None:
-            test_m = _evaluate_on_dev(
-                model,
-                test_pairs,
-                num_beams=cfg.num_beams,
-                batch_size=cfg.dev_batch_size,
-                output_dir=os.path.join(run_dir, "test_predictions", "final"),
-                eval_gold_edu=True,
-            )
-            console.print(metrics_table(test_m, title="Final Test Results"))
-            final_metrics["test"] = test_m
-            tb.log_scalars("test", test_m, global_step)
-        metrics_path = os.path.join(run_dir, "final_metrics.json")
-        with open(metrics_path, "w", encoding="utf-8") as f:
-            json.dump(final_metrics, f, indent=2)
-        wrote(metrics_path)
-    else:
-        success(f"Training complete. Best {cfg.val_metric_name}: {best_val:.4f}")
+        console.print(metrics_table(test_m, title="Final Test Results"))
+        final_metrics["test"] = test_m
+        tb.log_scalars("test", test_m, global_step)
+    metrics_path = os.path.join(run_dir, "final_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(final_metrics, f, indent=2)
+    wrote(metrics_path)
     tb.close()
 
 

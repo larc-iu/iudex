@@ -1,8 +1,8 @@
 """Shared utilities for the generative (text-to-tree) RST parsers, i.e. the
 ones that fine-tune a seq2seq or causal LM to emit a linearized tree
 (`seq2seq_sr`, `decoder_only_sr`, `seq2seq_sexp`, `decoder_only_sexp`). These
-two helpers are lifted here, rather than duplicated per parser, because both
-are pure, self-contained, and costly to keep in hand-sync across four copies:
+helpers are lifted here, rather than duplicated per parser, because they are
+pure, self-contained, and costly to keep in hand-sync across copies:
 
 - `align_edus_to_tokens`: the EDU to subword tiling that keeps train-time COPY
   substitution in lockstep with the inference copy-every-source-token
@@ -11,6 +11,9 @@ are pure, self-contained, and costly to keep in hand-sync across four copies:
 - `reorder_past_key_values`: beam-search KV-cache reordering. Defensive
   HF-version-compat plumbing, where a future transformers bump otherwise needs
   the same fix applied in all four parsers or three of them silently rot.
+- `reconstruct_text` / `gold_edu_source_ranges` / `empty_tree` /
+  `repair_actions` / `fallback_reduce`: the SR parsers' shared text-reconstruct,
+  gold-range tiling, single-EDU fallback, and action-sequence repair logic.
 
 The encoder-based parsers (`dmrst`, `piudotto`, `topdown_biaffine`) do not use
 these; their shared token-encoding lives in `common/encoding.py`.
@@ -22,6 +25,13 @@ from typing import Any
 import torch
 
 from iudex.common.log import warn
+from iudex.rst.data.tree import (
+    Reduce,
+    RstTree,
+    Shift,
+    ShiftReduceAction,
+    strings_to_actions,
+)
 
 # GNMT length-normalization exponent for beam selection (Wu et al. 2016). Shared
 # default across the four generative parsers' beam loops.
@@ -38,7 +48,7 @@ def align_edus_to_tokens(
     exactly: no gaps, no overlaps, sum of lengths == len(input_ids).
 
     `edus` is a sequence of objects with `.text: str` and `.prefix: str | None`
-    (default prefix " " for all but the first EDU), matching how `_reconstruct_text`
+    (default prefix " " for all but the first EDU), matching how `reconstruct_text`
     builds `text`. Assignment is by a single monotonic forward sweep over tokens:
     each token goes to the current EDU until its character midpoint crosses into
     the next EDU's char range, and the final EDU absorbs all trailing tokens. This
@@ -54,7 +64,7 @@ def align_edus_to_tokens(
     input_ids = enc["input_ids"]
     offsets = enc["offset_mapping"]
 
-    # Exclusive char-end per EDU, walking prefixes/text exactly like _reconstruct_text.
+    # Exclusive char-end per EDU, walking prefixes/text exactly like reconstruct_text.
     char_ends: list[int] = []
     char_cursor = 0
     for i, edu in enumerate(edus):
@@ -207,3 +217,82 @@ class ShiftReduceDecodeState:
 
     def step_eos(self) -> None:
         self.done = True
+
+
+def reconstruct_text(tree: RstTree) -> str:
+    """Reverse the storage convention: join EDU strings with spaces (or each
+    EDU's `prefix` field if populated, for detokenized corpora)."""
+    parts: list[str] = []
+    for i, edu in enumerate(tree.edus):
+        if i == 0:
+            parts.append(edu.text)
+            continue
+        prefix = edu.prefix if edu.prefix is not None else " "
+        parts.append(prefix + edu.text)
+    return "".join(parts)
+
+
+def gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
+    """Per-EDU `(start, end_exclusive)` token-position ranges in the source
+    tokenizer's whole-doc tokenization space, tiling it exactly. Delegates to
+    `align_edus_to_tokens` so train and predict agree on the tiling."""
+    text = reconstruct_text(tree)
+    _, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
+    return spans
+
+
+def empty_tree(relation_types, text: str = "") -> RstTree:
+    """Single-EDU fallback for empty / unrecoverable input. The text payload
+    becomes one EDU so downstream callers (to_rs4_string, eval) work."""
+    actions: list[ShiftReduceAction] = [Shift(edu_text=text or "")]
+    return RstTree.from_shift_reduce(actions, relation_types=relation_types)
+
+
+def fallback_reduce(reduce_token_map) -> "Reduce | None":
+    """A Reduce action to close an unfinished tree. Prefers NS-elaboration if
+    available, else the first reduce in the vocabulary."""
+    for _token_str, (nuc, rel) in reduce_token_map.items():
+        if (nuc, rel) == ("NS", "elaboration"):
+            return Reduce(nuc=nuc, rel=rel)
+    for _token_str, (nuc, rel) in reduce_token_map.items():
+        return Reduce(nuc=nuc, rel=rel)
+    return None
+
+
+def repair_actions(strings: list[str], reduce_token_map) -> tuple[list[ShiftReduceAction], str | None]:
+    """Try `strings_to_actions` on the raw string list. If trailing source
+    tokens are present, append a closing `<shift>` and the right number of
+    fallback reduces to drain the stack. Returns the action list plus a reason
+    if the sequence had to be repaired, None if it parsed cleanly."""
+    try:
+        actions = strings_to_actions(strings, reduce_token_map)
+    except ValueError:
+        # Trailing source tokens: append a closing <shift>, then check
+        # stack-size against the resulting Shift count and add reduces below.
+        repaired = list(strings) + [Shift().to_token()]
+        try:
+            actions = strings_to_actions(repaired, reduce_token_map)
+        except ValueError as e:
+            return [], str(e)
+        n_shifts = sum(1 for a in actions if isinstance(a, Shift))
+        n_reduces = sum(1 for a in actions if isinstance(a, Reduce))
+        needed = (n_shifts - 1) - n_reduces
+        if needed > 0:
+            fallback = fallback_reduce(reduce_token_map)
+            if fallback is None:
+                return actions, "no fallback reduce token available"
+            actions = list(actions) + [fallback] * needed
+        return actions, "max_length hit mid-EDU, appended closing shift/reduces"
+    n_shifts = sum(1 for a in actions if isinstance(a, Shift))
+    n_reduces = sum(1 for a in actions if isinstance(a, Reduce))
+    if n_shifts == 0:
+        return actions, "no shifts in generated sequence"
+    if n_reduces != n_shifts - 1:
+        needed = (n_shifts - 1) - n_reduces
+        if needed < 0:
+            return actions, f"too many reduces ({n_reduces}) for {n_shifts} shifts"
+        fallback = fallback_reduce(reduce_token_map)
+        if fallback is None:
+            return actions, "stack underdrained and no fallback reduce available"
+        return list(actions) + [fallback] * needed, "stack underdrained, appended closing reduces"
+    return actions, None

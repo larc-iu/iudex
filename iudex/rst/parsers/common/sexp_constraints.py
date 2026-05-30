@@ -245,11 +245,9 @@ class SexpDecodingState:
         return frozenset(legal)
 
     def content_is_wildcard(self) -> bool:
-        """True iff `legal_actions()` is currently the disjoint union of its
-        returned structural ids plus the "any non-structural vocab id" wildcard.
-        Only possible when `use_copy=False` and `constrain_content=False` AND
-        the state is at a content-emit position (in a leaf or fresh frame
-        before source exhaustion).
+        """True iff this is a content-emit position whose legal content is the
+        wildcard (any non-structural vocab id). See the `FORCE_CONTENT`
+        constant. Only possible under use_copy=False and constrain_content=False.
         """
         if self.use_copy or self.constrain_content:
             return False
@@ -585,23 +583,8 @@ class GoldEduForcer:
           * frozenset[int] of full-vocab ids -> whitelist. The caller masks
             logits to (legal & this set) and argmaxes. A singleton is a hard
             force. (In practice this is never the empty set.)
-          * FORCE_CONTENT (cc=False only) -> the caller must build a mask
-            admitting ONLY the content wildcard: start all-True, then zero out
-            every id in `state.structural_ids()` (OPEN, CLOSE, all label ids,
-            EOS, copy, edu placeholder, tokenizer specials). This is exactly
-            the mask `_full_ids_to_head_mask` already builds when
-            `state.content_is_wildcard()` is True, so the simplest caller
-            implementation is: on FORCE_CONTENT, skip the whitelist-intersect
-            branch and let the existing wildcard-mask path run. The whitelist
-            protocol cannot express this because under the content wildcard
-            `legal_actions()` is empty (content is not an enumerable id set).
-
-        FORCE_CONTENT replaces the two broken cc=False paths: a fresh
-        leaf-start frame (previously returned None, letting the model open an
-        internal node and never close the leaf) and a mid-leaf position below
-        the gold target_end (previously returned `frozenset(legal - {close})`,
-        which is the EMPTY set under the wildcard and masked everything to
-        -inf). The cc=True / use_copy paths are byte-for-byte unchanged.
+          * FORCE_CONTENT (cc=False only) -> force a content-wildcard emit.
+            See the `FORCE_CONTENT` constant for the caller contract.
         """
         if state.is_terminal():
             return None

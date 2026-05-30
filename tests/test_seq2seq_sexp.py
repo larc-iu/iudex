@@ -14,11 +14,9 @@ pytest.importorskip("transformers")
 
 from iudex.rst.data.tree import Reduce, RstTree, Shift
 from iudex.rst.parsers.seq2seq_sexp.configuration_seq2seq_sexp import Seq2SeqSexpConfig
+from iudex.rst.parsers.common.seqgen import gold_edu_source_ranges, reconstruct_text
 from iudex.rst.parsers.seq2seq_sexp.modeling_seq2seq_sexp import (
     Seq2SeqSexpParser,
-    _gold_edu_source_ranges,
-    _reconstruct_text,
-    _reduce_token_to_label,
 )
 
 SMALL_SEQ2SEQ = os.environ.get("IUDEX_TEST_SEQ2SEQ_MODEL", "google-t5/t5-small")
@@ -112,7 +110,8 @@ def _reconstruct_sexp_from_labels(parser: Seq2SeqSexpParser, labels: list[int], 
             depth -= 1
         elif tok in parser.label_id_set:
             token_str = parser.tokenizer.convert_ids_to_tokens(tok)
-            pieces.append(_reduce_token_to_label(token_str))
+            nuc, rel = parser.label_token_map[token_str]
+            pieces.append(f"{nuc}:{rel}")
             if kinds:
                 kinds[-1] = "internal"
         elif parser.config.use_copy and tok == parser.copy_token_id:
@@ -161,7 +160,7 @@ def test_encode_target_roundtrip(traversal_order, use_copy):
     labels, decoder_input_ids = encoded
     assert len(labels) == len(decoder_input_ids)
 
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     enc = parser.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
     source_ids = enc["input_ids"]
     sexp_str = _reconstruct_sexp_from_labels(parser, labels, source_ids)
@@ -207,7 +206,7 @@ def test_forward_returns_finite_loss(parser):
 
     tree = _toy_tree()
     labels, decoder_input_ids = parser.encode_target(tree)
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     enc = parser.encode_input(text)
     batch = {
         "input_ids": torch.tensor([enc["input_ids"]], dtype=torch.long),
@@ -248,8 +247,8 @@ def test_predict_beam_runs_without_crash(parser):
 
 def test_gold_edu_source_ranges_align_to_doc_tokenization(parser):
     tree = _toy_tree()
-    text = _reconstruct_text(tree)
-    ranges = _gold_edu_source_ranges(parser.tokenizer, tree)
+    text = reconstruct_text(tree)
+    ranges = gold_edu_source_ranges(parser.tokenizer, tree)
     assert len(ranges) == len(tree.edus)
     for s, e in ranges:
         assert 0 <= s <= e
@@ -297,7 +296,7 @@ def test_use_copy_false_predicts_source_ids(traversal_order):
     bypass the untrained-backbone choice of OPEN slot."""
     parser = _variant_parser(traversal_order, use_copy=False)
     tree = _toy_tree()
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     enc = parser.tokenizer(text, add_special_tokens=False)
     source_ids = enc["input_ids"]
     pred = parser.predict_with_gold_edus(tree)
@@ -331,7 +330,7 @@ def test_predict_with_gold_edus_opens_exactly_n_edus_on_untrained_backbone(trave
     could spin OPEN until max_output_length on untrained models."""
     parser = _variant_parser(traversal_order, use_copy=True)
     tree = _toy_tree_3edu()
-    gold_ranges = _gold_edu_source_ranges(parser.tokenizer, tree)
+    gold_ranges = gold_edu_source_ranges(parser.tokenizer, tree)
     assert len(gold_ranges) == 3
 
     pred = parser.predict_with_gold_edus(tree)
@@ -356,7 +355,7 @@ def test_use_copy_false_loss_is_finite_and_flows_to_lm_head(traversal_order):
     parser = _variant_parser(traversal_order, use_copy=False)
     tree = _toy_tree()
     labels, decoder_input_ids = parser.encode_target(tree)
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     inp = parser.encode_input(text)
     # Confirm the label stream contains at least one non-structural id (a
     # source subword). Without that the test would degenerate.
@@ -411,7 +410,7 @@ def test_constrain_content_false_runs_end_to_end(traversal_order):
     import torch
 
     labels, decoder_input_ids = parser.encode_target(tree)
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     inp = parser.encode_input(text)
     batch = {
         "input_ids": torch.tensor([inp["input_ids"]], dtype=torch.long),

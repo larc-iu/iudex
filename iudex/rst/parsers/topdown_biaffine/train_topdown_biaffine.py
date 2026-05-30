@@ -10,7 +10,7 @@ from collections import deque
 import torch
 from tonga import Params
 
-from iudex.common.log import console, dim, rule, setup_logging, success, warn
+from iudex.common.log import console, dim, rule, setup_logging, success, warn, wrote
 from iudex.common.training import (
     TBLogger,
     build_optimizer,
@@ -142,6 +142,7 @@ def train(cfg: TopdownBiaffineConfig) -> None:
             scheduler,
             config=cfg_dict,
             config_hash=cfg_hash,
+            parser_kind="topdown_biaffine",
             global_step=global_step,
             epoch=epoch,
             best_val=best_val,
@@ -297,8 +298,10 @@ def train(cfg: TopdownBiaffineConfig) -> None:
             tb.log_scalars("test", test_m, global_step)
         # Sidecar for downstream tools (e.g. hub.py model card) so they don't
         # need to torch.load the checkpoint just to read corpus-level numbers.
-        with open(os.path.join(run_dir, "final_metrics.json"), "w", encoding="utf-8") as f:
+        metrics_path = os.path.join(run_dir, "final_metrics.json")
+        with open(metrics_path, "w", encoding="utf-8") as f:
             json.dump(final_metrics, f, indent=2)
+        wrote(metrics_path)
     else:
         success(f"Training complete. Best {cfg.val_metric_name}: {best_val:.4f}")
     tb.close()

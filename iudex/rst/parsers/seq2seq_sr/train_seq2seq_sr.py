@@ -37,7 +37,8 @@ from iudex.rst.data.reader import infer_relation_types, read_rst_dir
 from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
 from iudex.rst.data.tree import RstTree
 from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
-from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import Seq2SeqSRParser, _reconstruct_text
+from iudex.rst.parsers.common.seqgen import reconstruct_text
+from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import Seq2SeqSRParser
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ def _build_dataset(model: Seq2SeqSRParser, pairs: list[tuple[str, RstTree]]) -> 
             dropped += 1
             continue
         labels, decoder_input_ids = encoded
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         enc = model.encode_input(text)
         items.append(
             {
@@ -146,12 +147,11 @@ def _gold_edu_token_mapping(model: Seq2SeqSRParser, tree: RstTree) -> tuple[list
     once and partitions its subwords among the EDUs so the ranges TILE the
     tokenization, putting gold mappings in the same space as the pred mappings
     produced by the inference loop's cursor tracking. The same helper drives
-    `encode_target` and `_gold_edu_source_ranges` so all three stay consistent.
+    `encode_target` and `gold_edu_source_ranges` so all three stay consistent.
     """
     from iudex.rst.parsers.common.seqgen import align_edus_to_tokens
-    from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import _reconstruct_text
 
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     _, mapping = align_edus_to_tokens(model.tokenizer, text, tree.edus)
     edu_ends = [end - 1 for _, end in mapping]
     return edu_ends, mapping

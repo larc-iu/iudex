@@ -53,6 +53,17 @@ _PARSER_META: dict[str, dict[str, str]] = {
         "paper_venue": "Findings of EMNLP 2022",
         "paper_url": "https://aclanthology.org/2022.findings-emnlp.501/",
     },
+    "sr_biaffine": {
+        "human_name": "Shift-reduce Biaffine RST parser",
+        "module_path": "iudex.rst.parsers.sr_biaffine.modeling_sr_biaffine",
+        "class_name": "SRBiaffineParser",
+        "description": "a transition-based shift-reduce RST parser with an FFN action head and a biaffine "
+        "reduce-label head (assumes gold EDU segmentation)",
+        "paper_title": "A Simple and Strong Baseline for End-to-End Neural RST-style Discourse Parsing",
+        "paper_authors": "Naoki Kobayashi, Tsutomu Hirao, Hidetaka Kamigaito, Manabu Okumura, Masaaki Nagata",
+        "paper_venue": "Findings of EMNLP 2022",
+        "paper_url": "https://aclanthology.org/2022.findings-emnlp.501/",
+    },
     # iudex original (no external paper): the `else` branch of render_model_card
     # supplies the intro/citation, so no `paper_*` keys.
     "piudotto": {

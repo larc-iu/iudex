@@ -4,50 +4,13 @@ import torch.nn.functional as F
 
 from iudex.rst.data.reader import determine_label_index
 from iudex.rst.data.tree import RstTree
+from iudex.rst.parsers.common.biaffine import DeepBiAffine
 from iudex.rst.parsers.common.encoding import (
     encode_tokens_strided,
     load_encoder_and_tokenizer,
     tokenize_edus,
 )
 from iudex.rst.parsers.topdown_biaffine.configuration_topdown_biaffine import TopdownBiaffineConfig
-
-
-class _FeedForward(nn.Sequential):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout_p):
-        super().__init__(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout_p),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-
-class _DeepBiAffine(nn.Module):
-    """Deep biaffine scorer used for both split and label decisions.
-
-    Each side is projected with its own FFN, then combined as a bilinear term
-    plus per-side linear terms (a.k.a. the deep biaffine of Dozat & Manning).
-
-    Args:
-        h_left: [num_candidates, input_dim]
-        h_right: [num_candidates, input_dim]
-
-    Returns:
-        scores: [num_candidates, output_dim]
-    """
-
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout_p):
-        super().__init__()
-        self.W_left = _FeedForward(input_dim, hidden_dim, hidden_dim, dropout_p)
-        self.W_right = _FeedForward(input_dim, hidden_dim, hidden_dim, dropout_p)
-        self.W_s = nn.Bilinear(hidden_dim, hidden_dim, output_dim)
-        self.V_left = nn.Linear(hidden_dim, output_dim)
-        self.V_right = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, h_left, h_right):
-        h_left = self.W_left(h_left)
-        h_right = self.W_right(h_right)
-        return self.W_s(h_left, h_right) + self.V_left(h_left) + self.V_right(h_right)
 
 
 class TopdownBiaffineParser(nn.Module):
@@ -69,8 +32,8 @@ class TopdownBiaffineParser(nn.Module):
         if compile_encoder and torch.cuda.is_available():
             self.encoder.forward = torch.compile(self.encoder.forward, dynamic=True)
 
-        self.split_biaffine = _DeepBiAffine(self.hidden_size, config.ffn_hidden_size, 1, config.dropout)
-        self.label_biaffine = _DeepBiAffine(
+        self.split_biaffine = DeepBiAffine(self.hidden_size, config.ffn_hidden_size, 1, config.dropout)
+        self.label_biaffine = DeepBiAffine(
             self.hidden_size, config.ffn_hidden_size, len(self.label_index), config.dropout
         )
 

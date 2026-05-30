@@ -8,20 +8,14 @@ Action vocabulary (use_copy=True):
     {<sexp_open>, <sexp_close>, <eos>} U {<reduce_ns_*>, <reduce_sn_*>,
     <reduce_nn_*>} U {<copy>}
 
-In use_copy=False mode the `<copy>` token is dropped from the head and
-the source subwords appear in-stream as their actual tokenizer IDs. The
-small action head still emits structural tokens, but source positions
-are predicted by the (untouched) backbone's lm_head over its full input
-vocab. Since we replace the lm_head with a small Linear, we expand the
-head's output dim to cover ALL source subwords seen during training, OR
-we constrain ourselves to the full vocab. Implementation choice: the
-head projects to {<sexp_open>, <sexp_close>, <eos>, labels} (no copy)
-PLUS the full input vocabulary, in head-index space. For practicality
-we keep `use_copy=True` as the canonical / well-tested path. The
-`use_copy=False` branch is supported in `encode_target` and decoding
-but uses the full backbone lm_head (no head replacement) so the source
-vocab is naturally available. This trades the memory benefit of the
-small head for keeping source-token prediction working without
+In use_copy=False mode the `<copy>` token is dropped and the source
+subwords appear in-stream as their actual tokenizer IDs. We keep
+`use_copy=True` as the canonical / well-tested path (small action head,
+installed by `_install_action_head`). The `use_copy=False` branch is
+supported in `encode_target` and decoding but keeps the full backbone
+lm_head (no head replacement) so the source vocab is naturally
+available for source-token prediction. This trades the memory benefit
+of the small head for keeping source-token prediction working without
 enumerating the source vocab at init.
 """
 
@@ -36,7 +30,13 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import Reduce, RstTree
-from iudex.rst.parsers.common.seqgen import align_edus_to_tokens, reorder_past_key_values
+from iudex.rst.parsers.common.seqgen import (
+    BEAM_LENGTH_PENALTY_ALPHA,
+    align_edus_to_tokens,
+    gold_edu_source_ranges,
+    reconstruct_text,
+    reorder_past_key_values,
+)
 from iudex.rst.parsers.common.sexp_constraints import (
     FORCE_CONTENT,
     GoldEduForcer,
@@ -45,16 +45,6 @@ from iudex.rst.parsers.common.sexp_constraints import (
 from iudex.rst.parsers.seq2seq_sexp.configuration_seq2seq_sexp import Seq2SeqSexpConfig
 
 logger = logging.getLogger(__name__)
-
-
-def _reduce_token_to_label(token: str) -> str:
-    """Map a `<reduce_<nuc>_<rel>>` token string to the s-expression
-    label `NUC:rel`. Inverse of the (nuc, rel) -> reduce-token mapping
-    in `Reduce.to_token`."""
-    # `<reduce_ns_elaboration>` -> nuc="NS", rel="elaboration"
-    inner = token[len("<reduce_") : -1]
-    nuc_low, _, rel = inner.partition("_")
-    return f"{nuc_low.upper()}:{rel}"
 
 
 class Seq2SeqSexpParser(nn.Module):
@@ -267,11 +257,6 @@ class Seq2SeqSexpParser(nn.Module):
             for fid, hi in self.head_idx_for_full_id.items():
                 lookup[fid] = hi
             self.register_buffer("_label_to_head_lookup", lookup, persistent=False)
-            self.register_buffer(
-                "_reduce_head_ids_buf",
-                torch.tensor(sorted(self.label_head_indices), dtype=torch.long),
-                persistent=False,
-            )
         else:
             # use_copy=False: scoring vocab IS the full pretrained vocab. No
             # head replacement, no full_id<->head_idx mapping. Structural
@@ -502,7 +487,7 @@ class Seq2SeqSexpParser(nn.Module):
 
     def _edu_subword_ids(self, tree: RstTree) -> tuple[str, list[list[int]]]:
         """Per-EDU subword IDs in the encoder's whole-doc tokenization space."""
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         full_input_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
         edu_subword_ids = [list(full_input_ids[s:e]) for s, e in spans]
         return text, edu_subword_ids
@@ -824,8 +809,8 @@ class Seq2SeqSexpParser(nn.Module):
         K = int(num_beams)
         # In use_copy=False mode the scoring vocab IS the model's full output
         # vocab (the pretrained lm_head). In use_copy=True it's the small
-        # replacement head. Either way the size is reflected by the model's
-        # final logit dim, which we read off the first decoder pass below.
+        # replacement head. Either way the size is the precomputed
+        # `self.head_vocab_size`.
         head_V = self.head_vocab_size
 
         enc = self.tokenizer(
@@ -970,8 +955,10 @@ class Seq2SeqSexpParser(nn.Module):
         if not candidates:
             return _empty_tree(self.config.relation_types)
 
-        length_penalty_alpha = 0.6
-        best = max(candidates, key=lambda c: c["score"] / max(c["length"], 1) ** length_penalty_alpha)
+        best = max(
+            candidates,
+            key=lambda c: c["score"] / max(c["length"], 1) ** BEAM_LENGTH_PENALTY_ALPHA,
+        )
         if not best.get("finished", False):
             warn(
                 f"Output truncated at inference (beam): no beam reached EOS within "
@@ -1013,8 +1000,8 @@ class Seq2SeqSexpParser(nn.Module):
         """
         self.eval()
         device = self.device
-        text = _reconstruct_text(tree)
-        gold_ranges = _gold_edu_source_ranges(self.tokenizer, tree)
+        text = reconstruct_text(tree)
+        gold_ranges = gold_edu_source_ranges(self.tokenizer, tree)
 
         enc = self.tokenizer(
             text,
@@ -1137,12 +1124,12 @@ class Seq2SeqSexpParser(nn.Module):
 
     @torch.no_grad()
     def predict(self, tree: RstTree, *, num_beams: int | None = None) -> RstTree:
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         return self.predict_from_text(text, num_beams=num_beams)
 
     @torch.no_grad()
     def predict_batch(self, trees: list[RstTree], *, num_beams: int | None = None) -> list[RstTree]:
-        texts = [_reconstruct_text(t) for t in trees]
+        texts = [reconstruct_text(t) for t in trees]
         return self.predict_batch_from_texts(texts, num_beams=num_beams)
 
     # -----------------------------------------------------------------
@@ -1233,8 +1220,8 @@ class Seq2SeqSexpParser(nn.Module):
                 leaf_open = bool(kind_stack) and kind_stack[-1] == "leaf"
             elif tok in self.label_id_set:
                 token_str = self.tokenizer.convert_ids_to_tokens(tok)
-                label = _reduce_token_to_label(token_str)
-                pieces.append(label)
+                nuc, rel = self.label_token_map[token_str]
+                pieces.append(f"{nuc}:{rel}")
                 if kind_stack:
                     kind_stack[-1] = "internal"
             elif self.config.use_copy and self.copy_token_id is not None and tok == self.copy_token_id:
@@ -1280,25 +1267,6 @@ class Seq2SeqSexpParser(nn.Module):
 
 
 # ----- module-level helpers (used by predict + tests) -----
-
-
-def _reconstruct_text(tree: RstTree) -> str:
-    parts: list[str] = []
-    for i, edu in enumerate(tree.edus):
-        if i == 0:
-            parts.append(edu.text)
-            continue
-        prefix = edu.prefix if edu.prefix is not None else " "
-        parts.append(prefix + edu.text)
-    return "".join(parts)
-
-
-def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
-    """Per-EDU (start, end_exclusive) ranges in the encoder's whole-doc
-    tokenization space. Mirrors the seq2seq_sr helper."""
-    text = _reconstruct_text(tree)
-    _full_input_ids, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
-    return list(spans)
 
 
 def _edu_ranges_from_actions(

@@ -35,12 +35,9 @@ from iudex.rst.data.metrics import compute_parseval_metrics, f1, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
 from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
 from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.common.seqgen import align_edus_to_tokens
+from iudex.rst.parsers.common.seqgen import align_edus_to_tokens, reconstruct_text
 from iudex.rst.parsers.seq2seq_sexp.configuration_seq2seq_sexp import Seq2SeqSexpConfig
-from iudex.rst.parsers.seq2seq_sexp.modeling_seq2seq_sexp import (
-    Seq2SeqSexpParser,
-    _reconstruct_text,
-)
+from iudex.rst.parsers.seq2seq_sexp.modeling_seq2seq_sexp import Seq2SeqSexpParser
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -66,7 +63,7 @@ def _build_dataset(model: Seq2SeqSexpParser, pairs: list[tuple[str, RstTree]]) -
             dropped += 1
             continue
         labels, decoder_input_ids = encoded
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         enc = model.encode_input(text)
         items.append(
             {
@@ -125,7 +122,7 @@ def _make_collator(pad_id: int):
 def _gold_edu_token_mapping(model: Seq2SeqSexpParser, tree: RstTree) -> tuple[list[int], list[tuple[int, int]]]:
     """Per-EDU `(start, end_exclusive)` ranges in encoder whole-doc token
     space. Same logic as the seq2seq_sr helper of the same name."""
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     _full_input_ids, spans = align_edus_to_tokens(model.tokenizer, text, tree.edus)
     mapping = list(spans)
     edu_ends = [end - 1 for _, end in mapping]

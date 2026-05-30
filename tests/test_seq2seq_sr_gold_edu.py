@@ -20,10 +20,9 @@ pytest.importorskip("transformers")
 
 from iudex.rst.data.tree import Reduce, RstTree, Shift
 from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
+from iudex.rst.parsers.common.seqgen import gold_edu_source_ranges, reconstruct_text
 from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import (
     Seq2SeqSRParser,
-    _gold_edu_source_ranges,
-    _reconstruct_text,
 )
 
 # Allow override; t5-small is the smallest cached seq2seq we can rely on.
@@ -67,8 +66,8 @@ def parser():
 
 def test_gold_edu_source_ranges_align_to_doc_tokenization(parser):
     tree = _toy_tree()
-    text = _reconstruct_text(tree)
-    ranges = _gold_edu_source_ranges(parser.tokenizer, tree)
+    text = reconstruct_text(tree)
+    ranges = gold_edu_source_ranges(parser.tokenizer, tree)
     assert len(ranges) == len(tree.edus)
     # Ranges are strictly increasing and contiguous in token space (modulo
     # zero-width spans for empty EDUs, which we don't construct here).
@@ -84,7 +83,7 @@ def test_gold_edu_source_ranges_align_to_doc_tokenization(parser):
 
 def test_predict_with_gold_edus_emits_one_shift_per_gold_edu(parser):
     tree = _toy_tree()
-    gold_ranges = _gold_edu_source_ranges(parser.tokenizer, tree)
+    gold_ranges = gold_edu_source_ranges(parser.tokenizer, tree)
 
     pred = parser.predict_with_gold_edus(tree)
     assert pred is not None

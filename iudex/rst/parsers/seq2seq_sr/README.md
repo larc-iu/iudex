@@ -7,6 +7,8 @@ the parser action that commits it to the stack. `<reduce_<nuc>_<rel>>` pops the 
 items and combines them. Both the EDU segmentation and the labeled tree are recovered from
 this one string.
 
-A custom `LogitsProcessor` enforces structural validity (stack/queue invariants) and
-input-coverage validity (the emitted source-copy sub-sequence must equal the input subword
-IDs verbatim) during beam search, so any beam that survives produces a parseable output.
+Decoding is a hand-rolled masked argmax (greedy) or log-softmax beam loop, not HF
+`generate()`. At each step the candidate actions are masked to the structurally valid set
+(stack/queue invariants) and the input-coverage valid set (the emitted source-copy
+sub-sequence must equal the input subword IDs verbatim) before the score, so any sequence
+the loop produces is parseable.

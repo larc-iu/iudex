@@ -151,9 +151,9 @@ def _make_batch(parser):
 
 
 def _reconstruct(parser):
-    from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import _reconstruct_text
+    from iudex.rst.parsers.common.seqgen import reconstruct_text
 
-    return _reconstruct_text(_toy_tree())
+    return reconstruct_text(_toy_tree())
 
 
 @pytest.mark.parametrize("name", list(PARSERS))

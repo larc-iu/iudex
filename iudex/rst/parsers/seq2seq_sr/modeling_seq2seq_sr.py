@@ -26,13 +26,16 @@ from iudex.rst.data.tree import (
     Reduce,
     RstTree,
     Shift,
-    ShiftReduceAction,
-    strings_to_actions,
 )
 from iudex.rst.parsers.common.seqgen import (
+    BEAM_LENGTH_PENALTY_ALPHA,
     ShiftReduceDecodeState,
     align_edus_to_tokens,
+    empty_tree,
+    gold_edu_source_ranges,
+    reconstruct_text,
     reorder_past_key_values,
+    repair_actions,
 )
 from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
 
@@ -568,9 +571,9 @@ class Seq2SeqSRParser(nn.Module):
         # The per-EDU subword id slices must TILE the whole-doc tokenization so
         # the training-time COPY substitutions match the inference-time
         # `source_ids` stream exactly. `align_edus_to_tokens` guarantees that
-        # tiling. The same helper drives `_gold_edu_source_ranges` and the
+        # tiling. The same helper drives `gold_edu_source_ranges` and the
         # trainer's `_gold_edu_token_mapping`.
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         full_input_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
         edu_subword_ids = [full_input_ids[s:e] for (s, e) in spans]
 
@@ -812,7 +815,7 @@ class Seq2SeqSRParser(nn.Module):
         empty_set = set(empty_rows)
         for i in range(B):
             if i in empty_set:
-                results.append(_empty_tree(self.config.relation_types))
+                results.append(empty_tree(self.config.relation_types))
                 continue
             if hit_max_len[i]:
                 warn(
@@ -823,7 +826,7 @@ class Seq2SeqSRParser(nn.Module):
             st = states[i]
             # If decoding stopped mid-EDU (uncommitted COPYs since the last
             # SHIFT), record the in-flight (start, cursor) range so seg eval
-            # sees the truncated EDU. `_repair_actions` independently appends
+            # sees the truncated EDU. `repair_actions` independently appends
             # a synthetic <shift> for trailing source tokens, so the action
             # sequence and pred_edu_ranges stay consistent.
             if st.cursor > st.edu_start:
@@ -885,7 +888,7 @@ class Seq2SeqSRParser(nn.Module):
             )
         source_ids = ids
         if not source_ids:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
 
         gc_active = self.config.gradient_checkpointing
         if gc_active:
@@ -1019,8 +1022,6 @@ class Seq2SeqSRParser(nn.Module):
                                 "pred_edu_ranges": list(st.pred_edu_ranges),
                                 "score": float(beam_scores[j].item()),
                                 "length": len(action_seqs[j]),
-                                "cursor": st.cursor,
-                                "edu_start": st.edu_start,
                             }
                         )
                         beam_scores[j] = float("-inf")
@@ -1043,7 +1044,7 @@ class Seq2SeqSRParser(nn.Module):
                 # EDU if max_output_length cut us off mid-EDU. Mirror the
                 # greedy-path fix so seg eval sees the truncated EDU. The
                 # action sequence gets a synthetic <shift> via
-                # `_repair_actions` downstream. Appending here keeps the
+                # `repair_actions` downstream. Appending here keeps the
                 # two data structures consistent.
                 ranges = list(st.pred_edu_ranges)
                 if st.cursor > st.edu_start:
@@ -1059,7 +1060,7 @@ class Seq2SeqSRParser(nn.Module):
                 )
 
         if not candidates:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
 
         # Length-normalized scoring: dividing cumulative sum log-prob by
         # length**alpha mitigates the systematic bias toward shorter
@@ -1067,10 +1068,9 @@ class Seq2SeqSRParser(nn.Module):
         # monotonically favors fewer-token = fewer-EDU trajectories).
         # alpha=0.6 is the GNMT default (alpha=1.0 is mean log-prob, also
         # defensible, 0.6 is the standard mitigation).
-        length_penalty_alpha = 0.6
         best = max(
             candidates,
-            key=lambda c: c["score"] / max(c["length"], 1) ** length_penalty_alpha,
+            key=lambda c: c["score"] / max(c["length"], 1) ** BEAM_LENGTH_PENALTY_ALPHA,
         )
         if not best.get("finished", False):
             warn(
@@ -1096,12 +1096,12 @@ class Seq2SeqSRParser(nn.Module):
         self.eval()
         device = self.device
 
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         # Re-derive the gold EDU spans in source-id space from the same
         # whole-doc tokenization the encoder will see. Duplicates the small
         # helper in train_seq2seq_sr.py rather than importing across files
         # (and keeps this path runnable without the trainer being loaded).
-        gold_ranges = _gold_edu_source_ranges(self.tokenizer, tree)
+        gold_ranges = gold_edu_source_ranges(self.tokenizer, tree)
 
         enc = self.tokenizer(
             text,
@@ -1125,7 +1125,7 @@ class Seq2SeqSRParser(nn.Module):
         source_ids = ids
         source_len = len(source_ids)
         if not source_ids:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
 
         # Clamp gold ranges to the (possibly truncated) source length. An EDU
         # whose start fell beyond truncation is dropped. One straddling the
@@ -1136,7 +1136,7 @@ class Seq2SeqSRParser(nn.Module):
                 break
             clamped_ranges.append((s, min(e, source_len)))
         if not clamped_ranges:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
         edu_ends = [end for _, end in clamped_ranges]  # exclusive ends
         n_edus = len(edu_ends)
 
@@ -1184,6 +1184,11 @@ class Seq2SeqSRParser(nn.Module):
                 if more_edus and st.cursor < current_end:
                     # Inside the current gold EDU: force COPY.
                     masked[self.copy_head_idx] = logits[self.copy_head_idx]
+                elif more_edus and st.cursor == current_end and st.edu_length == 0:
+                    # Empty-span gold EDU (shorter than a subword): commit it
+                    # immediately so edu_idx advances instead of drifting COPY
+                    # across the boundary.
+                    masked[self.shift_head_idx] = logits[self.shift_head_idx]
                 elif more_edus and st.cursor == current_end and st.edu_length > 0:
                     # Reached the boundary with content buffered: force SHIFT.
                     masked[self.shift_head_idx] = logits[self.shift_head_idx]
@@ -1250,7 +1255,7 @@ class Seq2SeqSRParser(nn.Module):
     def predict(self, tree: RstTree, *, num_beams: int | None = None) -> RstTree:
         """Reconstruct document text from the gold tree's EDUs, then parse
         end-to-end. The parser does not consume gold EDU boundaries."""
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         return self.predict_from_text(text, num_beams=num_beams)
 
     @torch.no_grad()
@@ -1260,9 +1265,10 @@ class Seq2SeqSRParser(nn.Module):
         *,
         num_beams: int | None = None,
     ) -> list[RstTree]:
-        """Batched analogue of `predict(tree)`. Reconstructs document text
-        per tree, then runs a single batched `generate()`."""
-        texts = [_reconstruct_text(t) for t in trees]
+        """Batched analogue of `predict(tree)`. Reconstructs document text per
+        tree, then dispatches through `predict_batch_from_texts` (batched greedy
+        masked-argmax loop, or per-example beam search when num_beams > 1)."""
+        texts = [reconstruct_text(t) for t in trees]
         return self.predict_batch_from_texts(texts, num_beams=num_beams)
 
     def _tree_from_action_sequence(self, action_ids: list[int], source_ids: list[int]) -> RstTree:
@@ -1299,96 +1305,23 @@ class Seq2SeqSRParser(nn.Module):
                 strings.append(self.tokenizer.convert_ids_to_tokens(tok))
         flush_source()
 
-        actions, malformed_reason = self._repair_actions(strings)
+        actions, malformed_reason = repair_actions(strings, self.reduce_token_map)
         if malformed_reason is not None:
             warn(
                 f"Malformed decoder output ({malformed_reason}), falling back to "
                 f"single-EDU tree. Likely an undertrained model or max_output_length too low."
             )
             full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
-            return _empty_tree(self.config.relation_types, text=full_text)
-        return RstTree.from_shift_reduce(actions, relation_types=self.config.relation_types)
-
-    def _repair_actions(self, strings: list[str]) -> tuple[list[ShiftReduceAction], str | None]:
-        """Try `strings_to_actions` on the raw string list. If trailing
-        source tokens are present, append a closing `<shift>` and the right
-        number of fallback reduces to drain the stack. Returns the action
-        list plus a reason if the sequence had to be repaired, None if it
-        parsed cleanly."""
+            return empty_tree(self.config.relation_types, text=full_text)
         try:
-            actions = strings_to_actions(strings, self.reduce_token_map)
-        except ValueError:
-            # Trailing source tokens: append a closing <shift>, then we'll
-            # check stack-size against the resulting Shift count and add
-            # reduces below.
-            repaired = list(strings) + [Shift().to_token()]
-            try:
-                actions = strings_to_actions(repaired, self.reduce_token_map)
-            except ValueError as e:
-                return [], str(e)
-            # Need to drain the stack. Add NS-elaboration-ish fallback reduces.
-            n_shifts = sum(1 for a in actions if isinstance(a, Shift))
-            n_reduces = sum(1 for a in actions if isinstance(a, Reduce))
-            needed = (n_shifts - 1) - n_reduces
-            if needed > 0:
-                fallback = self._fallback_reduce()
-                if fallback is None:
-                    return actions, "no fallback reduce token available"
-                actions = list(actions) + [fallback] * needed
-            return actions, "max_length hit mid-EDU, appended closing shift/reduces"
-        # No exception: still need to verify shift/reduce balance.
-        n_shifts = sum(1 for a in actions if isinstance(a, Shift))
-        n_reduces = sum(1 for a in actions if isinstance(a, Reduce))
-        if n_shifts == 0:
-            return actions, "no shifts in generated sequence"
-        if n_reduces != n_shifts - 1:
-            needed = (n_shifts - 1) - n_reduces
-            if needed < 0:
-                return actions, f"too many reduces ({n_reduces}) for {n_shifts} shifts"
-            fallback = self._fallback_reduce()
-            if fallback is None:
-                return actions, "stack underdrained and no fallback reduce available"
-            return list(actions) + [fallback] * needed, "stack underdrained, appended closing reduces"
-        return actions, None
-
-    def _fallback_reduce(self) -> "Reduce | None":
-        """A Reduce action we can use to close an unfinished tree. Prefers
-        NS-elaboration if available, falls back to the first reduce in the
-        vocabulary."""
-        for token_str, (nuc, rel) in self.reduce_token_map.items():
-            if (nuc, rel) == ("NS", "elaboration"):
-                return Reduce(nuc=nuc, rel=rel)
-        for token_str, (nuc, rel) in self.reduce_token_map.items():
-            return Reduce(nuc=nuc, rel=rel)
-        return None
-
-
-def _reconstruct_text(tree: RstTree) -> str:
-    """Reverse the storage convention: join EDU strings with spaces (or
-    each EDU's `prefix` field if populated, for detokenized corpora)."""
-    parts: list[str] = []
-    for i, edu in enumerate(tree.edus):
-        if i == 0:
-            parts.append(edu.text)
-            continue
-        prefix = edu.prefix if edu.prefix is not None else " "
-        parts.append(prefix + edu.text)
-    return "".join(parts)
-
-
-def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
-    """Per-EDU `(start, end_exclusive)` token-position ranges in the encoder's
-    whole-doc tokenization space, tiling it exactly. Mirrors
-    `_gold_edu_token_mapping` in train_seq2seq_sr.py (both via
-    `align_edus_to_tokens`), duplicated so the predict path doesn't pull the
-    trainer into module-load."""
-    text = _reconstruct_text(tree)
-    _, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
-    return spans
-
-
-def _empty_tree(relation_types, text: str = "") -> RstTree:
-    # Single-EDU fallback for empty / unrecoverable input. The text payload
-    # becomes one EDU so downstream callers (to_rs4_string, eval) work.
-    actions: list[ShiftReduceAction] = [Shift(edu_text=text or "")]
-    return RstTree.from_shift_reduce(actions, relation_types=relation_types)
+            return RstTree.from_shift_reduce(actions, relation_types=self.config.relation_types)
+        except Exception as e:
+            # A balanced (repaired) action sequence can still build a
+            # pathologically deep tree from an undertrained model's over-
+            # segmented output, blowing Python's recursion limit in
+            # binarize_tree. Real trees are shallow (GUM maxes ~235 EDUs); only
+            # untrusted model output hits this, so degrade on ANY failure,
+            # matching the sexp parsers' _tree_from_emitted.
+            warn(f"Unbuildable shift-reduce tree ({type(e).__name__}: {e}). Falling back to single-EDU tree.")
+            full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
+            return empty_tree(self.config.relation_types, text=full_text)

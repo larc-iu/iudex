@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from iudex.rst.data.reader import determine_label_index
 from iudex.rst.data.tree import RstTree
+from iudex.rst.parsers.common.biaffine import DeepBiAffine
 from iudex.rst.parsers.common.encoding import (
     encode_tokens_strided,
     load_encoder_and_tokenizer,
@@ -84,43 +85,6 @@ class _SpanPooler(nn.Module):
             weights = weights / seg_sum[token_to_edu]
             pooled = embeddings.new_zeros(n_edus, H).index_add_(0, token_to_edu, weights.unsqueeze(-1) * embeddings)
         return self.reduce(self.dropout(torch.cat([first, last, pooled], dim=-1)))
-
-
-class _FeedForward(nn.Sequential):
-    """Linear → GELU → Dropout → Linear."""
-
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float):
-        super().__init__(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-
-class _DeepBiAffine(nn.Module):
-    """Deep biaffine scorer (Dozat & Manning) over (left, right) span reprs.
-
-    Args:
-        h_left:  [num_candidates, input_dim]
-        h_right: [num_candidates, input_dim]
-
-    Returns:
-        scores: [num_candidates, output_dim]
-    """
-
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout: float, bias: bool = True):
-        super().__init__()
-        self.W_left = _FeedForward(input_dim, hidden_dim, hidden_dim, dropout)
-        self.W_right = _FeedForward(input_dim, hidden_dim, hidden_dim, dropout)
-        self.W_s = nn.Bilinear(hidden_dim, hidden_dim, output_dim, bias=bias)
-        self.V_left = nn.Linear(hidden_dim, output_dim)
-        self.V_right = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, h_left: torch.Tensor, h_right: torch.Tensor) -> torch.Tensor:
-        h_left = self.W_left(h_left)
-        h_right = self.W_right(h_right)
-        return self.W_s(h_left, h_right) + self.V_left(h_left) + self.V_right(h_right)
 
 
 def _sinusoidal_pe(length: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -311,7 +275,7 @@ class PiudottoParser(nn.Module):
         H = self.encoder.config.hidden_size
         self.encoder_dropout = nn.Dropout(config.encoder_dropout)
         self.span_pooler = _SpanPooler(H, config.span_pooling, config.encoder_dropout)
-        self.label_scorer = _DeepBiAffine(
+        self.label_scorer = DeepBiAffine(
             H,
             config.classifier_hidden_size,
             len(self.label_index),
@@ -338,7 +302,7 @@ class PiudottoParser(nn.Module):
             self.pointer_key_norm = nn.LayerNorm(H)
             self._pointer_scale = H**0.5
         else:
-            self.split_scorer = _DeepBiAffine(
+            self.split_scorer = DeepBiAffine(
                 H, config.classifier_hidden_size, 1, config.classifier_dropout, bias=config.classifier_use_bias
             )
             self.tree_decoder = None

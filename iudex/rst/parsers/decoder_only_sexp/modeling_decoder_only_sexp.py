@@ -35,7 +35,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.common.seqgen import align_edus_to_tokens, reorder_past_key_values
+from iudex.rst.parsers.common.seqgen import (
+    BEAM_LENGTH_PENALTY_ALPHA,
+    align_edus_to_tokens,
+    gold_edu_source_ranges,
+    reconstruct_text,
+    reorder_past_key_values,
+)
 from iudex.rst.parsers.common.sexp_constraints import (
     FORCE_CONTENT,
     GoldEduForcer,
@@ -256,11 +262,6 @@ class DecoderOnlySexpParser(nn.Module):
             self.register_buffer(
                 "_structural_token_ids_buf",
                 torch.tensor(structural_head_ids, dtype=torch.long),
-                persistent=False,
-            )
-            self.register_buffer(
-                "_label_head_ids_buf",
-                torch.tensor(sorted(self.label_head_indices), dtype=torch.long),
                 persistent=False,
             )
         else:
@@ -519,7 +520,7 @@ class DecoderOnlySexpParser(nn.Module):
         """Tokenize the reconstructed doc text once. Return (source_ids,
         per-EDU subword id lists) via the shared tiling helper, whose spans
         partition source_ids exactly (no gaps/overlaps)."""
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         source_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
         edu_subword_ids = [list(source_ids[s:e]) for s, e in spans]
         return source_ids, edu_subword_ids
@@ -1013,10 +1014,9 @@ class DecoderOnlySexpParser(nn.Module):
         if not candidates:
             return _empty_tree(self.config.relation_types)
 
-        length_penalty_alpha = 0.6
         best = max(
             candidates,
-            key=lambda c: c["score"] / max(c["length"], 1) ** length_penalty_alpha,
+            key=lambda c: c["score"] / max(c["length"], 1) ** BEAM_LENGTH_PENALTY_ALPHA,
         )
         if not best.get("finished", False):
             warn(
@@ -1057,8 +1057,8 @@ class DecoderOnlySexpParser(nn.Module):
         device = self.device
         eos_id = int(self.tokenizer.eos_token_id)
 
-        text = _reconstruct_text(tree)
-        gold_ranges = _gold_edu_source_ranges(self.tokenizer, tree)
+        text = reconstruct_text(tree)
+        gold_ranges = gold_edu_source_ranges(self.tokenizer, tree)
         source_ids = self._tokenize_source(text)
         if not source_ids:
             return _empty_tree(self.config.relation_types)
@@ -1184,12 +1184,12 @@ class DecoderOnlySexpParser(nn.Module):
 
     @torch.no_grad()
     def predict(self, tree: RstTree, *, num_beams: int | None = None) -> RstTree:
-        text = _reconstruct_text(tree)
+        text = reconstruct_text(tree)
         return self.predict_from_text(text, num_beams=num_beams)
 
     @torch.no_grad()
     def predict_batch(self, trees: list[RstTree], *, num_beams: int | None = None) -> list[RstTree]:
-        texts = [_reconstruct_text(t) for t in trees]
+        texts = [reconstruct_text(t) for t in trees]
         return self.predict_batch_from_texts(texts, num_beams=num_beams)
 
     # -----------------------------------------------------------------
@@ -1251,23 +1251,6 @@ class DecoderOnlySexpParser(nn.Module):
             # single-EDU fallback's edu count and downstream eval would skip).
             tree._from_sexp_failed = True  # type: ignore[attr-defined]
             return tree
-
-
-def _reconstruct_text(tree: RstTree) -> str:
-    parts: list[str] = []
-    for i, edu in enumerate(tree.edus):
-        if i == 0:
-            parts.append(edu.text)
-            continue
-        prefix = edu.prefix if edu.prefix is not None else " "
-        parts.append(prefix + edu.text)
-    return "".join(parts)
-
-
-def _gold_edu_source_ranges(tokenizer, tree: RstTree) -> list[tuple[int, int]]:
-    text = _reconstruct_text(tree)
-    _, spans = align_edus_to_tokens(tokenizer, text, tree.edus)
-    return spans
 
 
 def _empty_tree(relation_types, text: str = "") -> RstTree:

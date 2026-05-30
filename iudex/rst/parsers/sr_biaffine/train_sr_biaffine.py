@@ -2,7 +2,6 @@ import argparse
 import dataclasses
 import json
 import logging
-import math
 import os
 import random
 import time
@@ -23,20 +22,19 @@ from iudex.common.training import (
     make_scheduler,
     model_panel,
     prepare_run_dir,
+    resume_or_init,
     save_checkpoint,
     schedule_panel,
     set_seeds,
-    try_resume,
     weight_decay_panel,
     write_run_config,
 )
 from iudex.rst import HASH_EXCLUDE
 from iudex.rst.data.metrics import evaluate_parseval, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
-from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
 from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.piudotto.configuration_piudotto import PiudottoConfig
-from iudex.rst.parsers.piudotto.modeling_piudotto import PiudottoParser
+from iudex.rst.parsers.sr_biaffine.configuration_sr_biaffine import SRBiaffineConfig
+from iudex.rst.parsers.sr_biaffine.modeling_sr_biaffine import SRBiaffineParser
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -50,58 +48,25 @@ def _write_rs4(tree: RstTree, output_dir: str, basename: str) -> None:
 
 @torch.no_grad()
 def _evaluate_on_dev(
-    model: PiudottoParser,
+    model: SRBiaffineParser,
     dev_pairs: list[tuple[str, RstTree]],
     output_dir: str | None = None,
 ) -> dict[str, float]:
-    """Run the model over `dev_pairs` and aggregate Parseval (+ seg + e2e when
-    joint segmentation is on). One encoder pass per tree via `predict_both`."""
-    use_seg = model.segmenter is not None
+    """Run the model over `dev_pairs` and aggregate gold-EDU Parseval.
+    No segmentation, this parser assumes gold EDUs."""
     gold_trees: list[RstTree] = []
     gold_preds: list[RstTree] = []
-    seg_data: list[dict] | None = [] if use_seg else None
     for filepath, gold in dev_pairs:
-        basename = os.path.splitext(os.path.basename(filepath))[0] + ".rs4"
         gold_trees.append(gold)
-        if not use_seg:
-            pred = model.predict(gold)
-            gold_preds.append(pred)
-            if output_dir is not None:
-                _write_rs4(pred, output_dir, basename)
-            continue
-        both = model.predict_both(gold)
-        gold_preds.append(both["gold_pred"])
-        seg_data.append(
-            {
-                k: both[k]
-                for k in (
-                    "gold_edu_ends",
-                    "pred_edu_ends",
-                    "e2e_pred",
-                    "gold_edu_mapping",
-                    "pred_edu_mapping",
-                )
-            }
-        )
+        pred = model.predict(gold)
+        gold_preds.append(pred)
         if output_dir is not None:
-            _write_rs4(both["gold_pred"], os.path.join(output_dir, "gold"), basename)
-            if both["e2e_pred"] is not None:
-                _write_rs4(both["e2e_pred"], os.path.join(output_dir, "e2e"), basename)
-    metrics = evaluate_parseval(gold_trees, gold_preds)
-    if seg_data is not None:
-        metrics.update(evaluate_seg_and_e2e(gold_trees, seg_data))
-    if output_dir is not None:
-        console.print(f"[dim]Wrote {len(dev_pairs)} predictions under[/dim] [path]{os.path.abspath(output_dir)}[/path]")
-    return metrics
+            basename = os.path.splitext(os.path.basename(filepath))[0] + ".rs4"
+            _write_rs4(pred, output_dir, basename)
+    return evaluate_parseval(gold_trees, gold_preds)
 
 
-def train(cfg: PiudottoConfig) -> None:
-    """Full training loop with EMA-based loss weighting (see `_EMAConfig`).
-
-    The trainer combines the model's `split_loss`, `label_loss` and (when
-    `cfg.segmentation` is non-null) `seg_loss` with weights that adapt to each
-    component's recent rate of decrease, recomputed at every optimizer step.
-    """
+def train(cfg: SRBiaffineConfig) -> None:
     set_seeds(cfg.seed)
 
     run_dir, cfg_hash = prepare_run_dir(
@@ -126,7 +91,7 @@ def train(cfg: PiudottoConfig) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = cfg.amp and device.type == "cuda"
-    model = PiudottoParser(cfg, compile_encoder=True).to(device)
+    model = SRBiaffineParser(cfg, compile_encoder=True).to(device)
     train_trees = [
         t for _, t in read_rst_dir(cfg.train_dir, relation_types=cfg.relation_types, relation_map=cfg.relation_map)
     ]
@@ -163,32 +128,11 @@ def train(cfg: PiudottoConfig) -> None:
     console.print(weight_decay_panel(model, optimizer))
     scheduler = make_scheduler(optimizer, warmup, total_steps)
 
-    # EMA-based loss-weighting state. `ema_loss[k]` is a running per-component
-    # mean (initialized to None and seeded from the first step's loss).
-    components = ["split", "label"] + (["seg"] if cfg.segmentation is not None else [])
-    ema_loss: dict[str, float | None] = {k: None for k in components}
-    curr_sums = {k: 0.0 for k in components}
-    weights = {k: 1.0 for k in components}
-
-    checkpoint = try_resume(os.path.join(run_dir, "last.pt"), expected_hash=cfg_hash)
-    if checkpoint is None:
-        global_step, start_epoch, best_val, stale = 0, 0, -1.0, 0
-    else:
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        global_step = checkpoint["global_step"]
-        start_epoch = checkpoint["epoch"]
-        best_val = checkpoint.get("best_val", -1.0)
-        stale = checkpoint.get("stale_validations", 0)
-        loaded_ema = checkpoint.get("ema_loss")
-        loaded_weights = checkpoint.get("ema_weights")
-        if loaded_ema is not None and isinstance(loaded_ema, dict):
-            ema_loss = {k: loaded_ema.get(k) for k in components}
-        if loaded_weights is not None and isinstance(loaded_weights, dict):
-            weights = {k: float(loaded_weights.get(k, 1.0)) for k in components}
-        if loaded_ema is None and loaded_weights is None:
-            dim("  EMA state missing in checkpoint; restarting from cold EMA")
+    state = resume_or_init(run_dir, model=model, optimizer=optimizer, scheduler=scheduler, expected_hash=cfg_hash)
+    global_step = state["global_step"]
+    start_epoch = state["epoch"]
+    best_val = state["best_val"]
+    stale = state["stale_validations"]
 
     def _save(path: str, epoch: int) -> None:
         save_checkpoint(
@@ -198,13 +142,11 @@ def train(cfg: PiudottoConfig) -> None:
             scheduler,
             config=cfg_dict,
             config_hash=cfg_hash,
-            parser_kind="piudotto",
+            parser_kind="sr_biaffine",
             global_step=global_step,
             epoch=epoch,
             best_val=best_val,
             stale_validations=stale,
-            ema_loss=dict(ema_loss),
-            ema_weights=dict(weights),
         )
 
     def _validate(epoch: int) -> None:
@@ -261,13 +203,10 @@ def train(cfg: PiudottoConfig) -> None:
 
             for tree_idx, tree in enumerate(trees):
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-                    out = model(tree)
-                loss = sum(weights[k] * out[f"{k}_loss"] for k in components)
+                    loss = model(tree)["loss"]
                 if cfg.grad_accum > 1:
                     loss = loss / cfg.grad_accum
                 loss.backward()
-                for k in components:
-                    curr_sums[k] += out[f"{k}_loss"].item()
                 raw_loss = loss.item() * (cfg.grad_accum if cfg.grad_accum > 1 else 1)
                 recent_losses.append(raw_loss)
                 total_loss += raw_loss
@@ -283,28 +222,6 @@ def train(cfg: PiudottoConfig) -> None:
                 scheduler.step()
                 global_step += 1
                 epoch_step += 1
-
-                # EMA weighting. Compare this step's loss to the per-component
-                # EMA baseline; then update the EMA for the next step.
-                if cfg.ema is not None:
-                    if all(ema_loss[k] is not None for k in components):
-                        temperature = cfg.ema.temperature
-                        num_components = len(components)
-                        # Floor the denominator at 1e-3 (not 1e-8): a zero-loss
-                        # EMA shouldn't produce an enormous ratio that swamps
-                        # the softmax even after the max-subtract trick.
-                        exp_args = {k: (curr_sums[k] / max(ema_loss[k], 1e-3)) / temperature for k in components}
-                        max_arg = max(exp_args.values())
-                        expw = {k: math.exp(exp_args[k] - max_arg) for k in components}
-                        norm = sum(expw.values())
-                        weights = {k: num_components * expw[k] / norm for k in components}
-                    momentum = cfg.ema.momentum
-                    for k in components:
-                        if ema_loss[k] is None:
-                            ema_loss[k] = curr_sums[k]
-                        else:
-                            ema_loss[k] = momentum * ema_loss[k] + (1 - momentum) * curr_sums[k]
-                curr_sums = {k: 0.0 for k in components}
 
                 avg_loss = sum(recent_losses) / len(recent_losses)
                 lr_display = "/".join(f"{lr:.1e}" for lr in sorted(set(scheduler.get_last_lr())))
@@ -324,23 +241,13 @@ def train(cfg: PiudottoConfig) -> None:
                     tb_train = {"loss": avg_loss, "lr": max(scheduler.get_last_lr()), "grad_norm": float(grad_norm)}
                     if mem:
                         tb_train["gpu_mem_gb"] = mem[1]
-                    if cfg.ema is not None:
-                        for k in components:
-                            if ema_loss[k] is not None:
-                                tb_train[f"loss_{k}"] = ema_loss[k]
-                            tb_train[f"weight_{k}"] = weights[k]
                     tb.log_scalars("train", tb_train, global_step)
                     mem_log = f"  mem=[dim]{mem[1]:.1f}GB[/dim]" if mem else ""
-                    w_log = (
-                        "  w=[dim]" + "/".join(f"{weights[k]:.2f}" for k in components) + "[/dim]"
-                        if cfg.ema is not None
-                        else ""
-                    )
                     progress.console.print(
                         f"  [step]step {epoch_step}/{steps_per_epoch}[/step]  "
                         f"loss=[loss]{avg_loss:.4f}[/loss]  "
                         f"grad=[dim]{grad_norm:.4f}[/dim]  "
-                        f"lr=[dim]{lr_display}[/dim]{w_log}{mem_log}"
+                        f"lr=[dim]{lr_display}[/dim]{mem_log}"
                     )
 
                 if cfg.validate_every and global_step % cfg.validate_every == 0:
@@ -401,10 +308,10 @@ def train(cfg: PiudottoConfig) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train the piudotto parser")
+    parser = argparse.ArgumentParser(description="Train the sr_biaffine parser")
     parser.add_argument("config", help="Path to a jsonnet config file")
     args = parser.parse_args()
-    cfg = PiudottoConfig.from_dict(Params.from_file(args.config).as_dict(quiet=True))
+    cfg = SRBiaffineConfig.from_dict(Params.from_file(args.config).as_dict(quiet=True))
     train(cfg)
 
 

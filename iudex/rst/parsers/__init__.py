@@ -46,6 +46,14 @@ PARSERS: dict[str, ParserSpec] = {
         supports_text=False,
         signature_field="ffn_hidden_size",
     ),
+    "sr_biaffine": ParserSpec(
+        name="sr_biaffine",
+        package="iudex.rst.parsers.sr_biaffine",
+        config_cls="SRBiaffineConfig",
+        parser_cls="SRBiaffineParser",
+        supports_text=False,
+        signature_field="action_ffn_hidden_size",
+    ),
     "dmrst": ParserSpec(
         name="dmrst",
         package="iudex.rst.parsers.dmrst",

@@ -198,6 +198,7 @@ def train(cfg: DMRSTConfig) -> None:
             scheduler,
             config=cfg_dict,
             config_hash=cfg_hash,
+            parser_kind="dmrst",
             global_step=global_step,
             epoch=epoch,
             best_val=best_val,

@@ -21,10 +21,9 @@ from iudex.rst.data.tree import (
 from iudex.rst.parsers.decoder_only_sexp.configuration_decoder_only_sexp import (
     DecoderOnlySexpConfig,
 )
+from iudex.rst.parsers.common.seqgen import gold_edu_source_ranges, reconstruct_text
 from iudex.rst.parsers.decoder_only_sexp.modeling_decoder_only_sexp import (
     DecoderOnlySexpParser,
-    _gold_edu_source_ranges,
-    _reconstruct_text,
 )
 
 SMALL_CAUSAL = os.environ.get("IUDEX_TEST_CAUSAL_MODEL", "hf-internal-testing/tiny-random-Gemma3ForCausalLM")
@@ -80,7 +79,7 @@ def test_encode_target_lengths_and_layout(parser):
     input_ids, labels = enc
     assert len(input_ids) == len(labels)
 
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     source_ids = parser.tokenizer(text, add_special_tokens=False).input_ids
     bos_id = parser.tokenizer.bos_token_id
     assert input_ids[0] == bos_id
@@ -102,7 +101,7 @@ def test_encode_target_roundtrips_to_tree(parser):
     `RstTree.from_sexp` recovers a structurally-equal tree."""
     tree = _toy_tree()
     input_ids, labels = parser.encode_target(tree)
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     source_ids = parser.tokenizer(text, add_special_tokens=False).input_ids
     prefix_len = 1 + len(source_ids)
     eos_id = parser.tokenizer.eos_token_id
@@ -223,7 +222,7 @@ def test_use_copy_false_predicts_source_ids(traversal_order):
     backbone choosing OPEN at the right slot."""
     parser = _build_parser(traversal_order, use_copy=False)
     tree = _toy_tree()
-    text = _reconstruct_text(tree)
+    text = reconstruct_text(tree)
     source_ids = parser.tokenizer(text, add_special_tokens=False).input_ids
     # Gold-EDU forcing returns a tree but the internal emitted-id sequence is
     # opaque. Re-run a piece of the forcing flow via `predict_with_gold_edus`
@@ -260,7 +259,7 @@ def test_predict_with_gold_edus_opens_exactly_n_edus_on_untrained_backbone(trave
     randomly-initialized backbone."""
     parser = _build_parser(traversal_order, use_copy=True)
     tree = _toy_tree_3edu()
-    gold_ranges = _gold_edu_source_ranges(parser.tokenizer, tree)
+    gold_ranges = gold_edu_source_ranges(parser.tokenizer, tree)
     assert len(gold_ranges) == 3
 
     pred = parser.predict_with_gold_edus(tree)
