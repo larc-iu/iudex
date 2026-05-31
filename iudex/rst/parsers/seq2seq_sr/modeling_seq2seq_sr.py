@@ -84,12 +84,16 @@ class Seq2SeqSRParser(nn.Module):
         # memory and decouples input (full vocab) from output (action vocab).
         if config.relation_types is not None:
             self._install_action_head()
-            # Carve the newly-added action-token rows out of the resized
-            # embedding into a small trainable Parameter, freeze the base
-            # matrix, and splice the two at lookup time. Only the ~100 new
-            # rows train. We never materialize a full trainable copy or a
-            # dense full-vocab gradient.
-            self._carve_new_token_embeddings()
+            # Train only the newly-added action-token embedding rows: keep the
+            # full embedding trainable but zero the gradient on pretrained rows
+            # via a backward hook. Deliberately does NOT reach into the model's
+            # forward (an earlier "carve" scheme spliced a small trainable
+            # Parameter into a monkey-patched embedding forward to save the
+            # full-vocab gradient, but that silently dropped backbone-specific
+            # embedding behavior, e.g. T5Gemma2's sqrt(hidden) scaling, and
+            # regressed quality). The ~1 GB transient full-vocab gradient is the
+            # price of not depending on the backbone's embedding internals.
+            self._mask_old_embedding_gradients()
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -136,10 +140,11 @@ class Seq2SeqSRParser(nn.Module):
         """Wrap `self.model` in a PeftModel with LoRA adapters. The input
         embedding is NOT handed to PEFT `modules_to_save`: PEFT would keep a
         frozen original copy plus a full trainable copy of the vocab x hidden
-        matrix (~600 MB each at 1B scale) only to train ~100 new rows. We
-        instead freeze the base embedding and train a small new-rows
-        Parameter (`_carve_new_token_embeddings`). The lm_head is likewise
-        out of `modules_to_save` (replaced wholesale by a small fresh head)."""
+        matrix (~600 MB each at 1B scale) and de-tie the encoder/decoder
+        embeddings. We instead keep the single tied embedding trainable and
+        zero pretrained-row gradients (`_mask_old_embedding_gradients`). The
+        lm_head is likewise out of `modules_to_save` (replaced wholesale by a
+        small fresh head)."""
         from peft import LoraConfig, TaskType, get_peft_model
 
         lora_cfg = LoraConfig(
@@ -333,55 +338,38 @@ class Seq2SeqSRParser(nn.Module):
             m = m.model
         return m
 
-    def _carve_new_token_embeddings(self) -> None:
-        """Carve the action-token rows out of the resized input embedding into
-        a small trainable `self.new_token_embeddings` Parameter, freeze the
-        base matrix, and splice the two at lookup time.
+    def _mask_old_embedding_gradients(self) -> None:
+        """Train only the newly-added action-token embedding rows.
 
-        After `resize_token_embeddings` the embedding is `vocab x hidden`
-        (~600 MB bf16 at 1B scale) but only the ~100 new rows ever need to
-        train. The old modules_to_save scheme paid for a frozen copy, a full
-        trainable copy, and a dense (99.96%-zeroed) full-vocab gradient. Here
-        the base weight stays frozen (`requires_grad=False`, no duplicate)
-        and only `new_token_embeddings` (n_new x hidden, ~0.2 MB) carries
-        gradient. The patched forward does a two-lookup splice:
-          old ids (< n_old) -> frozen base, new ids (>= n_old) -> small param.
-        Gradient flows only to `new_token_embeddings`, the base weight's
-        `.grad` stays None.
+        Keep the full `vocab x hidden` input embedding trainable, but register a
+        backward hook that zeroes the gradient on the pretrained rows
+        `[0, n_old)`, so only the new rows update. This is deliberately the
+        whole mechanism: it never overrides the embedding module's `forward`, so
+        it inherits any backbone-specific behavior baked into that forward (e.g.
+        Gemma-family `sqrt(hidden)` scaling) for free. The cost is a dense
+        full-vocab gradient (~1 GB bf16 at 1B scale, transient); Adafactor's
+        factored optimizer state for the matrix is negligible.
 
-        T5/T5Gemma 2 tie encoder + decoder input embeddings (one weight, one
-        `nn.Embedding` object aliased under several names), so patching every
-        `nn.Embedding` whose weight shares the input-embedding storage covers
-        both sides with one Parameter. Untied backbones expose distinct
-        objects sharing the same storage, both get patched.
+        Encoder/decoder input embeddings are tied (one storage), so making the
+        single weight trainable + hooking it covers both sides.
         """
         n_old = int(self._original_vocab_size)
         embed = self._underlying_model().get_input_embeddings()
-        full_weight = embed.weight
-        n_total = full_weight.shape[0]
+        weight = embed.weight
+        n_total = weight.shape[0]
         if n_total <= n_old:
             return
+        weight.requires_grad_(True)
 
-        self.new_token_embeddings = nn.Parameter(full_weight.data[n_old:].clone())
-        full_weight.requires_grad_(False)
-        self._embed_n_old = n_old
+        def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
+            grad = grad.clone()
+            grad[:n_old] = 0
+            return grad
 
-        target_ptr = full_weight.data_ptr()
-        new_param = self.new_token_embeddings
-
-        def _spliced_embedding_forward(input_ids: torch.Tensor) -> torch.Tensor:
-            base = F.embedding(input_ids.clamp(max=n_old - 1), full_weight)
-            new = F.embedding((input_ids - n_old).clamp(min=0), new_param)
-            return torch.where((input_ids >= n_old).unsqueeze(-1), new, base)
-
-        patched = 0
-        for mod in self.model.modules():
-            if isinstance(mod, nn.Embedding) and mod.weight.data_ptr() == target_ptr:
-                mod.forward = _spliced_embedding_forward
-                patched += 1
+        weight.register_hook(_zero_old_rows)
         logger.info(
-            f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
-            f"(base {n_total}x{full_weight.shape[1]} frozen). Patched {patched} embedding lookup(s)."
+            f"Full {n_total}x{weight.shape[1]} input embedding trainable; gradient zeroed on rows "
+            f"[0, {n_old}) so only the {n_total - n_old} new action-token rows update."
         )
 
     @property
