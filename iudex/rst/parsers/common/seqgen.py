@@ -38,6 +38,44 @@ from iudex.rst.data.tree import (
 BEAM_LENGTH_PENALTY_ALPHA = 0.6
 
 
+def mask_old_embedding_gradients(underlying_model: Any, n_old: int) -> tuple[int, int] | None:
+    """Train only the newly-added (id >= n_old) input-embedding rows: keep the
+    full embedding trainable and register a backward hook zeroing the gradient
+    on the pretrained rows [0, n_old). Shared by the four generative parsers,
+    which all add ~100 action tokens via `resize_token_embeddings` and must
+    train only those rows.
+
+    Crucially this never overrides the embedding module's `forward`, so any
+    backbone-specific behavior baked into that forward is preserved. Notably the
+    Gemma family (Gemma, T5Gemma, ...) wraps the lookup in a `*ScaledWordEmbedding`
+    that multiplies by sqrt(hidden). An earlier "carve" scheme monkey-patched the
+    forward to splice a small trainable Parameter for the new rows, which
+    silently dropped that scaling (every input embedding ~34-48x too small) and
+    badly regressed quality on Gemma backbones (invisible on vanilla T5, which
+    has no scaling). The cost of this approach is a dense full-vocab gradient
+    (~1 GB bf16 at 1B scale, transient); Adafactor's factored optimizer state
+    stays negligible.
+
+    `underlying_model` is the PEFT-unwrapped HF model (exposing
+    `get_input_embeddings()`). Encoder/decoder input embeddings are tied (one
+    storage), so hooking the single weight covers both sides. Returns
+    `(n_total, n_new)` for the caller to log, or None when there are no new rows.
+    """
+    weight = underlying_model.get_input_embeddings().weight
+    n_total = weight.shape[0]
+    if n_total <= n_old:
+        return None
+    weight.requires_grad_(True)
+
+    def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
+        grad = grad.clone()
+        grad[:n_old] = 0
+        return grad
+
+    weight.register_hook(_zero_old_rows)
+    return n_total, n_total - n_old
+
+
 def align_edus_to_tokens(
     tokenizer: Any,
     text: str,

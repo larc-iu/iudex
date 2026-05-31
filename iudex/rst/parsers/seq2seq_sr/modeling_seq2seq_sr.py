@@ -33,6 +33,7 @@ from iudex.rst.parsers.common.seqgen import (
     align_edus_to_tokens,
     empty_tree,
     gold_edu_source_ranges,
+    mask_old_embedding_gradients,
     reconstruct_text,
     reorder_past_key_values,
     repair_actions,
@@ -84,16 +85,18 @@ class Seq2SeqSRParser(nn.Module):
         # memory and decouples input (full vocab) from output (action vocab).
         if config.relation_types is not None:
             self._install_action_head()
-            # Train only the newly-added action-token embedding rows: keep the
-            # full embedding trainable but zero the gradient on pretrained rows
-            # via a backward hook. Deliberately does NOT reach into the model's
-            # forward (an earlier "carve" scheme spliced a small trainable
-            # Parameter into a monkey-patched embedding forward to save the
-            # full-vocab gradient, but that silently dropped backbone-specific
-            # embedding behavior, e.g. T5Gemma2's sqrt(hidden) scaling, and
-            # regressed quality). The ~1 GB transient full-vocab gradient is the
-            # price of not depending on the backbone's embedding internals.
-            self._mask_old_embedding_gradients()
+            # Train only the newly-added action-token embedding rows via the
+            # shared gradient-mask helper (keeps the full embedding trainable,
+            # zeroes pretrained-row gradients, never overrides the embedding
+            # forward, so backbone-specific behavior like Gemma scaling is
+            # preserved). See `mask_old_embedding_gradients`.
+            masked = mask_old_embedding_gradients(self._underlying_model(), self._original_vocab_size)
+            if masked is not None:
+                n_total, n_new = masked
+                logger.info(
+                    f"Full {n_total}-row input embedding trainable; gradient zeroed on pretrained "
+                    f"rows so only the {n_new} new action-token rows update."
+                )
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -142,9 +145,9 @@ class Seq2SeqSRParser(nn.Module):
         frozen original copy plus a full trainable copy of the vocab x hidden
         matrix (~600 MB each at 1B scale) and de-tie the encoder/decoder
         embeddings. We instead keep the single tied embedding trainable and
-        zero pretrained-row gradients (`_mask_old_embedding_gradients`). The
-        lm_head is likewise out of `modules_to_save` (replaced wholesale by a
-        small fresh head)."""
+        zero pretrained-row gradients (`seqgen.mask_old_embedding_gradients`).
+        The lm_head is likewise out of `modules_to_save` (replaced wholesale by
+        a small fresh head)."""
         from peft import LoraConfig, TaskType, get_peft_model
 
         lora_cfg = LoraConfig(
@@ -337,40 +340,6 @@ class Seq2SeqSRParser(nn.Module):
         if hasattr(m, "model") and not isinstance(m, nn.ModuleList):
             m = m.model
         return m
-
-    def _mask_old_embedding_gradients(self) -> None:
-        """Train only the newly-added action-token embedding rows.
-
-        Keep the full `vocab x hidden` input embedding trainable, but register a
-        backward hook that zeroes the gradient on the pretrained rows
-        `[0, n_old)`, so only the new rows update. This is deliberately the
-        whole mechanism: it never overrides the embedding module's `forward`, so
-        it inherits any backbone-specific behavior baked into that forward (e.g.
-        Gemma-family `sqrt(hidden)` scaling) for free. The cost is a dense
-        full-vocab gradient (~1 GB bf16 at 1B scale, transient); Adafactor's
-        factored optimizer state for the matrix is negligible.
-
-        Encoder/decoder input embeddings are tied (one storage), so making the
-        single weight trainable + hooking it covers both sides.
-        """
-        n_old = int(self._original_vocab_size)
-        embed = self._underlying_model().get_input_embeddings()
-        weight = embed.weight
-        n_total = weight.shape[0]
-        if n_total <= n_old:
-            return
-        weight.requires_grad_(True)
-
-        def _zero_old_rows(grad: torch.Tensor) -> torch.Tensor:
-            grad = grad.clone()
-            grad[:n_old] = 0
-            return grad
-
-        weight.register_hook(_zero_old_rows)
-        logger.info(
-            f"Full {n_total}x{weight.shape[1]} input embedding trainable; gradient zeroed on rows "
-            f"[0, {n_old}) so only the {n_total - n_old} new action-token rows update."
-        )
 
     @property
     def device(self):

@@ -35,6 +35,7 @@ from iudex.rst.parsers.common.seqgen import (
     align_edus_to_tokens,
     empty_tree,
     gold_edu_source_ranges,
+    mask_old_embedding_gradients,
     reconstruct_text,
     reorder_past_key_values,
     repair_actions,
@@ -84,9 +85,18 @@ class DecoderOnlySRParser(nn.Module):
 
         if config.relation_types is not None:
             self._install_action_head()
-            # Freeze the base input embedding and train only a small new-rows
-            # Parameter (see `_carve_new_token_embeddings`).
-            self._carve_new_token_embeddings()
+            # Train only the newly-added (SEP + action) token embedding rows via
+            # the shared gradient-mask helper (keeps the full embedding trainable,
+            # zeroes pretrained-row gradients, never overrides the embedding
+            # forward, so backbone-specific behavior like Gemma scaling is
+            # preserved). See `mask_old_embedding_gradients`.
+            masked = mask_old_embedding_gradients(self._underlying_model(), self._original_vocab_size)
+            if masked is not None:
+                n_total, n_new = masked
+                logger.info(
+                    f"Full {n_total}-row input embedding trainable; gradient zeroed on pretrained "
+                    f"rows so only the {n_new} new action-token rows update."
+                )
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -114,8 +124,8 @@ class DecoderOnlySRParser(nn.Module):
     def _install_peft(self, peft_cfg) -> None:
         """Wrap `self.model` in LoRA adapters. The input embedding is NOT in
         PEFT `modules_to_save` (that would duplicate the vocab x hidden matrix
-        to train ~100 new rows). We freeze the base and train a small new-rows
-        Parameter instead (`_carve_new_token_embeddings`)."""
+        to train ~100 new rows). We keep the single embedding trainable and
+        zero pretrained-row gradients instead (`mask_old_embedding_gradients`)."""
         from peft import LoraConfig, TaskType, get_peft_model
 
         lora_cfg = LoraConfig(
@@ -281,42 +291,6 @@ class DecoderOnlySRParser(nn.Module):
             if hasattr(m, "model") and not isinstance(m, nn.ModuleList):
                 m = m.model
         return m
-
-    def _carve_new_token_embeddings(self) -> None:
-        """Carve the new (SEP + action) token rows out of the resized input
-        embedding into a small trainable `self.new_token_embeddings`
-        Parameter, freeze the base matrix, and splice the two at lookup time.
-        See `Seq2SeqSRParser._carve_new_token_embeddings` for the full
-        rationale. Gradient flows only to `new_token_embeddings`. The frozen
-        base weight's `.grad` stays None."""
-        n_old = int(self._original_vocab_size)
-        embed = self._underlying_model().get_input_embeddings()
-        full_weight = embed.weight
-        n_total = full_weight.shape[0]
-        if n_total <= n_old:
-            return
-
-        self.new_token_embeddings = nn.Parameter(full_weight.data[n_old:].clone())
-        full_weight.requires_grad_(False)
-        self._embed_n_old = n_old
-
-        target_ptr = full_weight.data_ptr()
-        new_param = self.new_token_embeddings
-
-        def _spliced_embedding_forward(input_ids: torch.Tensor) -> torch.Tensor:
-            base = F.embedding(input_ids.clamp(max=n_old - 1), full_weight)
-            new = F.embedding((input_ids - n_old).clamp(min=0), new_param)
-            return torch.where((input_ids >= n_old).unsqueeze(-1), new, base)
-
-        patched = 0
-        for mod in self.model.modules():
-            if isinstance(mod, nn.Embedding) and mod.weight.data_ptr() == target_ptr:
-                mod.forward = _spliced_embedding_forward
-                patched += 1
-        logger.info(
-            f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
-            f"(base {n_total}x{full_weight.shape[1]} frozen). Patched {patched} embedding lookup(s)."
-        )
 
     @property
     def device(self):

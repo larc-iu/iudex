@@ -10,8 +10,8 @@ class _PeftConfig(FromParams):
     """LoRA fine-tuning of the causal LM. Mirrors `DecoderOnlySRConfig._PeftConfig`.
 
     Under `use_copy=True` the lm_head is replaced with a small fresh head and
-    the input embedding freezes its base + trains a small new-rows Parameter
-    (`_carve_new_token_embeddings`); `modules_to_save` /
+    the input embedding stays fully trainable with pretrained-row gradients
+    zeroed (`seqgen.mask_old_embedding_gradients`). `modules_to_save` /
     `train_only_new_embedding_rows` have no effect.
 
     Under `use_copy=False` the full pretrained tied lm_head is kept (source

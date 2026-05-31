@@ -13,7 +13,7 @@ class _PeftConfig(FromParams):
     the action vocab. The input embedding is kept fully trainable with a
     backward hook zeroing the pretrained rows' gradient, so only the new
     action-token rows update (see
-    `Seq2SeqSRParser._mask_old_embedding_gradients`).
+    `iudex.rst.parsers.common.seqgen.mask_old_embedding_gradients`).
     """
 
     r: int = 16

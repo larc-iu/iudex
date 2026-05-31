@@ -10,9 +10,9 @@ class _PeftConfig(FromParams):
     """LoRA fine-tuning of the seq2seq stack. Mirrors `Seq2SeqSRConfig._PeftConfig`.
 
     Under `use_copy=True` the lm_head is replaced with a small fresh Linear
-    over the action vocab and the input embedding freezes its base + trains a
-    small new-rows Parameter (`_carve_new_token_embeddings`). `modules_to_save`
-    / `train_only_new_embedding_rows` have no effect.
+    over the action vocab and the input embedding stays fully trainable with
+    pretrained-row gradients zeroed (`seqgen.mask_old_embedding_gradients`).
+    `modules_to_save` / `train_only_new_embedding_rows` have no effect.
 
     Under `use_copy=False` the full pretrained tied lm_head is kept (source
     subwords predicted natively), so `modules_to_save=['embed_tokens']` is

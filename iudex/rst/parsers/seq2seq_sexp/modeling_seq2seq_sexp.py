@@ -34,6 +34,7 @@ from iudex.rst.parsers.common.seqgen import (
     BEAM_LENGTH_PENALTY_ALPHA,
     align_edus_to_tokens,
     gold_edu_source_ranges,
+    mask_old_embedding_gradients,
     reconstruct_text,
     reorder_past_key_values,
 )
@@ -77,12 +78,21 @@ class Seq2SeqSexpParser(nn.Module):
 
         if config.relation_types is not None and config.use_copy:
             self._install_action_head()
-            # use_copy=True: small action head, so the input embedding can
-            # freeze its base and train only the new-token rows. use_copy=False
-            # keeps the full tied lm_head, which must train all embedding rows
-            # to score source ids, so we leave that path on the old PEFT
-            # modules_to_save scheme.
-            self._carve_new_token_embeddings()
+            # use_copy=True: small action head, so the input embedding keeps the
+            # full matrix trainable while the shared gradient-mask helper zeroes
+            # pretrained-row gradients (only the new structural/label rows
+            # update). It never overrides the embedding forward, so backbone-
+            # specific behavior like Gemma scaling is preserved. use_copy=False
+            # keeps the full tied lm_head, which must train all embedding rows to
+            # score source ids, so that path stays on the PEFT modules_to_save
+            # scheme. See `mask_old_embedding_gradients`.
+            masked = mask_old_embedding_gradients(self._underlying_model(), self._original_vocab_size)
+            if masked is not None:
+                n_total, n_new = masked
+                logger.info(
+                    f"Full {n_total}-row input embedding trainable; gradient zeroed on pretrained "
+                    f"rows so only the {n_new} new action-token rows update."
+                )
 
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -113,10 +123,10 @@ class Seq2SeqSexpParser(nn.Module):
 
     def _install_peft(self, peft_cfg) -> None:
         """Wrap in LoRA adapters. Under `use_copy=True` the input embedding is
-        kept OUT of PEFT modules_to_save (frozen base + small new-rows
-        Parameter via `_carve_new_token_embeddings`). Under `use_copy=False`
-        the full tied lm_head must learn source ids, so the embedding is
-        wrapped in modules_to_save and re-tied like before."""
+        kept OUT of PEFT modules_to_save (the single embedding stays trainable
+        with pretrained-row gradients zeroed via `mask_old_embedding_gradients`).
+        Under `use_copy=False` the full tied lm_head must learn source ids, so
+        the embedding is wrapped in modules_to_save and re-tied like before."""
         from peft import LoraConfig, TaskType, get_peft_model
 
         use_modules_to_save = not self.config.use_copy
@@ -318,44 +328,6 @@ class Seq2SeqSexpParser(nn.Module):
         if hasattr(m, "model") and not isinstance(m, nn.ModuleList):
             m = m.model
         return m
-
-    def _carve_new_token_embeddings(self) -> None:
-        """Carve the new (structural + label) token rows out of the resized
-        input embedding into a small trainable `self.new_token_embeddings`
-        Parameter, freeze the base matrix, and splice the two at lookup time.
-        Only called under `use_copy=True` (the small action head makes the
-        full embedding redundant on the output side). See
-        `Seq2SeqSRParser._carve_new_token_embeddings` for the full rationale.
-        Gradient flows only to `new_token_embeddings`. The frozen base
-        weight's `.grad` stays None."""
-        n_old = int(self._original_vocab_size)
-        embed = self._underlying_model().get_input_embeddings()
-        full_weight = embed.weight
-        n_total = full_weight.shape[0]
-        if n_total <= n_old:
-            return
-
-        self.new_token_embeddings = nn.Parameter(full_weight.data[n_old:].clone())
-        full_weight.requires_grad_(False)
-        self._embed_n_old = n_old
-
-        target_ptr = full_weight.data_ptr()
-        new_param = self.new_token_embeddings
-
-        def _spliced_embedding_forward(input_ids: torch.Tensor) -> torch.Tensor:
-            base = F.embedding(input_ids.clamp(max=n_old - 1), full_weight)
-            new = F.embedding((input_ids - n_old).clamp(min=0), new_param)
-            return torch.where((input_ids >= n_old).unsqueeze(-1), new, base)
-
-        patched = 0
-        for mod in self.model.modules():
-            if isinstance(mod, nn.Embedding) and mod.weight.data_ptr() == target_ptr:
-                mod.forward = _spliced_embedding_forward
-                patched += 1
-        logger.info(
-            f"Carved {n_total - n_old} new-token embedding rows into a trainable Parameter "
-            f"(base {n_total}x{full_weight.shape[1]} frozen). Patched {patched} embedding lookup(s)."
-        )
 
     @property
     def device(self):

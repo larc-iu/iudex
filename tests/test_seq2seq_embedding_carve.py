@@ -1,15 +1,17 @@
-"""Tests for the new-token embedding carve-out shared by the four seq2seq /
+"""Tests for the new-token embedding gradient mask shared by the four seq2seq /
 decoder-only RST parsers.
 
-The carve-out replaces the old PEFT `modules_to_save=['embed_tokens']` scheme
-(which kept a frozen copy plus a full trainable copy of the vocab x hidden
-matrix) with a frozen base embedding plus a small trainable
-`new_token_embeddings` Parameter holding only the newly-added action-token
-rows. These tests assert, per parser:
-  * trainable embedding params == n_new x hidden, not full vocab x hidden,
-    and the frozen base has requires_grad=False (test b);
-  * a forward+backward flows gradient to `new_token_embeddings` and the
-    frozen base weight's `.grad` stays None (test c);
+The mask (`seqgen.mask_old_embedding_gradients`) replaced an earlier "carve"
+scheme that froze the base embedding and trained a separate small Parameter,
+splicing the two via a monkey-patched embedding forward. That dropped any
+backbone-specific embedding behavior (notably Gemma's sqrt(hidden) scaling).
+The mask instead keeps the full embedding trainable and registers a backward
+hook zeroing gradient on the pretrained rows [0, n_old), so the embedding
+forward (and its scaling) is never overridden. These tests assert, per parser:
+  * the full vocab x hidden embedding stays trainable, there is no separate
+    `new_token_embeddings` Parameter, and no embedding rows are frozen (test b);
+  * a forward+backward leaves the pretrained-row gradient exactly zero while
+    the new action-token rows receive nonzero gradient (test c);
   * the checkpoint round-trip (state_dict save -> fresh Parser(cfg) ->
     load_state_dict(strict=True)) reproduces identical logits (test a).
 
@@ -157,40 +159,30 @@ def _reconstruct(parser):
 
 
 @pytest.mark.parametrize("name", list(PARSERS))
-def test_trainable_embedding_is_only_new_rows(name):
+def test_full_embedding_trainable_no_carved_param(name):
     parser_cls, cfg_fn = PARSERS[name]
     parser = _build(parser_cls, cfg_fn)
 
-    assert hasattr(parser, "new_token_embeddings")
-    new = parser.new_token_embeddings
-    n_old = parser._embed_n_old
-    hidden = parser._underlying_model().get_input_embeddings().weight.shape[1]
-    n_total = len(parser.tokenizer)
-    assert new.requires_grad
-    assert tuple(new.shape) == (n_total - n_old, hidden)
+    # The old carve scheme is gone: no separate new-rows Parameter, no
+    # frozen base matrix.
+    assert not hasattr(parser, "new_token_embeddings")
 
-    # The base embedding matrix is frozen.
     base_weight = parser._underlying_model().get_input_embeddings().weight
-    assert base_weight.requires_grad is False
+    n_total = len(parser.tokenizer)
     assert base_weight.shape[0] == n_total
-    # The only trainable params whose name carries embed/shared are the
-    # carved new-rows Parameter, never the full vocab x hidden matrix.
-    embed_trainable = [
-        (pn, p)
-        for pn, p in parser.named_parameters()
-        if p.requires_grad and ("embed" in pn.lower() or "shared" in pn.lower())
-    ]
-    assert all(p.numel() == (n_total - n_old) * hidden for _, p in embed_trainable), [
-        (pn, tuple(p.shape)) for pn, p in embed_trainable
-    ]
+    # The single embedding matrix is fully trainable (the mask zeroes
+    # pretrained-row gradients in the backward hook, not via requires_grad).
+    assert base_weight.requires_grad is True
 
 
 @pytest.mark.parametrize("name", list(PARSERS))
-def test_grad_flows_to_new_rows_only(name):
+def test_grad_zeroed_on_old_rows_nonzero_on_new(name):
     parser_cls, cfg_fn = PARSERS[name]
     parser = _build(parser_cls, cfg_fn)
     parser.train()
     parser.zero_grad(set_to_none=True)
+
+    n_old = parser._original_vocab_size
 
     batch = _make_batch(parser)
     out = parser(batch)
@@ -198,11 +190,14 @@ def test_grad_flows_to_new_rows_only(name):
     assert torch.isfinite(loss).item()
     loss.backward()
 
-    assert parser.new_token_embeddings.grad is not None
-    assert torch.isfinite(parser.new_token_embeddings.grad).all().item()
-    # The frozen base embedding never accumulates gradient.
     base_weight = parser._underlying_model().get_input_embeddings().weight
-    assert base_weight.grad is None
+    grad = base_weight.grad
+    assert grad is not None
+    assert torch.isfinite(grad).all().item()
+    # Pretrained rows [0, n_old) are zeroed by the backward hook.
+    assert grad[:n_old].abs().sum().item() == 0.0
+    # New action-token rows [n_old:] receive gradient.
+    assert grad[n_old:].abs().sum().item() > 0.0
 
 
 @pytest.mark.parametrize("name", list(PARSERS))
@@ -233,7 +228,9 @@ def test_checkpoint_roundtrip_identical_logits(name):
             ).logits
 
     state = parser.state_dict()
-    assert "new_token_embeddings" in state
+    # No carved Parameter: the full embedding lives in the state_dict under
+    # the backbone's own key, so the round-trip stays a plain strict load.
+    assert "new_token_embeddings" not in state
 
     fresh = parser_cls(cfg)
     fresh.load_state_dict(state, strict=True)

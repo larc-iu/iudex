@@ -10,9 +10,9 @@ class _PeftConfig(FromParams):
     """LoRA fine-tuning of the causal LM. Mirrors `Seq2SeqSRConfig._PeftConfig`.
 
     The lm_head is replaced at parser-init with a fresh, small Linear over
-    the action vocab. The input embedding freezes its pretrained base and
-    trains a small new-rows Parameter (see
-    `DecoderOnlySRParser._carve_new_token_embeddings`).
+    the action vocab. The input embedding stays fully trainable, with
+    pretrained-row gradients zeroed so only the new action-token rows update
+    (see `seqgen.mask_old_embedding_gradients`).
     """
 
     r: int = 16
@@ -22,8 +22,8 @@ class _PeftConfig(FromParams):
     bias: str = "none"
     dora: bool = False
     # No-ops, kept so existing jsonnets load. The input embedding is no longer
-    # routed through PEFT modules_to_save (frozen base + small new-rows
-    # Parameter instead), so neither field has any effect.
+    # routed through PEFT modules_to_save (the single matrix stays trainable
+    # with pretrained-row gradients zeroed instead), so neither field has any effect.
     modules_to_save: list[str] = field(default_factory=lambda: ["embed_tokens"])
     train_only_new_embedding_rows: bool = True
 
