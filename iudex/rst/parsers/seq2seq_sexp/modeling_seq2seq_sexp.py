@@ -290,6 +290,15 @@ class Seq2SeqSexpParser(nn.Module):
         def _warm_init(new_linear: nn.Linear) -> None:
             with torch.no_grad():
                 embed_weight = self._underlying_model().get_input_embeddings().weight
+                if embed_weight.shape[-1] != new_linear.weight.shape[-1]:
+                    # Asymmetric encoder/decoder backbones (e.g. t5gemma-9b-2b:
+                    # encoder embeddings are 3584-wide but the decoder lm_head
+                    # projects from 2304) make the tied input embeddings the
+                    # wrong width to copy into the head. Fall back to the same
+                    # N(0, 0.02) init the head would otherwise get for fresh
+                    # rows, rather than crashing on the dim mismatch.
+                    new_linear.weight.normal_(mean=0.0, std=0.02)
+                    return
                 for hi, full_id in enumerate(self.full_id_for_head_idx):
                     src = embed_weight[full_id].to(dtype=new_linear.weight.dtype, device=new_linear.weight.device)
                     new_linear.weight[hi].copy_(src)
