@@ -1,8 +1,11 @@
 __pycache__
 .idea
 /checkpoints
+/checkpoints_*
+/logs_*
 /data
 /icl_pilot
+/configs/_*
 *.swp
 *.pyc
 scratch.py
