@@ -5,9 +5,10 @@ either side). Given a query (the decoder state for the current span) and the
 span's n - 1 candidate split-anchor EDU representations as keys, this scores
 each candidate split.
 
-Factored here (rather than copied) because it's a self-contained `nn.Module`
-reused verbatim across parsers, the kind of thing we share at the second use:
-dmrst's recurrent pointer decoder and piudotto's Transformer pointer decoder.
+Lives here as a self-contained `nn.Module`. Used by dmrst's recurrent pointer
+decoder. It was shared with a second parser when factored out; that parser has
+since been removed, so it is currently dmrst-only but kept here in anticipation
+of a second pointer-decoding parser.
 """
 
 import torch

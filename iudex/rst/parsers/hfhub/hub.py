@@ -66,13 +66,6 @@ _PARSER_META: dict[str, dict[str, str]] = {
     },
     # iudex original (no external paper): the `else` branch of render_model_card
     # supplies the intro/citation, so no `paper_*` keys.
-    "piudotto": {
-        "human_name": "piudotto RST parser",
-        "module_path": "iudex.rst.parsers.piudotto.modeling_piudotto",
-        "class_name": "PiudottoParser",
-        "description": "an end-to-end span-based RST parser with joint EDU segmentation, biaffine span scoring, "
-        "and an optional Transformer pointer decoder, greedy top-down decoding",
-    },
     "seq2seq_sr": {
         "human_name": "seq2seq shift-reduce RST parser",
         "module_path": "iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr",
@@ -332,8 +325,8 @@ def render_model_card(
     encoder = config.get("model_name", "")
     train_dir = config.get("train_dir") or ""
 
-    # A parser exposes `predict_from_text` iff it `supports_text` AND, for the
-    # parsers gated on a `segmentation` sub-config (dmrst, piudotto), that
+    # A parser exposes `predict_from_text` iff it `supports_text` AND, for a
+    # parser gated on a `segmentation` sub-config (dmrst), that
     # sub-config is non-null. The generative parsers have no `segmentation`
     # field and always support text, so absence of the key means text-capable.
     spec = PARSERS.get(parser_kind)

@@ -14,8 +14,8 @@ Shared by several parsers:
 - `detokenization.py` — the `Detokenizer` abstraction.
 - `inference.py` / `predict_cli.py` — source/checkpoint resolution + the shared predict CLI.
 
-Encoder-based parsers (`dmrst`, `piudotto`, `topdown_biaffine`, `sr_biaffine`):
-- `segmentation.py` — the EDU-boundary `Segmenter` (piudotto, dmrst).
+Encoder-based parsers (`dmrst`, `topdown_biaffine`, `sr_biaffine`):
+- `segmentation.py` — the EDU-boundary `Segmenter` (dmrst).
 - `biaffine.py` — the `DeepBiAffine` span scorer (topdown_biaffine, sr_biaffine).
 - `pointer.py` — `PointerAttention` (dmrst).
 

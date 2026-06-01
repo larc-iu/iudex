@@ -4,8 +4,7 @@ Factored out of `topdown_biaffine` when `sr_biaffine` became its second user
 (per the "reusable nn.Module" carve-out in CLAUDE.md design choice #1). The
 topdown parser scores splits/labels over a span's left/right sub-spans; the
 shift-reduce parser scores reduce labels over the top two stack spans. Both
-want the same deep biaffine, so it lives here. piudotto is the third user (its
-label/split scorers, with an optional bias knob).
+want the same deep biaffine, so it lives here.
 """
 
 import torch.nn as nn
@@ -39,7 +38,7 @@ class DeepBiAffine(nn.Module):
         super().__init__()
         self.W_left = FeedForward(input_dim, hidden_dim, hidden_dim, dropout_p)
         self.W_right = FeedForward(input_dim, hidden_dim, hidden_dim, dropout_p)
-        # `bias` knob exists for piudotto's `classifier_use_bias`.
+        # `bias` toggles a bias term on the bilinear scorer.
         self.W_s = nn.Bilinear(hidden_dim, hidden_dim, output_dim, bias=bias)
         self.V_left = nn.Linear(hidden_dim, output_dim)
         self.V_right = nn.Linear(hidden_dim, output_dim)

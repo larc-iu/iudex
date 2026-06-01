@@ -62,14 +62,6 @@ PARSERS: dict[str, ParserSpec] = {
         supports_text=True,
         signature_field="attention_type",
     ),
-    "piudotto": ParserSpec(
-        name="piudotto",
-        package="iudex.rst.parsers.piudotto",
-        config_cls="PiudottoConfig",
-        parser_cls="PiudottoParser",
-        supports_text=True,
-        signature_field="span_pooling",
-    ),
     "seq2seq_sr": ParserSpec(
         name="seq2seq_sr",
         package="iudex.rst.parsers.seq2seq_sr",

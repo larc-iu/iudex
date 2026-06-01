@@ -22,7 +22,7 @@ pure, self-contained, and costly to keep in hand-sync across copies:
   `repair_actions` / `fallback_reduce`: the SR parsers' shared text-reconstruct,
   gold-range tiling, single-EDU fallback, and action-sequence repair logic.
 
-The encoder-based parsers (`dmrst`, `piudotto`, `topdown_biaffine`, `sr_biaffine`)
+The encoder-based parsers (`dmrst`, `topdown_biaffine`, `sr_biaffine`)
 do not use these; their shared token-encoding lives in `common/encoding.py`.
 
 This functional-helper layer (not inheritance) is the deliberate de-duplication

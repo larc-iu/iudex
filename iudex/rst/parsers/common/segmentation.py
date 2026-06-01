@@ -1,9 +1,9 @@
 """Shared scheme-based EDU-boundary segmenter (BIE / BO / EO, CRF or CE).
 
-Used by any parser that does joint EDU segmentation: piudotto by default, and
-dmrst when its `segmentation.scheme` is set. Factored here (rather than copied)
-because it's a self-contained `nn.Module` reused verbatim across parsers, the
-kind of thing we now share at the second use. The per-parser training loops, by
+Used by dmrst when its `segmentation.scheme` is set. It was shared with a second
+segmenting parser when factored out; that parser has since been removed, so it
+is currently dmrst-only but kept here as a self-contained `nn.Module` in
+anticipation of a second segmenting parser. The per-parser training loops, by
 contrast, stay duplicated for self-contained reading.
 """
 
