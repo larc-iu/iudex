@@ -1095,29 +1095,23 @@ class Seq2SeqSRParser(nn.Module):
                 more_edus = edu_idx < n_edus
                 current_end = edu_ends[edu_idx] if more_edus else source_len
 
-                if more_edus and st.cursor < current_end:
-                    # Inside the current gold EDU: force COPY.
+                if more_edus and st.edu_length > 0 and st.cursor < current_end:
+                    # Mid-EDU: must keep copying this EDU's subwords until its boundary.
                     masked[self.copy_head_idx] = logits[self.copy_head_idx]
-                elif more_edus and st.cursor == current_end and st.edu_length == 0:
-                    # Empty-span gold EDU (shorter than a subword): commit it
-                    # immediately so edu_idx advances instead of drifting COPY
-                    # across the boundary.
-                    masked[self.shift_head_idx] = logits[self.shift_head_idx]
-                elif more_edus and st.cursor == current_end and st.edu_length > 0:
-                    # Reached the boundary with content buffered: force SHIFT.
+                elif more_edus and st.cursor >= current_end:
+                    # Boundary reached (content buffered, or an empty-span EDU): commit via SHIFT.
                     masked[self.shift_head_idx] = logits[self.shift_head_idx]
                 else:
-                    # Between EDUs (just shifted, buffer empty) or all EDUs
-                    # exhausted. The model freely chooses REDUCE vs the next
-                    # structural step.
+                    # Buffer empty (EDU start, after a shift/reduce) or all EDUs
+                    # exhausted: the model freely chooses REDUCE vs. proceeding,
+                    # so reductions interleave with segmentation instead of all
+                    # deferring to the end.
                     if st.stack_size >= 2:
                         masked[self._reduce_head_ids_buf] = logits[self._reduce_head_ids_buf]
                     if more_edus:
-                        # Start of the next EDU: only COPY moves forward.
                         masked[self.copy_head_idx] = logits[self.copy_head_idx]
-                    else:
-                        if st.stack_size == 1:
-                            masked[self.eos_head_idx] = logits[self.eos_head_idx]
+                    elif st.stack_size == 1:
+                        masked[self.eos_head_idx] = logits[self.eos_head_idx]
 
                 head_idx = int(masked.argmax(-1).item())
                 full_id = self.full_id_for_head_idx[head_idx]
