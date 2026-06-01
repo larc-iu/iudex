@@ -10,3 +10,4 @@ CLAUDE.md
 .claude
 *.egg-info/
 dist/
+/scripts/icl/
