@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers.modeling_outputs import BaseModelOutput
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import (
@@ -39,6 +40,7 @@ from iudex.rst.parsers.common.seqgen import (
     reorder_past_key_values,
     repair_actions,
     select_best_beam,
+    warm_init_head,
 )
 from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
 
@@ -286,33 +288,6 @@ class Seq2SeqSRParser(nn.Module):
         # Locate the existing output projection. T5Gemma 2 wraps it inside a
         # `T5Gemma2LMHead` module with an `out_proj` Linear. mT5 / T5 expose
         # `lm_head` directly as the Linear.
-        # Warm-init each head row from the matching embed_tokens row. The
-        # original lm_head was tied to embed_tokens, so row `full_id` of
-        # embed_tokens is the "right" unembedding direction for token
-        # `full_id`. Copying those rows into our small head means the model
-        # starts already knowing which hidden direction maps to which token,
-        # skipping the first chunk of training that would otherwise just
-        # relearn that alignment. For action tokens whose embed row was
-        # freshly created by `resize_token_embeddings`, the row is itself
-        # randomly initialized, so this is no worse than the previous
-        # N(0, 0.02) init for those entries (and strictly better for
-        # pre-existing tokens like EOS).
-        def _warm_init(new_linear: nn.Linear) -> None:
-            with torch.no_grad():
-                embed_weight = self._underlying_model().get_input_embeddings().weight
-                if embed_weight.shape[-1] != new_linear.weight.shape[-1]:
-                    # Asymmetric encoder/decoder backbones (e.g. t5gemma-9b-2b:
-                    # encoder embeddings are 3584-wide but the decoder lm_head
-                    # projects from 2304) make the tied input embeddings the
-                    # wrong width to copy into the head. Fall back to the same
-                    # N(0, 0.02) init the head would otherwise get for fresh
-                    # rows, rather than crashing on the dim mismatch.
-                    new_linear.weight.normal_(mean=0.0, std=0.02)
-                    return
-                for hi, full_id in enumerate(self.full_id_for_head_idx):
-                    src = embed_weight[full_id].to(dtype=new_linear.weight.dtype, device=new_linear.weight.device)
-                    new_linear.weight[hi].copy_(src)
-
         if (
             hasattr(base, "lm_head")
             and hasattr(base.lm_head, "out_proj")
@@ -323,7 +298,7 @@ class Seq2SeqSRParser(nn.Module):
             new = nn.Linear(hidden, self.head_vocab_size, bias=False).to(
                 dtype=old.weight.dtype, device=old.weight.device
             )
-            _warm_init(new)
+            warm_init_head(new, self._underlying_model().get_input_embeddings().weight, self.full_id_for_head_idx)
             base.lm_head.out_proj = new
         elif hasattr(base, "lm_head") and isinstance(base.lm_head, nn.Linear):
             old = base.lm_head
@@ -331,7 +306,7 @@ class Seq2SeqSRParser(nn.Module):
             new = nn.Linear(hidden, self.head_vocab_size, bias=False).to(
                 dtype=old.weight.dtype, device=old.weight.device
             )
-            _warm_init(new)
+            warm_init_head(new, self._underlying_model().get_input_embeddings().weight, self.full_id_for_head_idx)
             base.lm_head = new
         else:
             raise RuntimeError(
@@ -344,7 +319,11 @@ class Seq2SeqSRParser(nn.Module):
         )
 
     def _underlying_model(self):
-        """Walk PEFT wrappers to reach the original HF model."""
+        """Walk PEFT wrappers to reach the original HF model (the one that owns
+        the embeddings + lm_head). Plain attribute-walking is safe on the
+        encoder-decoder backbone: unlike the causal sibling, its `base_model`
+        shortcut does not over-descend past the LM head, so no PEFT-module-origin
+        gate is needed (contrast `decoder_only_sr._underlying_model`)."""
         m = self.model
         if hasattr(m, "base_model"):
             m = m.base_model
@@ -483,7 +462,7 @@ class Seq2SeqSRParser(nn.Module):
         return metrics
 
     # -----------------------------------------------------------------
-    # Action-aware tokenization (used by both training and inference)
+    # Tokenization
     # -----------------------------------------------------------------
 
     def encode_input(self, text: str) -> dict[str, list[int]]:
@@ -587,8 +566,21 @@ class Seq2SeqSRParser(nn.Module):
         return label_ids, decoder_input_ids
 
     # -----------------------------------------------------------------
-    # Inference
+    # Greedy decoding
     # -----------------------------------------------------------------
+
+    def _strip_specials(self, ids: list[int]) -> list[int]:
+        """Strip a leading BOS and trailing EOS / pad from an encoded id list."""
+        pad_id = self.tokenizer.pad_token_id
+        eos_id = self.tokenizer.eos_token_id
+        bos_id = self.tokenizer.bos_token_id
+        while ids and ids[-1] == pad_id:
+            ids.pop()
+        if ids and ids[-1] == eos_id:
+            ids.pop()
+        if bos_id is not None and ids and ids[0] == bos_id:
+            ids = ids[1:]
+        return ids
 
     @torch.no_grad()
     def predict_from_text(self, text: str, *, num_beams: int | None = None) -> RstTree:
@@ -644,19 +636,12 @@ class Seq2SeqSRParser(nn.Module):
         # `encode_target` substitutes at training (per-EDU tokenization with
         # `add_special_tokens=False`). T5/mT5 add EOS at the tail. T5Gemma 2
         # prepends BOS at the head. Either or both can be present.
-        bos_id = self.tokenizer.bos_token_id
         per_row_source_ids: list[list[int]] = []
         empty_rows: list[int] = []
         for i in range(enc["input_ids"].shape[0]):
-            ids = enc["input_ids"][i].tolist()
-            while ids and ids[-1] == pad_id:
-                ids.pop()
-            if ids and ids[-1] == eos_id:
-                ids.pop()
-            if bos_id is not None and ids and ids[0] == bos_id:
-                ids = ids[1:]
+            ids = self._strip_specials(enc["input_ids"][i].tolist())
             full_len = len(self.tokenizer(texts[i], add_special_tokens=False).input_ids)
-            if full_len > self.config.max_input_length - 1:
+            if full_len > self.config.max_input_length - 1:  # -1 for the trailing EOS
                 warn(
                     f"Input truncated for batch row {i}: {full_len} -> ~"
                     f"{self.config.max_input_length} subwords. Bump max_input_length "
@@ -799,15 +784,13 @@ class Seq2SeqSRParser(nn.Module):
             # sequence and pred_edu_ranges stay consistent.
             if st.cursor > st.edu_start:
                 st.pred_edu_ranges.append((st.edu_start, st.cursor))
-            tree = self._tree_from_action_sequence(action_seqs[i], per_row_source_ids[i])
-            # Stash per-EDU source-position ranges on the tree so eval can
-            # use them without re-tokenizing (which drifts vs the encoder's
-            # whole-doc tokenization). Side-channel via a `_meta` attribute
-            # since RstTree doesn't natively carry this.
-            tree._pred_edu_source_ranges = st.pred_edu_ranges  # type: ignore[attr-defined]
-            tree._source_ids = per_row_source_ids[i]  # type: ignore[attr-defined]
+            tree = self._finalize_tree(action_seqs[i], per_row_source_ids[i], st.pred_edu_ranges)
             results.append(tree)
         return results
+
+    # -----------------------------------------------------------------
+    # Beam search
+    # -----------------------------------------------------------------
 
     @torch.no_grad()
     def _predict_one_beam(self, text: str, num_beams: int) -> RstTree:
@@ -826,7 +809,6 @@ class Seq2SeqSRParser(nn.Module):
         K = int(num_beams)
         pad_id = self.tokenizer.pad_token_id
         eos_id = self.tokenizer.eos_token_id
-        bos_id = self.tokenizer.bos_token_id
         decoder_start = self.decoder_start_token_id
         min_edu_len = max(1, int(self.config.min_edu_length))
 
@@ -840,15 +822,9 @@ class Seq2SeqSRParser(nn.Module):
         ).to(device)
 
         # Strip leading BOS + trailing pad / EOS to get the cursor stream.
-        ids = enc["input_ids"][0].tolist()
-        while ids and ids[-1] == pad_id:
-            ids.pop()
-        if ids and ids[-1] == eos_id:
-            ids.pop()
-        if bos_id is not None and ids and ids[0] == bos_id:
-            ids = ids[1:]
+        ids = self._strip_specials(enc["input_ids"][0].tolist())
         full_len = len(self.tokenizer(text, add_special_tokens=False).input_ids)
-        if full_len > self.config.max_input_length - 1:
+        if full_len > self.config.max_input_length - 1:  # -1 for the trailing EOS
             warn(
                 f"Input truncated (beam): {full_len} -> ~{self.config.max_input_length} subwords. "
                 f"Bump max_input_length."
@@ -864,8 +840,6 @@ class Seq2SeqSRParser(nn.Module):
             # Encoder pass, once for the single doc, then expand to K beams.
             encoder = self.model.get_encoder()
             enc_out = encoder(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], return_dict=True)
-            from transformers.modeling_outputs import BaseModelOutput
-
             expanded_hidden = enc_out.last_hidden_state.expand(K, -1, -1).contiguous()
             expanded_attn = enc["attention_mask"].expand(K, -1).contiguous()
             enc_out_K = BaseModelOutput(last_hidden_state=expanded_hidden)
@@ -1023,17 +997,20 @@ class Seq2SeqSRParser(nn.Module):
                 f"max_output_length={self.config.max_output_length} without EOS for any beam. "
                 f"Tree closed by best-effort repair."
             )
-        tree = self._tree_from_action_sequence(best["action_seq"], source_ids)
-        tree._pred_edu_source_ranges = best["pred_edu_ranges"]  # type: ignore[attr-defined]
-        tree._source_ids = source_ids  # type: ignore[attr-defined]
-        return tree
+        return self._finalize_tree(best["action_seq"], source_ids, best["pred_edu_ranges"])
+
+    # -----------------------------------------------------------------
+    # Gold-EDU forced decode
+    # -----------------------------------------------------------------
 
     @torch.no_grad()
     def predict_with_gold_edus(self, tree: RstTree) -> RstTree:
         """Greedy decode with gold EDU boundaries forced at the copy/shift
         positions. The model still freely chooses every `<reduce_*>`, so
         binarization + labeling stay model-driven, only segmentation is
-        supplied. Used by training-time eval when `cfg.eval_gold_edu`."""
+        supplied. Used by the trainer's final-eval path (gold-EDU eval is gated
+        by the `eval_gold_edu` parameter of `_evaluate_on_dev`, not a config
+        field)."""
         return self._predict_one_gold_edu(tree)
 
     @torch.no_grad()
@@ -1058,16 +1035,8 @@ class Seq2SeqSRParser(nn.Module):
 
         pad_id = self.tokenizer.pad_token_id
         eos_id = self.tokenizer.eos_token_id
-        bos_id = self.tokenizer.bos_token_id
 
-        ids = enc["input_ids"][0].tolist()
-        while ids and ids[-1] == pad_id:
-            ids.pop()
-        if ids and ids[-1] == eos_id:
-            ids.pop()
-        if bos_id is not None and ids and ids[0] == bos_id:
-            ids = ids[1:]
-        source_ids = ids
+        source_ids = self._strip_specials(enc["input_ids"][0].tolist())
         source_len = len(source_ids)
         if not source_ids:
             return empty_tree(self.config.relation_types)
@@ -1178,6 +1147,8 @@ class Seq2SeqSRParser(nn.Module):
                 new_step = torch.tensor([[next_input]], device=device, dtype=torch.long)
                 decoder_input_ids = torch.cat([decoder_input_ids, new_step], dim=1)
             else:
+                # for-else: the step loop ran to max_output_length without an
+                # EOS break, so we finalize whatever decoded so far.
                 hit_max_len = not st.done
         finally:
             if gc_active:
@@ -1191,10 +1162,7 @@ class Seq2SeqSRParser(nn.Module):
             )
         if st.cursor > st.edu_start:
             st.pred_edu_ranges.append((st.edu_start, st.cursor))
-        tree_out = self._tree_from_action_sequence(action_seq, source_ids)
-        tree_out._pred_edu_source_ranges = st.pred_edu_ranges  # type: ignore[attr-defined]
-        tree_out._source_ids = source_ids  # type: ignore[attr-defined]
-        return tree_out
+        return self._finalize_tree(action_seq, source_ids, st.pred_edu_ranges)
 
     @torch.no_grad()
     def predict(self, tree: RstTree, *, num_beams: int | None = None) -> RstTree:
@@ -1215,6 +1183,25 @@ class Seq2SeqSRParser(nn.Module):
         masked-argmax loop, or per-example beam search when num_beams > 1)."""
         texts = [reconstruct_text(t) for t in trees]
         return self.predict_batch_from_texts(texts, num_beams=num_beams)
+
+    # -----------------------------------------------------------------
+    # Tree reconstruction
+    # -----------------------------------------------------------------
+
+    def _finalize_tree(
+        self, action_ids: list[int], source_ids: list[int], pred_edu_ranges: list[tuple[int, int]]
+    ) -> RstTree:
+        """Build the tree from the emitted action sequence and stash the source
+        meta the dev eval reads off the tree: per-EDU source-position ranges
+        (`_pred_edu_source_ranges`, in the encoder's source-id token space, so
+        eval avoids a re-tokenize that would drift from the encoder's whole-doc
+        tokenization) and the raw `_source_ids`. Side-channel attributes because
+        `RstTree` doesn't natively carry them; the greedy, beam, and gold-EDU
+        decoders all funnel through here."""
+        tree = self._tree_from_action_sequence(action_ids, source_ids)
+        tree._pred_edu_source_ranges = pred_edu_ranges  # type: ignore[attr-defined]
+        tree._source_ids = source_ids  # type: ignore[attr-defined]
+        return tree
 
     def _tree_from_action_sequence(self, action_ids: list[int], source_ids: list[int]) -> RstTree:
         """Turn the model's emitted action sequence into an `RstTree`,

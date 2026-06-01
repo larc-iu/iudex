@@ -39,11 +39,13 @@ from iudex.rst.parsers.common.seqgen import (
     align_edus_to_tokens,
     beam_reorder_needed,
     beam_topk_step,
+    empty_tree,
     gold_edu_source_ranges,
     mask_old_embedding_gradients,
     reconstruct_text,
     reorder_past_key_values,
     select_best_beam,
+    warm_init_head,
 )
 from iudex.rst.parsers.common.sexp_constraints import (
     FORCE_CONTENT,
@@ -293,22 +295,6 @@ class DecoderOnlySexpParser(nn.Module):
         keeps the full vocab head because source subwords are scored too."""
         base = self._underlying_model()
 
-        def _warm_init(new_linear: nn.Linear) -> None:
-            with torch.no_grad():
-                embed_weight = self._underlying_model().get_input_embeddings().weight
-                if embed_weight.shape[-1] != new_linear.weight.shape[-1]:
-                    # Asymmetric encoder/decoder backbones (e.g. t5gemma-9b-2b:
-                    # encoder embeddings are 3584-wide but the decoder lm_head
-                    # projects from 2304) make the tied input embeddings the
-                    # wrong width to copy into the head. Fall back to the same
-                    # N(0, 0.02) init the head would otherwise get for fresh
-                    # rows, rather than crashing on the dim mismatch.
-                    new_linear.weight.normal_(mean=0.0, std=0.02)
-                    return
-                for hi, full_id in enumerate(self.full_id_for_head_idx):
-                    src = embed_weight[full_id].to(dtype=new_linear.weight.dtype, device=new_linear.weight.device)
-                    new_linear.weight[hi].copy_(src)
-
         if not hasattr(base, "lm_head"):
             raise RuntimeError(
                 f"Don't know how to replace lm_head on {type(base).__name__}. "
@@ -322,11 +308,15 @@ class DecoderOnlySexpParser(nn.Module):
             raise RuntimeError(f"lm_head on {type(base).__name__} has no `.weight` and no `.base_layer.weight`.")
         hidden = weight.shape[1]
         new = nn.Linear(hidden, self.head_vocab_size, bias=False).to(dtype=weight.dtype, device=weight.device)
-        _warm_init(new)
+        warm_init_head(new, self._underlying_model().get_input_embeddings().weight, self.full_id_for_head_idx)
         base.lm_head = new
         logger.info(f"Replaced lm_head with fresh Linear(hidden={hidden}, head_vocab_size={self.head_vocab_size}).")
 
     def _underlying_model(self):
+        """Walk PEFT wrappers to the underlying causal LM class (the one that
+        owns `lm_head`). Gates on PEFT module-origin rather than attribute
+        presence because HF's `base_model` shortcut would otherwise descend past
+        the LM head on no-PEFT setups (see `decoder_only_sr._underlying_model`)."""
         m = self.model
         if type(m).__module__.startswith("peft"):
             m = m.base_model
@@ -391,66 +381,41 @@ class DecoderOnlySexpParser(nn.Module):
         shifted_logits = logits[..., :-1, :].contiguous()
         shifted_labels = batch["labels"][..., 1:].contiguous()
 
+        labels_flat = shifted_labels.reshape(-1)
+        V = shifted_logits.size(-1)  # head_vocab_size (use_copy) or full vocab
+        logits_flat = shifted_logits.reshape(-1, V)
+
         if self.config.use_copy:
-            labels_flat = shifted_labels.reshape(-1)
             max_id = self._label_to_head_lookup.size(0) - 1
             in_range = (labels_flat >= 0) & (labels_flat <= max_id)
             clamped = labels_flat.clamp(min=0, max=max_id)
-            head_labels_flat = torch.where(
+            scored_labels_flat = torch.where(
                 in_range,
                 self._label_to_head_lookup[clamped],
                 torch.full_like(labels_flat, -100),
             )
-            base_loss = F.cross_entropy(
-                shifted_logits.reshape(-1, self.head_vocab_size).float(),
-                head_labels_flat,
-                ignore_index=-100,
-                label_smoothing=self.config.label_smoothing,
-            )
-            metrics: dict[str, torch.Tensor] = {"loss": base_loss}
+            structural_buf = self._structural_token_ids_buf
+        else:
+            # use_copy=False: full-vocab cross-entropy over the original lm_head.
+            # Source subwords at leaf-content positions are scored alongside the
+            # structural action positions (open/close/labels/eos/sep). Labels are
+            # already full-vocab ids; the structural buffer is in full-vocab ids.
+            scored_labels_flat = labels_flat
+            structural_buf = self._structural_full_ids_buf
 
-            valid_mask = head_labels_flat != -100
-            is_structural = torch.isin(head_labels_flat, self._structural_token_ids_buf) & valid_mask
-            n_total = int(valid_mask.sum().item())
-            n_structural = int(is_structural.sum().item())
-            n_copy = n_total - n_structural
-            if n_structural == 0 or n_copy == 0:
-                return metrics
-
-            structural_idx = is_structural.nonzero(as_tuple=True)[0]
-            logits_flat = shifted_logits.reshape(-1, self.head_vocab_size)
-            structural_logits = logits_flat.index_select(0, structural_idx).float()
-            structural_labels = head_labels_flat.index_select(0, structural_idx)
-            action_loss = F.cross_entropy(
-                structural_logits, structural_labels, label_smoothing=self.config.label_smoothing
-            )
-            with torch.no_grad():
-                copy_loss = (base_loss.detach() * n_total - action_loss.detach() * n_structural) / max(n_copy, 1)
-            metrics["action_loss"] = action_loss.detach()
-            metrics["copy_loss"] = copy_loss
-            metrics["n_action_tokens"] = torch.tensor(n_structural, dtype=torch.long)
-            w = self.config.action_loss_weight
-            if w != 1.0 and n_total > 0:
-                alpha = (w - 1.0) * n_structural / n_total
-                metrics["loss"] = base_loss + alpha * action_loss
-            return metrics
-
-        # use_copy=False: full-vocab cross-entropy over the original lm_head.
-        # Source subwords at leaf-content positions are scored alongside the
-        # structural action positions (open/close/labels/eos/sep).
-        vocab_size = shifted_logits.size(-1)
-        labels_flat = shifted_labels.reshape(-1)
-        logits_flat = shifted_logits.reshape(-1, vocab_size)
         base_loss = F.cross_entropy(
             logits_flat.float(),
-            labels_flat,
+            scored_labels_flat,
             ignore_index=-100,
             label_smoothing=self.config.label_smoothing,
         )
         metrics: dict[str, torch.Tensor] = {"loss": base_loss}
 
-        valid_mask = labels_flat != -100
-        is_structural = torch.isin(labels_flat, self._structural_full_ids_buf) & valid_mask
+        if structural_buf.numel() == 0:
+            return metrics
+
+        valid_mask = scored_labels_flat != -100
+        is_structural = torch.isin(scored_labels_flat, structural_buf) & valid_mask
         n_total = int(valid_mask.sum().item())
         n_structural = int(is_structural.sum().item())
         n_copy = n_total - n_structural
@@ -459,17 +424,21 @@ class DecoderOnlySexpParser(nn.Module):
 
         structural_idx = is_structural.nonzero(as_tuple=True)[0]
         structural_logits = logits_flat.index_select(0, structural_idx).float()
-        structural_labels = labels_flat.index_select(0, structural_idx)
+        structural_labels = scored_labels_flat.index_select(0, structural_idx)
         action_loss = F.cross_entropy(structural_logits, structural_labels, label_smoothing=self.config.label_smoothing)
+
         with torch.no_grad():
             copy_loss = (base_loss.detach() * n_total - action_loss.detach() * n_structural) / max(n_copy, 1)
+
         metrics["action_loss"] = action_loss.detach()
         metrics["copy_loss"] = copy_loss
         metrics["n_action_tokens"] = torch.tensor(n_structural, dtype=torch.long)
+
         w = self.config.action_loss_weight
         if w != 1.0 and n_total > 0:
             alpha = (w - 1.0) * n_structural / n_total
             metrics["loss"] = base_loss + alpha * action_loss
+
         return metrics
 
     # -----------------------------------------------------------------
@@ -627,7 +596,7 @@ class DecoderOnlySexpParser(nn.Module):
         return input_ids, labels
 
     # -----------------------------------------------------------------
-    # Constraint state
+    # Inference helpers
     # -----------------------------------------------------------------
 
     def _tokenizer_special_ids(self) -> frozenset[int]:
@@ -661,7 +630,7 @@ class DecoderOnlySexpParser(nn.Module):
         )
 
     # -----------------------------------------------------------------
-    # Inference
+    # Greedy decoding
     # -----------------------------------------------------------------
 
     @torch.no_grad()
@@ -698,43 +667,65 @@ class DecoderOnlySexpParser(nn.Module):
         which is resized in lockstep with the embeddings."""
         return len(self.tokenizer)
 
-    def _mask_logits_for_state(
-        self,
-        logits: torch.Tensor,
-        state: SexpDecodingState,
-    ) -> torch.Tensor:
-        """Mask logits to the SexpDecodingState's legal set. `logits` is a 1-D
-        tensor in the model's native scoring space: head-vocab when
-        `use_copy=True`, full vocab when `use_copy=False`. When the state
-        marks content as wildcarded (`use_copy=False, constrain_content=False`
-        inside a leaf or fresh frame), admit any non-structural id."""
+    def _mask_logits_for_state(self, state: SexpDecodingState, head_V: int) -> torch.Tensor:
+        """Boolean mask over the scoring vocab of legal actions at this state.
+        Same contract as `seq2seq_sexp._mask_logits_for_state`: callers apply it
+        via `torch.where(mask, logits, -inf)`.
+
+        `use_copy=True`: scoring vocab is the small action head, so map legal
+            full-vocab ids through `head_idx_for_full_id`.
+        `use_copy=False`: scoring vocab IS the full tokenizer vocab, legal
+            ids are used directly as positions in the mask. When the state
+            says content is wildcarded, admit any non-structural id.
+        """
         legal = state.legal_actions()
-        masked = torch.full_like(logits, float("-inf"))
+        mask = torch.zeros(head_V, dtype=torch.bool)
         if self.config.use_copy:
-            if not legal:
-                return masked
             for full_id in legal:
                 hi = self.head_idx_for_full_id.get(int(full_id))
                 if hi is not None:
-                    masked[hi] = logits[hi]
-            return masked
-        # use_copy=False path.
-        V = int(logits.size(-1))
+                    mask[hi] = True
+            return mask
+        for full_id in legal:
+            fid = int(full_id)
+            if 0 <= fid < head_V:
+                mask[fid] = True
         if state.content_is_wildcard():
-            masked.copy_(logits)
+            mask[:] = True
             for fid in state.structural_ids():
-                if 0 <= int(fid) < V:
-                    masked[int(fid)] = float("-inf")
+                if 0 <= int(fid) < head_V:
+                    mask[int(fid)] = False
+            # Re-enable explicitly-legal structural ids (e.g. close paren may
+            # be the lone structural legal here, we want it back in the mask).
             for full_id in legal:
                 fid = int(full_id)
-                if 0 <= fid < V:
-                    masked[fid] = logits[fid]
-            return masked
-        if not legal:
-            return masked
-        idx = torch.tensor(sorted(int(x) for x in legal), dtype=torch.long, device=logits.device)
-        masked[idx] = logits[idx]
-        return masked
+                if 0 <= fid < head_V:
+                    mask[fid] = True
+        return mask
+
+    def _narrowed_mask(self, narrowed, state: SexpDecodingState, base_mask: torch.Tensor) -> torch.Tensor:
+        """Materialize a GoldEduForcer narrowing onto the base legal mask (see
+        `GoldEduForcer.narrowed_legal` for the None | frozenset | FORCE_CONTENT
+        contract). None -> base_mask unchanged. FORCE_CONTENT -> content wildcard:
+        every scoring id except the structurals (CLOSE included, so the leaf
+        can't close before the gold target). Multi-element frozenset -> base_mask
+        intersected with those ids (mapped to scoring-vocab indices). A singleton
+        frozenset is a hard force handled by the caller before reaching here."""
+        V = base_mask.shape[-1]
+        if narrowed is FORCE_CONTENT:
+            mask = torch.ones(V, dtype=torch.bool)
+            for fid in state.structural_ids():
+                if 0 <= int(fid) < V:
+                    mask[int(fid)] = False
+            return mask
+        if isinstance(narrowed, frozenset):
+            keep = torch.zeros(V, dtype=torch.bool)
+            for fid in narrowed:
+                hi = self.head_idx_for_full_id.get(int(fid)) if self.config.use_copy else int(fid)
+                if hi is not None and 0 <= int(hi) < V:
+                    keep[int(hi)] = True
+            return base_mask & keep
+        return base_mask
 
     def _decode_full_id(self, head_idx: int) -> int:
         if self.config.use_copy:
@@ -749,9 +740,8 @@ class DecoderOnlySexpParser(nn.Module):
 
         source_ids = self._tokenize_source(text)
         if not source_ids:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
         prefix_ids = self._build_prefix_ids(source_ids)
-        source_len = len(source_ids)
         state = self._initial_state(source_ids)
 
         with self._inference_mode():
@@ -774,7 +764,8 @@ class DecoderOnlySexpParser(nn.Module):
 
             for step in range(self.config.max_output_length):
                 if self.config.use_validity_constraints:
-                    step_logits = self._mask_logits_for_state(logits, state)
+                    mask = self._mask_logits_for_state(state, int(logits.size(-1))).to(logits.device)
+                    step_logits = torch.where(mask, logits, torch.full_like(logits, float("-inf")))
                 else:
                     step_logits = logits
 
@@ -822,6 +813,8 @@ class DecoderOnlySexpParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[0, -1, :]
             else:
+                # for-else: the step loop ran to max_output_length without an
+                # EOS break, so we finalize whatever decoded so far.
                 hit_max_len = not done
 
         if hit_max_len:
@@ -830,14 +823,12 @@ class DecoderOnlySexpParser(nn.Module):
                 f"max_output_length={self.config.max_output_length} without EOS. "
                 f"Tree closed by best-effort repair."
             )
-        tree = self._tree_from_emitted(emitted_ids, source_ids)
         # Dedup adjacent identical ranges in case the loop double-counted.
-        clean_ranges = _dedup_ranges(pred_edu_ranges)
-        if getattr(tree, "_from_sexp_failed", False):
-            clean_ranges = []
-        tree._pred_edu_source_ranges = clean_ranges  # type: ignore[attr-defined]
-        tree._source_ids = source_ids  # type: ignore[attr-defined]
-        return tree
+        return self._finalize_tree(emitted_ids, source_ids, _dedup_ranges(pred_edu_ranges))
+
+    # -----------------------------------------------------------------
+    # Beam search
+    # -----------------------------------------------------------------
 
     @torch.no_grad()
     def _predict_one_beam(self, text: str, num_beams: int) -> RstTree:
@@ -848,9 +839,8 @@ class DecoderOnlySexpParser(nn.Module):
 
         source_ids = self._tokenize_source(text)
         if not source_ids:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
         prefix_ids = self._build_prefix_ids(source_ids)
-        source_len = len(source_ids)
         head_V = self.head_vocab_size if self.config.use_copy else self._vocab_size()
 
         with self._inference_mode():
@@ -883,7 +873,8 @@ class DecoderOnlySexpParser(nn.Module):
                 for j in range(K):
                     if done[j]:
                         continue
-                    masked[j] = self._mask_logits_for_state(logits[j], states[j])
+                    mask = self._mask_logits_for_state(states[j], logits.size(-1)).to(device)
+                    masked[j] = torch.where(mask, logits[j], torch.full_like(logits[j], float("-inf")))
 
                 top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, masked, K)
 
@@ -891,6 +882,10 @@ class DecoderOnlySexpParser(nn.Module):
                 if beam_reorder_needed(step, parent_of_new, K, past_key_values):
                     past_key_values = reorder_past_key_values(past_key_values, parent_tensor, self._underlying_model())
 
+                # No .clone() needed: SexpDecodingState is immutable, so
+                # .step() below returns a fresh state and sibling beams sharing
+                # a parent never mutate it (unlike the SR ShiftReduceDecodeState
+                # path, which clones because it mutates in place).
                 new_states = [states[p] for p in parent_of_new]
                 new_done = [done[p] for p in parent_of_new]
                 new_emitted = [list(emitted_seqs[p]) for p in parent_of_new]
@@ -983,7 +978,7 @@ class DecoderOnlySexpParser(nn.Module):
                 )
 
         if not candidates:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
 
         best = select_best_beam(candidates)
         if not best.get("finished", False):
@@ -992,13 +987,11 @@ class DecoderOnlySexpParser(nn.Module):
                 f"max_output_length={self.config.max_output_length} without EOS for any beam. "
                 f"Tree closed by best-effort repair."
             )
-        tree = self._tree_from_emitted(best["emitted"], source_ids)
-        pred_ranges = best["pred_edu_ranges"]
-        if getattr(tree, "_from_sexp_failed", False):
-            pred_ranges = []
-        tree._pred_edu_source_ranges = pred_ranges  # type: ignore[attr-defined]
-        tree._source_ids = source_ids  # type: ignore[attr-defined]
-        return tree
+        return self._finalize_tree(best["emitted"], source_ids, best["pred_edu_ranges"])
+
+    # -----------------------------------------------------------------
+    # Gold-EDU forced decode
+    # -----------------------------------------------------------------
 
     @torch.no_grad()
     def predict_with_gold_edus(self, tree: RstTree) -> RstTree:
@@ -1029,7 +1022,7 @@ class DecoderOnlySexpParser(nn.Module):
         gold_ranges = gold_edu_source_ranges(self.tokenizer, tree)
         source_ids = self._tokenize_source(text)
         if not source_ids:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
         source_len = len(source_ids)
         prefix_ids = self._build_prefix_ids(source_ids)
 
@@ -1039,7 +1032,7 @@ class DecoderOnlySexpParser(nn.Module):
                 break
             clamped_ranges.append((s, min(e, source_len)))
         if not clamped_ranges:
-            return _empty_tree(self.config.relation_types)
+            return empty_tree(self.config.relation_types)
         n_edus = len(clamped_ranges)
         forcer = GoldEduForcer(n_edus, clamped_ranges)
 
@@ -1065,32 +1058,12 @@ class DecoderOnlySexpParser(nn.Module):
 
             for step in range(self.config.max_output_length):
                 narrowed = forcer.narrowed_legal(state)
-                if narrowed is FORCE_CONTENT:
-                    # Admit ONLY the content wildcard: every scoring id except
-                    # the structurals. We do NOT re-enable any legal structural
-                    # (in particular CLOSE stays masked mid-leaf), so the model
-                    # is forced to emit a content token. FORCE_CONTENT only
-                    # arises under use_copy=False, so the scoring space is the
-                    # full vocab and ids map 1:1 (no head remap).
-                    masked = logits.clone()
-                    V = int(masked.size(-1))
-                    for fid in state.structural_ids():
-                        if 0 <= int(fid) < V:
-                            masked[int(fid)] = float("-inf")
-                    head_idx = int(masked.argmax(-1).item())
-                    full_id = self._decode_full_id(head_idx)
-                elif isinstance(narrowed, frozenset) and len(narrowed) == 1:
+                if isinstance(narrowed, frozenset) and len(narrowed) == 1:
                     full_id = int(next(iter(narrowed)))
                 else:
-                    masked = self._mask_logits_for_state(logits, state)
-                    if isinstance(narrowed, frozenset):
-                        V = int(masked.size(-1))
-                        keep = torch.full_like(masked, float("-inf"))
-                        for fid in narrowed:
-                            hi = self.head_idx_for_full_id.get(int(fid)) if self.config.use_copy else int(fid)
-                            if hi is not None and 0 <= int(hi) < V:
-                                keep[int(hi)] = masked[int(hi)]
-                        masked = keep
+                    base_mask = self._mask_logits_for_state(state, int(logits.size(-1))).to(logits.device)
+                    mask = self._narrowed_mask(narrowed, state, base_mask)
+                    masked = torch.where(mask, logits, torch.full_like(logits, float("-inf")))
                     head_idx = int(masked.argmax(-1).item())
                     full_id = self._decode_full_id(head_idx)
 
@@ -1134,6 +1107,8 @@ class DecoderOnlySexpParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[0, -1, :]
             else:
+                # for-else: the step loop ran to max_output_length without an
+                # EOS break, so we finalize whatever decoded so far.
                 hit_max_len = not done
 
         if hit_max_len:
@@ -1142,13 +1117,7 @@ class DecoderOnlySexpParser(nn.Module):
                 f"max_output_length={self.config.max_output_length} without EOS. "
                 f"Tree closed by best-effort repair."
             )
-        tree_out = self._tree_from_emitted(emitted_ids, source_ids)
-        pred_ranges = _dedup_ranges(pred_edu_ranges)
-        if getattr(tree_out, "_from_sexp_failed", False):
-            pred_ranges = []
-        tree_out._pred_edu_source_ranges = pred_ranges  # type: ignore[attr-defined]
-        tree_out._source_ids = source_ids  # type: ignore[attr-defined]
-        return tree_out
+        return self._finalize_tree(emitted_ids, source_ids, _dedup_ranges(pred_edu_ranges))
 
     @torch.no_grad()
     def predict(self, tree: RstTree, *, num_beams: int | None = None) -> RstTree:
@@ -1163,6 +1132,23 @@ class DecoderOnlySexpParser(nn.Module):
     # -----------------------------------------------------------------
     # Tree reconstruction
     # -----------------------------------------------------------------
+
+    def _finalize_tree(
+        self, emitted_ids: list[int], source_ids: list[int], pred_edu_ranges: list[tuple[int, int]]
+    ) -> RstTree:
+        """Build the tree from the emitted sexp ids and stash the source meta the
+        dev eval reads off the tree: per-EDU source-position ranges
+        (`_pred_edu_source_ranges`, in the model's source-id token space) and
+        the raw `_source_ids`. If `from_sexp` fell back to a degenerate tree
+        (`_from_sexp_failed`), the inline-tracked ranges are meaningless and are
+        nulled out. Side-channel attributes; greedy, beam, and gold-EDU all
+        funnel through here. Callers pass the ranges already tracked/deduped for
+        their path."""
+        tree = self._tree_from_emitted(emitted_ids, source_ids)
+        ranges = [] if getattr(tree, "_from_sexp_failed", False) else pred_edu_ranges
+        tree._pred_edu_source_ranges = ranges  # type: ignore[attr-defined]
+        tree._source_ids = source_ids  # type: ignore[attr-defined]
+        return tree
 
     def _tree_from_emitted(self, emitted_ids: list[int], source_ids: list[int]) -> RstTree:
         """Stringify the emitted action sequence and call `RstTree.from_sexp`.
@@ -1213,19 +1199,12 @@ class DecoderOnlySexpParser(nn.Module):
         except Exception as e:
             warn(f"Malformed sexp output ({type(e).__name__}: {e}). Falling back to single-EDU tree.")
             full_text = self.tokenizer.decode(source_ids, skip_special_tokens=True)
-            tree = _empty_tree(self.config.relation_types, text=full_text)
+            tree = empty_tree(self.config.relation_types, text=full_text)
             # Mark the fallback so callers null out `_pred_edu_source_ranges`
             # (otherwise the action-derived ranges wouldn't match the
             # single-EDU fallback's edu count and downstream eval would skip).
             tree._from_sexp_failed = True  # type: ignore[attr-defined]
             return tree
-
-
-def _empty_tree(relation_types, text: str = "") -> RstTree:
-    from iudex.rst.data.tree import RstNode
-
-    edu_nodes = [RstNode("1", "terminal", text or "")]
-    return RstTree(edu_nodes, [], relation_types=relation_types)
 
 
 def _dedup_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:

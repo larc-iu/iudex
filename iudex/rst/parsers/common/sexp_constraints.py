@@ -91,7 +91,6 @@ class _Frame:
     children_emitted: int = 0  # for internal nodes (0, 1, or 2)
     leaf_token_count: int = 0  # for leaf nodes
     label_emitted: bool = False  # for internal nodes
-    label_position_ok: bool = False  # has the slot where the label must go arrived?
 
 
 @dataclass(frozen=True)

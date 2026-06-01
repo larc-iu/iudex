@@ -41,6 +41,7 @@ from iudex.rst.parsers.common.seqgen import (
     reorder_past_key_values,
     repair_actions,
     select_best_beam,
+    warm_init_head,
 )
 from iudex.rst.data.tree import (
     Reduce,
@@ -242,32 +243,9 @@ class DecoderOnlySRParser(nn.Module):
         """Replace the model's lm_head (tied to embed_tokens for Gemma)
         with a small fresh `Linear(hidden -> head_vocab_size)`. Done AFTER
         PEFT wrap so any LoRA adapter PEFT attached to lm_head gets
-        discarded (we want this small head fully trainable, not LoRA).
-
-        Warm-init copies each head row from `embed_tokens[full_id]`. This
-        is only meaningfully informative for rows whose `full_id` was
-        already in the pretrained vocab (here that's EOS, every other
-        head row is for a token added via `resize_token_embeddings` and
-        therefore has a freshly-random embedding). For those new rows the
-        warm-init is effectively just re-randomization, but it's harmless
-        and the EOS case is worth keeping."""
+        discarded (we want this small head fully trainable, not LoRA). Rows
+        are warm-initialized from the tied embeddings via `warm_init_head`."""
         base = self._underlying_model()
-
-        def _warm_init(new_linear: nn.Linear) -> None:
-            with torch.no_grad():
-                embed_weight = self._underlying_model().get_input_embeddings().weight
-                if embed_weight.shape[-1] != new_linear.weight.shape[-1]:
-                    # Asymmetric encoder/decoder backbones (e.g. t5gemma-9b-2b:
-                    # encoder embeddings are 3584-wide but the decoder lm_head
-                    # projects from 2304) make the tied input embeddings the
-                    # wrong width to copy into the head. Fall back to the same
-                    # N(0, 0.02) init the head would otherwise get for fresh
-                    # rows, rather than crashing on the dim mismatch.
-                    new_linear.weight.normal_(mean=0.0, std=0.02)
-                    return
-                for hi, full_id in enumerate(self.full_id_for_head_idx):
-                    src = embed_weight[full_id].to(dtype=new_linear.weight.dtype, device=new_linear.weight.device)
-                    new_linear.weight[hi].copy_(src)
 
         if not hasattr(base, "lm_head"):
             raise RuntimeError(
@@ -283,7 +261,7 @@ class DecoderOnlySRParser(nn.Module):
             raise RuntimeError(f"lm_head on {type(base).__name__} has no `.weight` and no `.base_layer.weight`.")
         hidden = weight.shape[1]
         new = nn.Linear(hidden, self.head_vocab_size, bias=False).to(dtype=weight.dtype, device=weight.device)
-        _warm_init(new)
+        warm_init_head(new, self._underlying_model().get_input_embeddings().weight, self.full_id_for_head_idx)
         base.lm_head = new
         logger.info(f"Replaced lm_head with fresh Linear(hidden={hidden}, head_vocab_size={self.head_vocab_size}).")
 
@@ -524,7 +502,7 @@ class DecoderOnlySRParser(nn.Module):
         return input_ids, labels
 
     # -----------------------------------------------------------------
-    # Inference
+    # Greedy decoding
     # -----------------------------------------------------------------
 
     @torch.no_grad()
@@ -642,6 +620,8 @@ class DecoderOnlySRParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[0, -1, :]
             else:
+                # for-else: the step loop ran to max_output_length without an
+                # EOS break, so we finalize whatever decoded so far.
                 hit_max_len = not st.done
 
         if hit_max_len:
@@ -652,10 +632,11 @@ class DecoderOnlySRParser(nn.Module):
             )
         if st.cursor > st.edu_start:
             st.pred_edu_ranges.append((st.edu_start, st.cursor))
-        tree = self._tree_from_action_sequence(action_seq, source_ids)
-        tree._pred_edu_source_ranges = st.pred_edu_ranges  # type: ignore[attr-defined]
-        tree._source_ids = source_ids  # type: ignore[attr-defined]
-        return tree
+        return self._finalize_tree(action_seq, source_ids, st.pred_edu_ranges)
+
+    # -----------------------------------------------------------------
+    # Beam search
+    # -----------------------------------------------------------------
 
     @torch.no_grad()
     def _predict_one_beam(self, text: str, num_beams: int) -> RstTree:
@@ -805,10 +786,11 @@ class DecoderOnlySRParser(nn.Module):
                 f"max_output_length={self.config.max_output_length} without EOS for any beam. "
                 f"Tree closed by best-effort repair."
             )
-        tree = self._tree_from_action_sequence(best["action_seq"], source_ids)
-        tree._pred_edu_source_ranges = best["pred_edu_ranges"]  # type: ignore[attr-defined]
-        tree._source_ids = source_ids  # type: ignore[attr-defined]
-        return tree
+        return self._finalize_tree(best["action_seq"], source_ids, best["pred_edu_ranges"])
+
+    # -----------------------------------------------------------------
+    # Gold-EDU forced decode
+    # -----------------------------------------------------------------
 
     @torch.no_grad()
     def predict_with_gold_edus(self, tree: RstTree) -> RstTree:
@@ -920,6 +902,8 @@ class DecoderOnlySRParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[0, -1, :]
             else:
+                # for-else: the step loop ran to max_output_length without an
+                # EOS break, so we finalize whatever decoded so far.
                 hit_max_len = not st.done
 
         if hit_max_len:
@@ -930,10 +914,7 @@ class DecoderOnlySRParser(nn.Module):
             )
         if st.cursor > st.edu_start:
             st.pred_edu_ranges.append((st.edu_start, st.cursor))
-        tree_out = self._tree_from_action_sequence(action_seq, source_ids)
-        tree_out._pred_edu_source_ranges = st.pred_edu_ranges  # type: ignore[attr-defined]
-        tree_out._source_ids = source_ids  # type: ignore[attr-defined]
-        return tree_out
+        return self._finalize_tree(action_seq, source_ids, st.pred_edu_ranges)
 
     @torch.no_grad()
     def predict(self, tree: RstTree, *, num_beams: int | None = None) -> RstTree:
@@ -944,6 +925,25 @@ class DecoderOnlySRParser(nn.Module):
     def predict_batch(self, trees: list[RstTree], *, num_beams: int | None = None) -> list[RstTree]:
         texts = [reconstruct_text(t) for t in trees]
         return self.predict_batch_from_texts(texts, num_beams=num_beams)
+
+    # -----------------------------------------------------------------
+    # Tree reconstruction
+    # -----------------------------------------------------------------
+
+    def _finalize_tree(
+        self, action_ids: list[int], source_ids: list[int], pred_edu_ranges: list[tuple[int, int]]
+    ) -> RstTree:
+        """Build the tree from the emitted action sequence and stash the source
+        meta the dev eval reads off the tree: per-EDU source-position ranges
+        (`_pred_edu_source_ranges`, in the model's source-id token space, so
+        eval avoids a re-tokenize that would drift from the model's whole-doc
+        tokenization) and the raw `_source_ids`. Side-channel attributes because
+        `RstTree` doesn't natively carry them; the greedy, beam, and gold-EDU
+        decoders all funnel through here."""
+        tree = self._tree_from_action_sequence(action_ids, source_ids)
+        tree._pred_edu_source_ranges = pred_edu_ranges  # type: ignore[attr-defined]
+        tree._source_ids = source_ids  # type: ignore[attr-defined]
+        return tree
 
     def _tree_from_action_sequence(self, action_ids: list[int], source_ids: list[int]) -> RstTree:
         strings: list[str] = []

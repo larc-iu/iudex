@@ -41,17 +41,10 @@ class GenerativeParser(Protocol):
 
 def _gold_edu_token_mapping(model: GenerativeParser, tree: RstTree) -> tuple[list[int], list[tuple[int, int]]]:
     """EDU end-positions and per-EDU `(start, end_exclusive)` token-position
-    ranges in the ENCODER'S whole-document tokenization space.
-
-    Critically NOT just `tokenize(edu.text)` summed cumulatively, that drifts
-    from the encoder's actual tokenization because SentencePiece is whitespace-
-    sensitive (per-EDU vs whole-doc tokenizations can disagree by a few
-    subwords per doc). `align_edus_to_tokens` tokenizes the reconstructed doc
-    once and partitions its subwords among the EDUs so the ranges TILE the
-    tokenization, putting gold mappings in the same space as the pred mappings
-    produced by the inference loop's cursor tracking. The same helper drives
-    `encode_target` and `gold_edu_source_ranges` so all three stay consistent.
-    """
+    ranges in the ENCODER'S whole-document tokenization space, the same space as
+    the pred mappings the inference loop produces by cursor tracking. Delegates
+    to `align_edus_to_tokens` (see it for why whole-doc tiling, not per-EDU
+    tokenization, is required)."""
     text = reconstruct_text(tree)
     _, mapping = align_edus_to_tokens(model.tokenizer, text, tree.edus)
     edu_ends = [end - 1 for _, end in mapping]

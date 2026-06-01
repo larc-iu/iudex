@@ -22,8 +22,12 @@ pure, self-contained, and costly to keep in hand-sync across copies:
   `repair_actions` / `fallback_reduce`: the SR parsers' shared text-reconstruct,
   gold-range tiling, single-EDU fallback, and action-sequence repair logic.
 
-The encoder-based parsers (`dmrst`, `piudotto`, `topdown_biaffine`) do not use
-these; their shared token-encoding lives in `common/encoding.py`.
+The encoder-based parsers (`dmrst`, `piudotto`, `topdown_biaffine`, `sr_biaffine`)
+do not use these; their shared token-encoding lives in `common/encoding.py`.
+
+This functional-helper layer (not inheritance) is the deliberate de-duplication
+seam for the four generative parsers; see CLAUDE.md ("generative parsers") for
+why there is no shared base class.
 """
 
 from dataclasses import dataclass, field
@@ -44,6 +48,11 @@ from iudex.rst.data.tree import (
 # GNMT length-normalization exponent for beam selection (Wu et al. 2016). Shared
 # default across the four generative parsers' beam loops.
 BEAM_LENGTH_PENALTY_ALPHA = 0.6
+
+
+# -----------------------------------------------------------------
+# Embedding gradients & action-head warm-init
+# -----------------------------------------------------------------
 
 
 def mask_old_embedding_gradients(underlying_model: Any, n_old: int) -> tuple[int, int] | None:
@@ -84,6 +93,37 @@ def mask_old_embedding_gradients(underlying_model: Any, n_old: int) -> tuple[int
     return n_total, n_total - n_old
 
 
+def warm_init_head(new_linear: torch.nn.Linear, embed_weight: torch.Tensor, full_id_for_head_idx: list[int]) -> None:
+    """Warm-init each row of a freshly-built small action head from the matching
+    `embed_tokens` row. The original lm_head was tied to embed_tokens, so row
+    `full_id` of embed_tokens is the "right" unembedding direction for token
+    `full_id`; copying those rows into the small head means the model starts
+    already knowing which hidden direction maps to which token, skipping the
+    training that would otherwise just relearn that alignment. For action tokens
+    whose embed row was freshly created by `resize_token_embeddings` the row is
+    itself random, so this is no worse than an N(0, 0.02) init there (and
+    strictly better for pre-existing tokens like EOS). `full_id_for_head_idx[hi]`
+    is the full-vocab id seeding head row `hi`. Mutates `new_linear.weight`.
+
+    If the tied input embeddings are the wrong width to copy into the head
+    (asymmetric encoder/decoder backbones, e.g. t5gemma-9b-2b: 3584-wide encoder
+    embeddings but a 2304-wide decoder lm_head), fall back to the same N(0, 0.02)
+    init fresh rows would otherwise get rather than crashing on the dim mismatch.
+    """
+    with torch.no_grad():
+        if embed_weight.shape[-1] != new_linear.weight.shape[-1]:
+            new_linear.weight.normal_(mean=0.0, std=0.02)
+            return
+        for hi, full_id in enumerate(full_id_for_head_idx):
+            src = embed_weight[full_id].to(dtype=new_linear.weight.dtype, device=new_linear.weight.device)
+            new_linear.weight[hi].copy_(src)
+
+
+# -----------------------------------------------------------------
+# EDU <-> token alignment
+# -----------------------------------------------------------------
+
+
 def align_edus_to_tokens(
     tokenizer: Any,
     text: str,
@@ -92,6 +132,13 @@ def align_edus_to_tokens(
     """Tokenize `text` (the reconstructed document) and partition its subword
     tokens among `edus` so the per-EDU token ranges TILE range(len(input_ids))
     exactly: no gaps, no overlaps, sum of lengths == len(input_ids).
+
+    Tokenizing the whole doc once and partitioning (rather than tokenizing each
+    EDU separately and concatenating) is deliberate: SentencePiece is
+    whitespace-sensitive, so per-EDU tokenizations drift from the encoder's
+    actual whole-doc tokenization by a few subwords per doc. Tiling keeps the
+    gold EDU ranges (`encode_target`, `gold_edu_source_ranges`) in the same
+    token space as the pred ranges the inference loop tracks by cursor.
 
     `edus` is a sequence of objects with `.text: str` and `.prefix: str | None`
     (default prefix " " for all but the first EDU), matching how `reconstruct_text`
@@ -135,6 +182,11 @@ def align_edus_to_tokens(
         spans.append((cursor, cursor + c))
         cursor += c
     return input_ids, spans
+
+
+# -----------------------------------------------------------------
+# Beam search
+# -----------------------------------------------------------------
 
 
 def reorder_past_key_values(past_key_values, beam_idx: torch.Tensor, model):
@@ -229,6 +281,11 @@ def select_best_beam(candidates: list[dict], alpha: float = BEAM_LENGTH_PENALTY_
     return max(candidates, key=lambda c: c["score"] / max(c["length"], 1) ** alpha)
 
 
+# -----------------------------------------------------------------
+# Shift-reduce decode state
+# -----------------------------------------------------------------
+
+
 @dataclass
 class ShiftReduceDecodeState:
     """Bottom-up shift-reduce decode state for the SR generative parsers
@@ -314,6 +371,11 @@ class ShiftReduceDecodeState:
 
     def step_eos(self) -> None:
         self.done = True
+
+
+# -----------------------------------------------------------------
+# SR tree reconstruction
+# -----------------------------------------------------------------
 
 
 def reconstruct_text(tree: RstTree) -> str:
