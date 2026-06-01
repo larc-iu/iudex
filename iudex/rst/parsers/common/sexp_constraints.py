@@ -164,6 +164,108 @@ class SexpDecodingState:
             return None
         return self.source_ids[self.cursor]
 
+    @property
+    def remaining_content(self) -> int:
+        """Source/EDU-slot positions not yet consumed by the cursor. Every
+        leaf (or `<edu>` placeholder) that still has to START must consume at
+        least one of these, so this is the budget the obligation gates spend
+        against."""
+        return self.source_len - self.cursor
+
+    def _pending_leaf_obligation(self) -> int:
+        """Minimum number of leaves that must still START (each consuming at
+        least one not-yet-consumed content position) to legally complete every
+        currently-open frame.
+
+        The stack is nested (`stack[0]` is the root, `stack[-1]` the innermost
+        currently-open child), so this is NOT a naive per-frame sum: a child's
+        leaves are PART of its parent's child-obligation, not additional to it.
+        Walk innermost -> outermost. The innermost frame's own minimum:
+          * leaf  -> 0 (already started; a leaf frame only exists once >=1
+                       content token has been emitted)
+          * None  -> 1 (minimally becomes a 1-token leaf)
+          * internal with c children emitted -> (2 - c) remaining child
+                       subtrees, each >= 1 leaf
+        Each ancestor already has one child currently open (the frame below it
+        on the stack, which the inner term accounts for), so it contributes
+        only its OTHER not-yet-opened children: `(2 - c) - 1 = (1 - c)`.
+        Ancestors are always `internal` (a frame acquires a stacked child only
+        via OPEN, which resolves a postorder None frame to internal and a
+        preorder frame is internal once its label fired).
+
+        Maintaining the invariant `remaining_content >= _pending_leaf_obligation()`
+        at every in-tree state is what makes the OPEN/placeholder gates below
+        deadlock-free: it guarantees an internal node never reaches
+        `children_emitted == 1` with the source exhausted (which would be
+        unable to OPEN its 2nd child and unable to CLOSE).
+        """
+        if not self.stack:
+            return 0
+        inner = self.stack[-1]
+        if inner.kind == "leaf":
+            total = 0
+        elif inner.kind == "internal":
+            total = max(0, 2 - inner.children_emitted)
+        else:  # kind is None
+            total = 1
+        for anc in self.stack[:-1]:
+            # anc.kind is "internal" by construction (see docstring). The open
+            # child below it is one slot; it still owes (2 - c) - 1 children.
+            total += max(0, (2 - anc.children_emitted) - 1)
+        return total
+
+    def _can_open_subtree(self) -> bool:
+        """Whether opening a fresh child subtree (a new leaf, minimally) here
+        is affordable, i.e. it won't obligate more leaves than there is
+        remaining content to fill.
+
+        Cases (derived in `_pending_leaf_obligation`'s docstring):
+          * innermost is `internal` (preorder/postorder internal-node child
+            slot): the new child is one of the (2 - c) leaves already counted,
+            so the post-open obligation equals the current one. Affordable iff
+            `remaining_content >= _pending_leaf_obligation()`. Under the
+            maintained invariant this always holds, but it is also the backstop
+            that forbids OPEN once content is exhausted.
+          * innermost is `None` (postorder fresh frame deciding leaf-vs-
+            internal): opening turns a 1-leaf obligation into a 2-leaf one, so
+            the post-open obligation is current + 1. Affordable iff
+            `remaining_content >= _pending_leaf_obligation() + 1`. (Content to
+            start the SAME frame as a leaf is still offered separately, so
+            forbidding OPEN here never empties the legal set.)
+          * empty stack (pre-root OPEN): a tree needs >= 1 leaf, so iff
+            `source_len >= 1`.
+        """
+        if not self.stack:
+            return self.source_len >= 1
+        inner = self.stack[-1]
+        need = self._pending_leaf_obligation()
+        if inner.kind is None:
+            need += 1  # this frame would go from a 1-leaf to a 2-leaf node
+        return self.remaining_content >= need
+
+    def _placeholder_legal(self) -> bool:
+        """Whether the `<edu>` placeholder is legal as a child here.
+
+        The placeholder is a contentless leaf in include_text=False mode: per
+        `step`, it consumes exactly one cursor position (capped at source_len)
+        and resolves/extends the parent to an internal node with one more
+        child. `source_len` in this mode is the EDU count, so a position is the
+        per-EDU budget and the placeholder is a leaf-start: it needs >= 1
+        remaining position, and (because it commits the parent to one more
+        child) the same affordability as opening a subtree.
+
+        LIMITATION: placeholder mode is not exercised by any shipped config and
+        has no end-to-end coverage. This gate is the sound minimal bound
+        (never offer a placeholder with no remaining EDU slot, never commit to
+        an unaffordable extra child); the exact obligation arithmetic for the
+        None-frame -> internal(children=1) transition the placeholder triggers
+        in `step` is not separately validated here. If placeholder decoding is
+        ever turned on, add direct PDA tests before trusting it.
+        """
+        if self.remaining_content < 1:
+            return False
+        return self._can_open_subtree()
+
     def legal_actions(self) -> FrozenSet[int]:
         if self.terminated:
             return frozenset()
@@ -180,7 +282,10 @@ class SexpDecodingState:
             # An '<edu>' top-level is allowed only for a 1-EDU document and
             # only in use_copy=True+include_text=False mode. For simplicity in
             # the constraint state we just gate on edu_placeholder_id being set.
-            legal.append(self.open_id)
+            # OPEN requires there be at least one source position to fill the
+            # tree's (minimally one) leaf.
+            if self._can_open_subtree():
+                legal.append(self.open_id)
             if self.edu_placeholder_id is not None and self.source_len > 0:
                 legal.append(self.edu_placeholder_id)
             return frozenset(legal)
@@ -193,38 +298,88 @@ class SexpDecodingState:
             if self.traversal_order == "preorder":
                 # Internal node: starts with a label.
                 # Leaf: starts with a source/copy token.
+                # The label commits this frame to a 2-leaf internal node, so it
+                # is gated on affording the 2nd leaf exactly like the postorder
+                # OPEN below (`_can_open_subtree` adds +1 for a None frame). The
+                # content path stays offered, so the legal set is never empty.
                 if self.cursor < self.source_len:
                     legal.extend(self._content_legal())
-                legal.extend(sorted(self.label_ids))
+                if self._can_open_subtree():
+                    legal.extend(sorted(self.label_ids))
             else:
                 # Postorder. Internal: child first, which is '(' or '<edu>'.
                 # Leaf: starts with a source/copy token.
-                legal.append(self.open_id)
-                if self.edu_placeholder_id is not None:
+                # OPEN here would commit this frame to being a 2-leaf internal
+                # node, so it is gated on being able to afford a 2nd leaf; the
+                # content path below still lets the model make it a 1-leaf
+                # node, so the legal set is never empty.
+                if self._can_open_subtree():
+                    legal.append(self.open_id)
+                # `<edu>` placeholder: see the placeholder note in
+                # `_placeholder_legal`. Gated identically to OPEN.
+                if self.edu_placeholder_id is not None and self._placeholder_legal():
                     legal.append(self.edu_placeholder_id)
                 if self.cursor < self.source_len:
                     legal.extend(self._content_legal())
             return frozenset(legal)
 
         if top.kind == "leaf":
-            # In a leaf. Continue collecting content tokens, or close.
-            if self.cursor < self.source_len:
+            # In a leaf the choices are eat-content or CLOSE. Both normally stay
+            # open (the model picks EDU length / where to split); two narrow
+            # gates keep the source fully consumable, both expressed via
+            # `obl_rest` = the tree's outstanding leaf-STARTS excluding this leaf
+            # (a leaf frame contributes 0, so `_pending_leaf_obligation` already
+            # equals the ancestors' remaining-child demand). The maintained
+            # invariant is `remaining_content >= _pending_leaf_obligation()`
+            # PLUS `obligation >= 1 whenever content remains` (some future leaf
+            # must be able to absorb leftover positions).
+            #
+            #   * CONTENT gate: eating drops remaining_content by 1 without
+            #     changing obl_rest, so it is illegal once
+            #     `remaining_content == obl_rest` (every remaining position is
+            #     reserved for a distinct future leaf-start). Offered iff
+            #     `remaining_content > obl_rest`. A future sibling leaf can
+            #     absorb arbitrarily many positions, so this does NOT force the
+            #     current leaf to swallow surplus, it just stops it from eating
+            #     INTO another leaf's last reserved position.
+            #   * CLOSE gate: closing when `obl_rest == 0` (this leaf is the last
+            #     open leaf-slot) while content remains would leave the tree
+            #     complete-but-unclosable (root-close needs cursor==source_len),
+            #     so CLOSE is withheld then and the leaf must keep eating.
+            #
+            # Exactly one of the two is ever the sole option, and that option is
+            # always available, so under min_edu_length=1 the legal set is never
+            # empty (verified exhaustively over all reachable states).
+            #
+            # LIMITATION (min_edu_length > 1): `_can_close` keeps CLOSE off below
+            # min length, so a leaf can be forced to keep eating past the
+            # `remaining_content == obl_rest` line, over-eating into a later
+            # sibling's min-length budget and stranding a 1-child internal node
+            # (empty legal set). Same hazard `GoldEduForcer` documents for
+            # min_edu>1; every shipped config pins min_edu_length=1.
+            obl_rest = self._pending_leaf_obligation()
+            has_content = self.cursor < self.source_len
+            if has_content and self.remaining_content > obl_rest:
                 legal.extend(self._content_legal())
-            if top.leaf_token_count > 0:
-                # Closing this leaf is legal whenever non-empty. (Root-close
-                # has the additional constraint that cursor==source_len, but
-                # that's handled by the close path below.)
-                if self._can_close():
-                    legal.append(self.close_id)
+            must_keep_eating = has_content and obl_rest == 0
+            if top.leaf_token_count > 0 and self._can_close() and not must_keep_eating:
+                legal.append(self.close_id)
             return frozenset(legal)
 
         # top.kind == 'internal'
+        # For an internal node's child slot, opening the next child is one of
+        # the (2 - children_emitted) leaves already counted in the obligation,
+        # so `_can_open_subtree` reduces to `remaining_content >= obligation`
+        # (the maintained invariant) and stays True until content is exhausted.
+        # The invariant guarantees content is NOT exhausted while a child is
+        # still owed, so OPEN is always offered here and the set is never empty.
         if self.traversal_order == "preorder":
             # Label has already been emitted (it's how we discovered we're
             # internal). Need 2 children before close.
             if top.children_emitted < 2:
-                legal.append(self.open_id)
-                if self.edu_placeholder_id is not None:
+                if self._can_open_subtree():
+                    legal.append(self.open_id)
+                if self.edu_placeholder_id is not None and self._placeholder_legal():
                     legal.append(self.edu_placeholder_id)
             else:
                 if self._can_close():
@@ -232,8 +387,9 @@ class SexpDecodingState:
             return frozenset(legal)
         # Postorder internal node.
         if top.children_emitted < 2:
-            legal.append(self.open_id)
-            if self.edu_placeholder_id is not None:
+            if self._can_open_subtree():
+                legal.append(self.open_id)
+            if self.edu_placeholder_id is not None and self._placeholder_legal():
                 legal.append(self.edu_placeholder_id)
             return frozenset(legal)
         if not top.label_emitted:
@@ -350,6 +506,16 @@ class SexpDecodingState:
                     root_emitted=True,
                 )
             raise ValueError(f"Action {action_id} illegal at the pre-root position.")
+
+        # Post-root with an empty stack: the only legal action was EOS (handled
+        # above). Any other action here is illegal. Raise ValueError (not the
+        # IndexError that `self.stack[-1]` would throw on the empty stack) so
+        # callers that drive the PDA inside a `try/except ValueError` (the beam
+        # loops) treat it as an illegal continuation and prune the beam rather
+        # than crashing. Reachable when a caller feeds a fallback/padding token
+        # (e.g. beam-search topk backfill) into a post-root state.
+        if not self.stack:
+            raise ValueError(f"Action {action_id} illegal at the post-root position.")
 
         top = self.stack[-1]
 
