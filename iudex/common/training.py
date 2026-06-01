@@ -46,12 +46,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_HASH_EXCLUDE: tuple[str, ...] = (
     "run_name",
     "checkpoint_dir",
-    "max_epochs",
     "patience",
     "log_every",
-    "validate_every",
     "begin_validation_epoch",
-    "checkpoint_every",
     "val_metric_name",
     "test_dir",
 )
@@ -62,6 +59,24 @@ def config_hash(obj: Any) -> str:
     TypeError on non-JSON values (silent `str()`-ifying would make hashes
     platform- and Python-version-dependent)."""
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def edu_count_loss_weights(n_edus_per_doc: list[int], *, exponent: float = 1.0) -> dict[int, float]:
+    """Map each distinct document EDU-count to a per-document loss multiplier
+    proportional to `n_edus ** exponent`, normalized so the dataset MEAN weight
+    is 1.0 (keeps the effective LR/loss scale unchanged vs unweighted). Hu & Wan
+    2023 Eq. 2 uses `exponent=1` (weight proportional to #EDUs), so long/hard
+    documents get more gradient. Returned as a lookup keyed by EDU count so a
+    collator (generative parsers) or the per-tree loop (encoder parsers) can
+    resolve each document's weight cheaply. Empty input returns an empty table.
+    """
+    if not n_edus_per_doc:
+        return {}
+    raw = {n: float(n) ** exponent for n in set(n_edus_per_doc)}
+    mean_raw = sum(raw[n] for n in n_edus_per_doc) / len(n_edus_per_doc)
+    if mean_raw <= 0:
+        return {n: 1.0 for n in raw}
+    return {n: w / mean_raw for n, w in raw.items()}
 
 
 def set_seeds(seed: int) -> None:

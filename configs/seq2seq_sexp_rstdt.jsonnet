@@ -32,7 +32,7 @@
     // Training
     lr: 3e-4,
     weight_decay: 0.05,
-    max_epochs: 200,
+    curriculum: { epochs: 200 },
     batch_size: 1,
     grad_accum: 8,
     optimizer: 'adafactor',
@@ -41,8 +41,6 @@
     amp: true,
     patience: 5,
     log_every: 5,
-    validate_every: 131,
-    checkpoint_every: 131,
     checkpoint_dir: 'checkpoints',
     run_name: null,
     seed: 42,

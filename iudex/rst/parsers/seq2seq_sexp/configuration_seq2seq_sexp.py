@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from tonga import FromParams
 
 from iudex.rst.parsers.common.config import parse_config_dict
+from iudex.rst.parsers.common.curriculum import Curriculum, SimpleCurriculum
 
 
 @dataclass
@@ -69,10 +70,15 @@ class Seq2SeqSexpConfig(FromParams):
     # since full FT blows up optimizer memory.
     peft: _PeftConfig | None = None
 
+    # Curriculum strategy (Registrable). Default `SimpleCurriculum` reproduces
+    # cold full-document training. `SubtreeSizeCurriculum` warms up on small
+    # subtrees before full docs. The curriculum owns each phase's train trees,
+    # dev set, and epoch budget (the run length).
+    curriculum: Curriculum = field(default_factory=SimpleCurriculum)
+
     # Training
     lr: float = 3e-5
     weight_decay: float = 0.01
-    max_epochs: int = 10
     batch_size: int = 1
     grad_accum: int = 16
     # "adamw": standard, but two fp32-or-bf16 state tensors per param (~16-32 GB
@@ -85,13 +91,12 @@ class Seq2SeqSexpConfig(FromParams):
     amp: bool = True
     patience: int = 5
     log_every: int = 5
-    validate_every: int | None = None
     # Skip dev validation until this epoch (0 = validate from the start).
     # Generative parsers decode every dev doc to max_output_length while
     # undertrained, so early evals cost hours for a ~0 score. In HASH_EXCLUDE,
-    # so changing it is resume-safe.
+    # so changing it is resume-safe. Applies within a validating phase. A
+    # curriculum's non-final phases skip validation regardless (empty dev set).
     begin_validation_epoch: int = 0
-    checkpoint_every: int | None = None
     checkpoint_dir: str = "checkpoints"
     run_name: str | None = None
     seed: int = 42
@@ -130,6 +135,12 @@ class Seq2SeqSexpConfig(FromParams):
     # 262K-vocab justification for upweighting structurals doesn't apply.
     # Bump above 1.0 only if action positions are demonstrably starved.
     action_loss_weight: float = 1.0
+
+    # Per-document loss weight proportional to (#EDUs ** edu_loss_weight_exponent),
+    # normalized to mean 1 over each phase's training set (Hu & Wan 2023 Eq. 2 uses
+    # exponent 1). 0.0 disables it (all documents weighted equally). Recomputed per
+    # curriculum phase over that phase's trees.
+    edu_loss_weight_exponent: float = 0.0
 
     # Label smoothing on the CE loss. Standard seq2seq fine-tuning trick.
     # The action head is small (~100 classes) and GUM has ~150 train docs,

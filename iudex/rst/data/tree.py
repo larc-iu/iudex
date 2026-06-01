@@ -846,6 +846,57 @@ class RstTree:
             raise ValueError(f"from_shift_reduce: consumed {edu_counter} EDUs but {len(edu_strings)} were available.")
         return cls(nodes, edges, relation_types=relation_types)
 
+    def subtrees_up_to(self, max_edus: int, *, min_edus: int = 2) -> List["RstTree"]:
+        """Maximal-subtree partition of this tree under an EDU-count cap, for
+        size-bucketed curriculum training. Walk the binary tree top-down and
+        emit a node as a standalone `RstTree` as soon as its EDU leaf count is
+        `<= max_edus` (then stop recursing into it), otherwise recurse into both
+        children. Nodes with fewer than `min_edus` leaves are skipped (a 1-EDU
+        "tree" carries no split to learn), so the emitted EDU windows tile
+        `[0, len(edus))` except for those dropped singletons (partition-with-holes).
+
+        A whole tree with `<= max_edus` leaves returns one subtree structurally
+        equal to `self`. Emitted subtrees carry already-`_resolve_rel`-mapped
+        relation names (they come from `_build_binary_tree`), so `relation_map`
+        is not re-applied (only `_relation_types` is propagated). EDU `prefix`
+        info is not preserved (the rebuilt EDUs hold text only), so callers that
+        reconstruct text from a subtree get space-joined EDUs.
+        """
+        if not self.is_binary:
+            raise NotImplementedError("Non-binary trees are not currently supported for this operation.")
+
+        def leaf_count(node) -> int:
+            return 1 if node[0] == "edu" else leaf_count(node[3]) + leaf_count(node[4])
+
+        def to_actions(node) -> List[ShiftReduceAction]:
+            out: List[ShiftReduceAction] = []
+
+            def walk(n):
+                if n[0] == "edu":
+                    out.append(Shift(edu_text=n[1]))
+                    return
+                _, nuc, rel, left, right = n
+                walk(left)
+                walk(right)
+                out.append(Reduce(nuc=nuc, rel=rel))
+
+            walk(node)
+            return out
+
+        subtrees: List["RstTree"] = []
+
+        def select(node) -> None:
+            n_leaves = leaf_count(node)
+            if n_leaves <= max_edus:
+                if n_leaves >= min_edus:
+                    subtrees.append(RstTree.from_shift_reduce(to_actions(node), relation_types=self._relation_types))
+                return
+            select(node[3])
+            select(node[4])
+
+        select(self._build_binary_tree())
+        return subtrees
+
     @property
     def edus(self) -> List[RstNode]:
         return [n for n in self._node_map.values() if n.is_edu]

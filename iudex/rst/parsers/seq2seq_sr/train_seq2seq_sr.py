@@ -4,7 +4,6 @@ import json
 import logging
 import math
 import os
-import random
 import time
 from collections import deque
 
@@ -18,6 +17,7 @@ from iudex.common.training import (
     build_optimizer,
     config_panel,
     device_panel,
+    edu_count_loss_weights,
     gpu_mem_gb,
     install_abort_handler,
     make_progress_bar,
@@ -36,8 +36,8 @@ from iudex.rst.data.metrics import compute_parseval_metrics, f1, metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
 from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
 from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
 from iudex.rst.parsers.common.seqgen import reconstruct_text
+from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
 from iudex.rst.parsers.seq2seq_sr.modeling_seq2seq_sr import Seq2SeqSRParser
 
 setup_logging()
@@ -78,6 +78,7 @@ def _build_dataset(model: Seq2SeqSRParser, pairs: list[tuple[str, RstTree]]) -> 
                 "attention_mask": enc["attention_mask"],
                 "labels": labels,
                 "decoder_input_ids": decoder_input_ids,
+                "n_edus": len(tree.edus),
             }
         )
     return _Seq2SeqSRDataset(items), dropped
@@ -104,19 +105,18 @@ def _build_optimizer(model: Seq2SeqSRParser, cfg: Seq2SeqSRConfig):
     raise ValueError(f"Unknown optimizer {cfg.optimizer!r}. Expected 'adamw' or 'adafactor'.")
 
 
-def _make_collator(pad_id: int):
-    """Variable-length pad to the longest item in the batch. `-100` label
-    padding so HF cross-entropy ignores those positions, `pad_id` pad on the
-    decoder-input side so attention masks behave."""
+def _make_collator(pad_id: int, weight_table: dict[int, float] | None = None):
+    """Returns a collator producing `(model_batch, meta)`. `meta["weights"]` is a
+    `[B]` float tensor of per-document EDU-count loss weights (all ones when
+    `weight_table` is None). The weights live in `meta`, not the model batch, so
+    `model.forward` is untouched."""
 
-    def collate(batch: list[dict]) -> dict[str, torch.Tensor]:
+    def collate(batch: list[dict]) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         max_in = max(len(item["input_ids"]) for item in batch)
         max_lbl = max(len(item["labels"]) for item in batch)
         input_ids = torch.full((len(batch), max_in), pad_id, dtype=torch.long)
         attention_mask = torch.zeros((len(batch), max_in), dtype=torch.long)
         labels = torch.full((len(batch), max_lbl), -100, dtype=torch.long)
-        # decoder_input_ids: substituted (source-token-rich) shift-right of
-        # labels, built by `encode_target`. Same length as labels.
         decoder_input_ids = torch.full((len(batch), max_lbl), pad_id, dtype=torch.long)
         for i, item in enumerate(batch):
             n = len(item["input_ids"])
@@ -126,12 +126,17 @@ def _make_collator(pad_id: int):
             labels[i, :m] = torch.tensor(item["labels"], dtype=torch.long)
             d = len(item["decoder_input_ids"])
             decoder_input_ids[i, :d] = torch.tensor(item["decoder_input_ids"], dtype=torch.long)
-        return {
+        model_batch = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "decoder_input_ids": decoder_input_ids,
         }
+        if weight_table is None:
+            weights = torch.ones(len(batch), dtype=torch.float)
+        else:
+            weights = torch.tensor([weight_table.get(item["n_edus"], 1.0) for item in batch], dtype=torch.float)
+        return model_batch, {"weights": weights}
 
     return collate
 
@@ -315,36 +320,62 @@ def train(cfg: Seq2SeqSRConfig) -> None:
         else None
     )
 
-    train_ds, dropped = _build_dataset(model, train_pairs)
-    if dropped > 0:
-        warn(
-            f"Dropped {dropped}/{len(train_pairs)} training trees whose target exceeded "
-            f"max_output_length={cfg.max_output_length}. Bump it if this is a large fraction."
-        )
+    train_trees = [t for _, t in train_pairs]
+    phases = cfg.curriculum.plan()
+    total_epochs = sum(p.epochs for p in phases)
 
-    collate = _make_collator(model.tokenizer.pad_token_id)
+    pad_id = model.tokenizer.pad_token_id
     rng_seed = torch.Generator()
     rng_seed.manual_seed(cfg.seed)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        collate_fn=collate,
-        generator=rng_seed,
-    )
 
-    # ceil, not floor: the loop also steps the final partial-accumulation batch,
-    # so a floor undercounts total_steps and the LR scheduler decays to 0 early.
-    steps_per_epoch = max(1, math.ceil(len(train_loader) / cfg.grad_accum))
-    total_steps = steps_per_epoch * cfg.max_epochs
+    # Build each phase's loader up front so the LR schedule spans the whole run
+    # (total_steps summed across phases, else it would decay mid-curriculum). A
+    # SimpleCurriculum yields a single full-document phase == prior behavior.
+    phase_loaders: list[tuple] = []  # (phase, loader, steps_per_epoch)
+    total_steps = 0
+    for phase in phases:
+        phase_trees = cfg.curriculum.train_trees(train_trees, phase)
+        ds, dropped = _build_dataset(model, [("", t) for t in phase_trees])
+        if dropped > 0:
+            warn(
+                f"[phase cap={phase.cap}] Dropped {dropped}/{len(phase_trees)} training trees "
+                f"(source > max_input_length={cfg.max_input_length} or target > "
+                f"max_output_length={cfg.max_output_length}, see per-tree warnings above)."
+            )
+        wtab = (
+            edu_count_loss_weights([it["n_edus"] for it in ds.items], exponent=cfg.edu_loss_weight_exponent)
+            if cfg.edu_loss_weight_exponent
+            else None
+        )
+        loader = DataLoader(
+            ds,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            collate_fn=_make_collator(pad_id, wtab),
+            generator=rng_seed,
+        )
+        # ceil, not floor: the trailing partial accumulation window is stepped too.
+        spe = max(1, math.ceil(len(loader) / cfg.grad_accum))
+        phase_loaders.append((phase, loader, spe))
+        total_steps += spe * phase.epochs
+
     warmup = cfg.num_warmup_steps if cfg.num_warmup_steps is not None else max(1, int(0.1 * total_steps))
+
+    if len(phases) > 1:
+        dim(
+            "Curriculum phases (cap/epochs/examples): "
+            + ", ".join(
+                f"{p.cap if p.cap is not None else 'full'}/{p.epochs}/{len(loader.dataset)}"
+                for p, loader, _ in phase_loaders
+            )
+        )
 
     console.print(config_panel(cfg_dict))
     console.print(device_panel(device, seed=cfg.seed, checkpoint_dir=run_dir))
-    console.print(model_panel(model, num_train_trees=len(train_ds), grad_accum=cfg.grad_accum))
+    console.print(model_panel(model, num_train_trees=len(train_trees), grad_accum=cfg.grad_accum))
     console.print(
         schedule_panel(
-            steps_per_epoch=steps_per_epoch,
+            steps_per_epoch=phase_loaders[0][2],
             total_steps=total_steps,
             warmup_steps=warmup,
             lr=cfg.lr,
@@ -385,18 +416,14 @@ def train(cfg: Seq2SeqSRConfig) -> None:
         )
 
     dev_beams = 1 if cfg.eval_decode_greedy else cfg.num_beams
-    # Per-epoch dev cap. Final eval below uses the full dev_pairs.
-    per_epoch_dev = dev_pairs if cfg.dev_max_docs is None else dev_pairs[: cfg.dev_max_docs]
-    if cfg.dev_max_docs is not None and cfg.dev_max_docs < len(dev_pairs):
-        dim(
-            f"Per-epoch dev eval is capped to the first {len(per_epoch_dev)}/"
-            f"{len(dev_pairs)} documents (cfg.dev_max_docs). Final eval still uses all."
-        )
 
-    def _validate(epoch: int) -> None:
+    def _validate(epoch: int, dev_set: list) -> None:
         nonlocal best_val, stale
-        if epoch < cfg.begin_validation_epoch:
+        # Empty dev_set => the curriculum suppresses validation for this phase
+        # (e.g. subtree warmup phases). begin_validation_epoch is the in-phase gate.
+        if epoch < cfg.begin_validation_epoch or not dev_set:
             return
+        per_epoch_dev = dev_set if cfg.dev_max_docs is None else dev_set[: cfg.dev_max_docs]
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         # Per-epoch validation deliberately skips the gold-EDU pass to save
         # time. Final dev/test eval below always runs it.
@@ -421,9 +448,9 @@ def train(cfg: Seq2SeqSRConfig) -> None:
         model.train()
 
     aborted = install_abort_handler()
-    training_complete = start_epoch >= cfg.max_epochs or stale >= cfg.patience
+    training_complete = start_epoch >= total_epochs or stale >= cfg.patience
     if training_complete:
-        reason = "max_epochs reached" if start_epoch >= cfg.max_epochs else "patience exhausted"
+        reason = "all epochs completed" if start_epoch >= total_epochs else "patience exhausted"
         dim(f"Skipping training: {reason} on prior run, jumping to final evaluation.")
 
     recent_losses: deque = deque(maxlen=200)
@@ -433,111 +460,111 @@ def train(cfg: Seq2SeqSRConfig) -> None:
         rule("Training")
     training_start = time.monotonic()
 
-    for epoch in range(start_epoch, cfg.max_epochs):
+    phase_start = 0
+    for phase, loader, spe in phase_loaders:
+        p_start, p_end = phase_start, phase_start + phase.epochs
+        phase_start = p_end
         if stale >= cfg.patience or aborted.value:
             break
-        epoch_start = time.monotonic()
-        model.train()
-        total_loss = 0.0
-        num_batches = 0
-        epoch_step = 0
+        if start_epoch >= p_end:  # phase already finished on a prior run
+            continue
+        dev_set = cfg.curriculum.dev_pairs(dev_pairs, phase)
+        n_batches_total = len(loader)
 
-        with make_progress_bar() as progress:
-            task = progress.add_task(
-                "training",
-                total=steps_per_epoch,
-                epoch=f"{epoch + 1}/{cfg.max_epochs}",
-                loss_str="loss=-.----",
-                lr_str="",
-                mem_str="",
-                total_elapsed="0:00:00",
-            )
+        for epoch in range(max(start_epoch, p_start), p_end):
+            if stale >= cfg.patience or aborted.value:
+                break
+            epoch_start = time.monotonic()
+            model.train()
+            total_loss = 0.0
+            num_batches = 0
+            epoch_step = 0
 
-            for batch_idx, batch in enumerate(train_loader):
-                batch = {k: v.to(device) for k, v in batch.items()}
-                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-                    out = model(batch)
-                loss = out["loss"]
-                if cfg.grad_accum > 1:
-                    loss = loss / cfg.grad_accum
-                loss.backward()
-                raw_loss = loss.item() * (cfg.grad_accum if cfg.grad_accum > 1 else 1)
-                recent_losses.append(raw_loss)
-                if "action_loss" in out:
-                    recent_action_losses.append(float(out["action_loss"].item()))
-                    recent_copy_losses.append(float(out["copy_loss"].item()))
-                total_loss += raw_loss
-                num_batches += 1
-
-                is_step = (batch_idx + 1) % cfg.grad_accum == 0 or (batch_idx + 1) == len(train_loader)
-                if not is_step:
-                    continue
-
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                scheduler.step()
-                global_step += 1
-                epoch_step += 1
-
-                avg_loss = sum(recent_losses) / len(recent_losses)
-                lr_display = "/".join(f"{lr:.1e}" for lr in sorted(set(scheduler.get_last_lr())))
-                mem = gpu_mem_gb(device)
-                mem_str = f"[gpu]max_mem={mem[1]:.1f}GB[/gpu]" if mem else ""
-                secs = int(time.monotonic() - training_start)
-                progress.update(
-                    task,
-                    advance=1,
-                    loss_str=f"loss=[bold orange1]{avg_loss:.4f}[/bold orange1]",
-                    lr_str=f"lr=[dim]{lr_display}[/dim]",
-                    mem_str=mem_str,
-                    total_elapsed=f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}",
+            with make_progress_bar() as progress:
+                task = progress.add_task(
+                    "training",
+                    total=spe,
+                    epoch=f"{epoch + 1}/{total_epochs}",
+                    loss_str="loss=-.----",
+                    lr_str="",
+                    mem_str="",
+                    total_elapsed="0:00:00",
                 )
 
-                if epoch_step % cfg.log_every == 0:
-                    tb_train = {"loss": avg_loss, "lr": max(scheduler.get_last_lr()), "grad_norm": float(grad_norm)}
-                    if recent_action_losses:
-                        tb_train["action_loss"] = sum(recent_action_losses) / len(recent_action_losses)
-                        tb_train["copy_loss"] = sum(recent_copy_losses) / len(recent_copy_losses)
-                    if mem:
-                        tb_train["gpu_mem_gb"] = mem[1]
-                    tb.log_scalars("train", tb_train, global_step)
-                    mem_log = f"  mem=[dim]{mem[1]:.1f}GB[/dim]" if mem else ""
-                    split_log = ""
-                    if recent_action_losses:
-                        a = sum(recent_action_losses) / len(recent_action_losses)
-                        c = sum(recent_copy_losses) / len(recent_copy_losses)
-                        split_log = f"  act=[dim]{a:.3f}[/dim]  cpy=[dim]{c:.3f}[/dim]"
-                    progress.console.print(
-                        f"  [step]step {epoch_step}/{steps_per_epoch}[/step]  "
-                        f"loss=[loss]{avg_loss:.4f}[/loss]{split_log}  "
-                        f"grad=[dim]{grad_norm:.4f}[/dim]  "
-                        f"lr=[dim]{lr_display}[/dim]{mem_log}"
+                for batch_idx, (batch, meta) in enumerate(loader):
+                    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+                        out = model(batch)
+                    # EDU-count weight (mean over the batch, exact at batch_size=1).
+                    loss = out["loss"] * meta["weights"].to(device).mean()
+                    if cfg.grad_accum > 1:
+                        loss = loss / cfg.grad_accum
+                    loss.backward()
+                    raw_loss = loss.item() * (cfg.grad_accum if cfg.grad_accum > 1 else 1)
+                    recent_losses.append(raw_loss)
+                    if "action_loss" in out:
+                        recent_action_losses.append(float(out["action_loss"].item()))
+                        recent_copy_losses.append(float(out["copy_loss"].item()))
+                    total_loss += raw_loss
+                    num_batches += 1
+
+                    is_step = (batch_idx + 1) % cfg.grad_accum == 0 or (batch_idx + 1) == n_batches_total
+                    if not is_step:
+                        continue
+
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                    global_step += 1
+                    epoch_step += 1
+
+                    avg_loss = sum(recent_losses) / len(recent_losses)
+                    lr_display = "/".join(f"{lr:.1e}" for lr in sorted(set(scheduler.get_last_lr())))
+                    mem = gpu_mem_gb(device)
+                    mem_str = f"[gpu]max_mem={mem[1]:.1f}GB[/gpu]" if mem else ""
+                    secs = int(time.monotonic() - training_start)
+                    progress.update(
+                        task,
+                        advance=1,
+                        loss_str=f"loss=[bold orange1]{avg_loss:.4f}[/bold orange1]",
+                        lr_str=f"lr=[dim]{lr_display}[/dim]",
+                        mem_str=mem_str,
+                        total_elapsed=f"{secs // 3600}:{(secs % 3600) // 60:02d}:{secs % 60:02d}",
                     )
 
-                if cfg.validate_every and global_step % cfg.validate_every == 0:
-                    _validate(epoch + 1)
-                    if stale >= cfg.patience or aborted.value:
-                        break
+                    if epoch_step % cfg.log_every == 0:
+                        tb_train = {"loss": avg_loss, "lr": max(scheduler.get_last_lr()), "grad_norm": float(grad_norm)}
+                        if recent_action_losses:
+                            tb_train["action_loss"] = sum(recent_action_losses) / len(recent_action_losses)
+                            tb_train["copy_loss"] = sum(recent_copy_losses) / len(recent_copy_losses)
+                        if mem:
+                            tb_train["gpu_mem_gb"] = mem[1]
+                        tb.log_scalars("train", tb_train, global_step)
+                        mem_log = f"  mem=[dim]{mem[1]:.1f}GB[/dim]" if mem else ""
+                        split_log = ""
+                        if recent_action_losses:
+                            a = sum(recent_action_losses) / len(recent_action_losses)
+                            c = sum(recent_copy_losses) / len(recent_copy_losses)
+                            split_log = f"  act=[dim]{a:.3f}[/dim]  cpy=[dim]{c:.3f}[/dim]"
+                        progress.console.print(
+                            f"  [step]step {epoch_step}/{spe}[/step]  "
+                            f"loss=[loss]{avg_loss:.4f}[/loss]{split_log}  "
+                            f"grad=[dim]{grad_norm:.4f}[/dim]  "
+                            f"lr=[dim]{lr_display}[/dim]{mem_log}"
+                        )
 
-                if cfg.checkpoint_every and global_step % cfg.checkpoint_every == 0:
-                    _save(os.path.join(run_dir, "last.pt"), epoch + 1)
-
-        if num_batches > 0 and stale < cfg.patience:
-            console.print(
-                f"  [epoch]Epoch {epoch + 1}/{cfg.max_epochs}[/epoch] "
-                f"[dim]({time.monotonic() - epoch_start:.1f}s)[/dim]  "
-                f"loss=[loss]{total_loss / num_batches:.4f}[/loss]"
-            )
-            if not cfg.validate_every:
-                _validate(epoch + 1)
-            _save(os.path.join(run_dir, "last.pt"), epoch + 1)
-            if stale >= cfg.patience or aborted.value:
-                warn(f"\nEarly stopping after {cfg.patience} validations without improvement")
-                break
-        elif stale >= cfg.patience or aborted.value:
-            warn(f"\nEarly stopping at step {global_step}")
-            break
+            if num_batches > 0:
+                console.print(
+                    f"  [epoch]Epoch {epoch + 1}/{total_epochs}[/epoch] "
+                    f"[dim]({time.monotonic() - epoch_start:.1f}s)[/dim]  "
+                    f"loss=[loss]{total_loss / num_batches:.4f}[/loss]"
+                )
+                _validate(epoch + 1, dev_set)
+                _save(os.path.join(run_dir, "last.pt"), epoch + 1)
+                if stale >= cfg.patience or aborted.value:
+                    warn(f"\nEarly stopping after {cfg.patience} validations without improvement")
+                    break
 
     rule("Final Evaluation")
     best_path = os.path.join(run_dir, "best_model.pt")

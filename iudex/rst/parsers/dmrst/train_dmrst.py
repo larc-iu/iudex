@@ -17,6 +17,7 @@ from iudex.common.training import (
     build_optimizer,
     config_panel,
     device_panel,
+    edu_count_loss_weights,
     gpu_mem_gb,
     install_abort_handler,
     make_progress_bar,
@@ -136,16 +137,45 @@ def train(cfg: DMRSTConfig) -> None:
         else None
     )
 
-    steps_per_epoch = max(1, len(train_trees) // cfg.grad_accum)
-    total_steps = steps_per_epoch * cfg.max_epochs
-    warmup = steps_per_epoch if cfg.num_warmup_steps is None else cfg.num_warmup_steps
+    phases = cfg.curriculum.plan()
+    total_epochs = sum(p.epochs for p in phases)
+
+    # Per-phase tree lists + EDU-count weight tables + step counts. total_steps
+    # spans all phases so the LR schedule does not decay mid-curriculum. A
+    # SimpleCurriculum yields a single full-document phase == prior behavior.
+    phase_specs: list[tuple] = []  # (phase, trees, weight_table, phase_steps_per_epoch)
+    total_steps = 0
+    for phase in phases:
+        phase_trees = cfg.curriculum.train_trees(train_trees, phase)
+        wtab = (
+            edu_count_loss_weights([len(t.edus) for t in phase_trees], exponent=cfg.edu_loss_weight_exponent)
+            if cfg.edu_loss_weight_exponent
+            else None
+        )
+        spe = max(1, len(phase_trees) // cfg.grad_accum)
+        phase_specs.append((phase, phase_trees, wtab, spe))
+        total_steps += spe * phase.epochs
+    warmup = phase_specs[0][3] if cfg.num_warmup_steps is None else cfg.num_warmup_steps
+
+    # Flatten phases to a per-absolute-epoch spec so the single epoch loop (and
+    # resume by absolute epoch) stays unchanged.
+    epoch_to_spec: list[tuple] = []
+    for phase, phase_trees, wtab, spe in phase_specs:
+        for _ in range(phase.epochs):
+            epoch_to_spec.append((phase, phase_trees, wtab, spe))
+
+    if len(phases) > 1:
+        dim(
+            "Curriculum phases (cap/epochs/trees): "
+            + ", ".join(f"{p.cap if p.cap is not None else 'full'}/{p.epochs}/{len(tr)}" for p, tr, _, _ in phase_specs)
+        )
 
     console.print(config_panel(cfg_dict))
     console.print(device_panel(device, seed=cfg.seed, checkpoint_dir=run_dir))
     console.print(model_panel(model, num_train_trees=len(train_trees), grad_accum=cfg.grad_accum))
     console.print(
         schedule_panel(
-            steps_per_epoch=steps_per_epoch,
+            steps_per_epoch=phase_specs[0][3],
             total_steps=total_steps,
             warmup_steps=warmup,
             lr=cfg.lr,
@@ -207,11 +237,15 @@ def train(cfg: DMRSTConfig) -> None:
             dlw_weights=dict(weights),
         )
 
-    def _validate(epoch: int) -> None:
+    def _validate(epoch: int, dev_set: list) -> None:
         nonlocal best_val, stale
+        # Empty dev_set => the curriculum suppresses validation for this phase
+        # (e.g. subtree warmup phases). begin_validation_epoch is the in-phase gate.
+        if epoch < cfg.begin_validation_epoch or not dev_set:
+            return
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         model.eval()
-        metrics = _evaluate_on_dev(model, dev_pairs, output_dir=pred_dir)
+        metrics = _evaluate_on_dev(model, dev_set, output_dir=pred_dir)
         tb.log_scalars("dev", metrics, global_step)
         console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
         score = metrics[cfg.val_metric_name]
@@ -226,9 +260,9 @@ def train(cfg: DMRSTConfig) -> None:
         model.train()
 
     aborted = install_abort_handler()
-    training_complete = start_epoch >= cfg.max_epochs or stale >= cfg.patience
+    training_complete = start_epoch >= total_epochs or stale >= cfg.patience
     if training_complete:
-        reason = "max_epochs reached" if start_epoch >= cfg.max_epochs else "patience exhausted"
+        reason = "all epochs completed" if start_epoch >= total_epochs else "patience exhausted"
         dim(f"Skipping training: {reason} on prior run; jumping to final evaluation.")
 
     recent_losses = deque(maxlen=200)
@@ -237,10 +271,12 @@ def train(cfg: DMRSTConfig) -> None:
         rule("Training")
     training_start = time.monotonic()
 
-    for epoch in range(start_epoch, cfg.max_epochs):
+    for epoch in range(start_epoch, total_epochs):
         if stale >= cfg.patience or aborted.value:
             break
-        trees = list(train_trees)
+        phase, phase_trees, wtab, spe = epoch_to_spec[epoch]
+        dev_set = cfg.curriculum.dev_pairs(dev_pairs, phase)
+        trees = list(phase_trees)
         rng.shuffle(trees)
         epoch_start = time.monotonic()
         model.train()
@@ -251,8 +287,8 @@ def train(cfg: DMRSTConfig) -> None:
         with make_progress_bar() as progress:
             task = progress.add_task(
                 "training",
-                total=steps_per_epoch,
-                epoch=f"{epoch + 1}/{cfg.max_epochs}",
+                total=spe,
+                epoch=f"{epoch + 1}/{total_epochs}",
                 loss_str="loss=-.----",
                 lr_str="",
                 mem_str="",
@@ -263,6 +299,8 @@ def train(cfg: DMRSTConfig) -> None:
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
                     out = model(tree)
                 loss = sum(weights[k] * out[f"{k}_loss"] for k in components)
+                if wtab is not None:
+                    loss = loss * wtab.get(len(tree.edus), 1.0)
                 if cfg.grad_accum > 1:
                     loss = loss / cfg.grad_accum
                 loss.backward()
@@ -348,35 +386,23 @@ def train(cfg: DMRSTConfig) -> None:
                         else ""
                     )
                     progress.console.print(
-                        f"  [step]step {epoch_step}/{steps_per_epoch}[/step]  "
+                        f"  [step]step {epoch_step}/{spe}[/step]  "
                         f"loss=[loss]{avg_loss:.4f}[/loss]  "
                         f"grad=[dim]{grad_norm:.4f}[/dim]  "
                         f"lr=[dim]{lr_display}[/dim]{w_log}{mem_log}"
                     )
 
-                if cfg.validate_every and global_step % cfg.validate_every == 0:
-                    _validate(epoch + 1)
-                    if stale >= cfg.patience or aborted.value:
-                        break
-
-                if cfg.checkpoint_every and global_step % cfg.checkpoint_every == 0:
-                    _save(os.path.join(run_dir, "last.pt"), epoch + 1)
-
-        if num_trees > 0 and stale < cfg.patience:
+        if num_trees > 0:
             console.print(
-                f"  [epoch]Epoch {epoch + 1}/{cfg.max_epochs}[/epoch] "
+                f"  [epoch]Epoch {epoch + 1}/{total_epochs}[/epoch] "
                 f"[dim]({time.monotonic() - epoch_start:.1f}s)[/dim]  "
                 f"loss=[loss]{total_loss / num_trees:.4f}[/loss]"
             )
-            if not cfg.validate_every:
-                _validate(epoch + 1)
+            _validate(epoch + 1, dev_set)
             _save(os.path.join(run_dir, "last.pt"), epoch + 1)
             if stale >= cfg.patience or aborted.value:
                 warn(f"\nEarly stopping after {cfg.patience} validations without improvement")
                 break
-        elif stale >= cfg.patience or aborted.value:
-            warn(f"\nEarly stopping at step {global_step}")
-            break
 
     rule("Final Evaluation")
     best_path = os.path.join(run_dir, "best_model.pt")
