@@ -1,29 +1,23 @@
-// decoder_only_sexp trained on RST-DT with the 18 coarse Carlson & Marcu classes.
-// Nested s-expression sibling of decoder_only_sr. Default variant is post-order
-// + copy. Canonical config: every field on `DecoderOnlySexpConfig` is set
-// explicitly.
+// decoder_only_sexp on RST-DT (coarse). Causal LM with source + a nested
+// s-expression linearization of the tree in one stream.
 {
     // Data
     train_dir: 'data/rstdt/train',
     dev_dir: 'data/rstdt/dev',
     test_dir: 'data/rstdt/test',
-    relation_types: null,
+    relation_types: null,                                  // inferred at train time
     relation_map: import 'lib/rstdt_coarse_map.libsonnet',
 
     // Model
     model_name: 'google/gemma-3-1b-it',
-    causal_mode: true,
-    max_input_length: 3072,
-    max_output_length: 5120,
-    gradient_checkpointing: false,
+    max_input_length: 3072,                                // source subwords (single-stream: source + tree share the budget)
+    max_output_length: 5120,                               // tree stream
+    gradient_checkpointing: false,                         // set true to trade compute for memory
+    causal_mode: true,                                     // parser-kind tag (identifies decoder_only_sexp configs)
 
-    // LoRA on the causal LM. When use_copy=true the lm_head is replaced at
-    // parser init with a small fresh head over the action vocab; when
-    // use_copy=false the full pretrained head stays (source subwords need
-    // to be scored). The two embedding knobs below (modules_to_save,
-    // train_only_new_embedding_rows) are honored only under use_copy=false.
-    // Under the default use_copy=true they are no-ops (the carve-out trains
-    // only the new-token rows regardless).
+    // LoRA. null = full fine-tuning. Under use_copy (default) the lm_head is replaced
+    // with a small action-vocab head and only the new embedding rows train, so
+    // modules_to_save / train_only_new_embedding_rows are honored only when use_copy=false.
     peft: {
         r: 8,
         alpha: 16,
@@ -35,43 +29,44 @@
         train_only_new_embedding_rows: true,
     },
 
+    // Curriculum (Registrable). SimpleCurriculum = cold full-document training and
+    // owns the epoch budget. SubtreeSizeCurriculum warms up on small subtrees first.
+    curriculum: { epochs: 200 },
+
     // Training
     lr: 3e-4,
     weight_decay: 0.05,
-    curriculum: { epochs: 200 },
     batch_size: 1,
     grad_accum: 8,
-    optimizer: 'adafactor',
-    num_warmup_steps: null,
+    optimizer: 'adafactor',                                // or 'adamw' (more memory)
+    num_warmup_steps: null,                                // null = 1-epoch warmup, 0 = none
     max_grad_norm: 1.0,
-    amp: true,
+    amp: true,                                             // bf16 autocast (CUDA), inference stays fp32
     patience: 5,
     log_every: 5,
+    begin_validation_epoch: 0,                             // skip slow dev decodes until this epoch
     checkpoint_dir: 'checkpoints',
     run_name: null,
     seed: 42,
     val_metric_name: 'e2e_full_f1',
-    action_loss_weight: 1.0,
-    // Applied uniformly at this value in both use_copy modes (no auto-scale).
-    // Under use_copy=false the head is the full vocab vs ~100 action classes
-    // under use_copy=true, a known head-size confound on the smoothing mass.
+
+    // Loss
+    action_loss_weight: 1.0,                               // gradient multiplier on structural actions, 1.0 = no rebalance
+    edu_loss_weight_exponent: 0.0,                         // weight docs by #EDUs**exp, 0 = equal
     label_smoothing: 0.1,
 
     // Dev eval
-    dev_max_docs: null,
-    dev_batch_size: 1,
+    dev_max_docs: null,                                    // null = full dev set each epoch (final eval always full)
+    dev_batch_size: 1,                                     // bump to batch dev decodes
 
     // Decoding
     num_beams: 4,
     use_validity_constraints: true,
     eval_decode_greedy: true,
-    min_edu_length: 1,
+    min_edu_length: 1,                                     // require >=N content tokens before a leaf can close (1 = off)
 
-    // Sexp-specific. `use_copy` is the registry's signature_field.
-    traversal_order: 'postorder',
-    use_copy: true,
-    // Only meaningful when use_copy=false. true = hard-mask content
-    // positions to source_ids[cursor] (COPY-via-constraint). false =
-    // free content generation (Hu and Wan 2023's apparent setup).
-    constrain_content: true,
+    // Sexp-specific
+    traversal_order: 'postorder',                          // or 'preorder'
+    use_copy: true,                                        // true: <copy> sentinel + small head. false: verbatim source + full head (Hu & Wan 2023)
+    constrain_content: true,                               // use_copy=false only: hard-mask content positions to the source cursor
 }

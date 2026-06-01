@@ -21,17 +21,13 @@ class Seq2SeqSRConfig(FromParams):
     model_name: str = "google/t5gemma-2-1b-1b"
     # Encoder input length (raw document subword tokens, no specials counted).
     max_input_length: int = 4096
-    # Decoder target length. Output is source subwords + n SHIFTs + n-1 REDUCEs,
-    # so headroom matters: a 1.5K-source / 50-EDU doc lands around 1.6K tokens.
+    # Decoder target length. Output is source subwords + n SHIFTs + n-1 REDUCEs.
     max_output_length: int = 6144
-    # Required on a 4090 at T5Gemma-1B + 4K input + 6K output. Enters the
-    # hash so flipping it triggers a fresh run.
+    # Trade compute for activation memory. Enters the config hash.
     gradient_checkpointing: bool = True
 
-    # LoRA. Null = full fine-tuning. When set, the base seq2seq stack is
-    # frozen and only LoRA adapters + the modules in `peft.modules_to_save`
-    # train. For T5Gemma2 / mT5 at 1B+ scale this is the practical default
-    # since full FT blows up optimizer memory.
+    # LoRA. Null = full fine-tuning. When set, the base stack is frozen and only
+    # LoRA adapters + `peft.modules_to_save` train. The practical default at 1B+.
     peft: PeftConfig | None = None
 
     # Curriculum strategy (Registrable). Default `SimpleCurriculum` reproduces
@@ -45,21 +41,17 @@ class Seq2SeqSRConfig(FromParams):
     weight_decay: float = 0.01
     batch_size: int = 1
     grad_accum: int = 16
-    # "adamw": standard, but two fp32-or-bf16 state tensors per param (~16-32 GB
-    # for T5Gemma 2 1B-1B).
-    # "adafactor": T5 paper's optimizer, factored 2nd moment, ~50 MB of state
-    # total. Use this when the AdamW footprint OOMs.
+    # "adamw" (two state tensors per param) or "adafactor" (factored 2nd moment,
+    # far less memory). Use adafactor when the AdamW footprint OOMs.
     optimizer: str = "adafactor"
     num_warmup_steps: int | None = None
     max_grad_norm: float = 1.0
     amp: bool = True
     patience: int = 5
     log_every: int = 5
-    # Skip dev validation until this epoch (0 = validate from the start).
-    # Generative parsers decode every dev doc to max_output_length while
-    # undertrained, so early evals cost hours for a ~0 score. In HASH_EXCLUDE,
-    # so changing it is resume-safe. Applies within a validating phase. A
-    # curriculum's non-final phases skip validation regardless (empty dev set).
+    # Skip dev validation until this epoch (0 = from the start). Useful here
+    # because decoding undertrained dev docs is slow for a ~0 score. Resume-safe
+    # (in HASH_EXCLUDE). Non-final curriculum phases skip validation regardless.
     begin_validation_epoch: int = 0
     checkpoint_dir: str = "checkpoints"
     run_name: str | None = None
@@ -71,37 +63,23 @@ class Seq2SeqSRConfig(FromParams):
     use_validity_constraints: bool = True
     eval_decode_greedy: bool = True
 
-    # Minimum number of `<copy>` actions required before `<shift>` becomes
-    # legal at decode time (inference-only, has no effect on training). 1
-    # is no constraint. Bump to 2 or 3 to suppress over-segmentation
-    # (splits like "Education" + "and early loves" out of one gold EDU).
-    # The model trained on real EDUs of length >=1 may still want to shift
-    # after a single copy, but the constraint forces it to continue copying.
-    # Exception: at the end of the source, shift is always legal regardless
-    # of this setting (otherwise the final EDU can't be committed).
+    # Min `<copy>` actions before `<shift>` is legal at decode time (inference
+    # only). 1 = no constraint, bump to 2-3 to suppress over-segmentation.
+    # At end-of-source `<shift>` is always legal (else the last EDU can't commit).
     min_edu_length: int = 1
 
-    # Cap per-epoch dev eval to the first N documents (in directory order) to
-    # speed up training-time validation. Autoregressive generation at L≈3K on
-    # a 1B decoder is ~1 min/doc even with KV cache. Full GUM dev (32 docs)
-    # costs ~30 min/epoch. None = use the full dev set every epoch. The FINAL
-    # dev/test eval always runs on the full split regardless of this setting.
+    # Cap per-epoch dev eval to the first N docs (directory order) to speed up
+    # validation. None = full dev set each epoch. The final dev/test eval is
+    # always on the full split regardless.
     dev_max_docs: int | None = None
 
-    # Batch size for dev/test predictions. Each batch shares one decoder pass
-    # (weights stream from HBM once, KV cache strides across the batch) so
-    # this is bandwidth-bound rather than compute-bound and roughly linear
-    # in batch_size up to memory. 1 = original per-document loop.
+    # Batch size for dev/test predictions (KV cache strides across the batch).
+    # 1 = per-document loop. Bump up to memory.
     dev_batch_size: int = 1
 
-    # Multiplier on the gradient contribution of structural-action positions
-    # (`<shift>`, `<reduce_*>`) in the training loss. Default 1.0 (no
-    # rebalance) since the replacement lm_head projects to ~100 action
-    # classes, copy CE is on the same scale as structural CE and the old
-    # 262K-vocab justification for upweighting structurals doesn't apply.
-    # Bump above 1.0 only if action positions are demonstrably starved
-    # (e.g. copy CE near zero but structural CE high). Higher values bias
-    # the model toward over-emitting `<shift>` at inference.
+    # Gradient multiplier on structural-action positions (`<shift>`, `<reduce_*>`).
+    # 1.0 = no rebalance (copy and structural CE share a scale under the small
+    # action head). Bump only if action positions are demonstrably starved.
     action_loss_weight: float = 1.0
 
     # Per-document loss weight proportional to (#EDUs ** edu_loss_weight_exponent),
@@ -110,9 +88,8 @@ class Seq2SeqSRConfig(FromParams):
     # curriculum phase over that phase's trees.
     edu_loss_weight_exponent: float = 0.0
 
-    # Label smoothing on the CE loss. Standard seq2seq fine-tuning trick.
-    # The action head is small (~100 classes) and GUM has ~150 train docs,
-    # so hard targets overfit fast. 0.1 is the conventional default.
+    # Label smoothing on the CE loss. 0.1 is a reasonable default for the small
+    # action head and few training docs.
     label_smoothing: float = 0.1
 
     @classmethod

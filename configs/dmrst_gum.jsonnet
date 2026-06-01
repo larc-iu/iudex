@@ -1,71 +1,66 @@
-// DMRST trained on GUM 12.1 (English RST + EDU segmentation).
+// DMRST on GUM 12.1 (fine relations), joint RST parsing + EDU segmentation.
+// Modern showcase (ettin encoder, CRF segmentation). For the paper-faithful
+// RST-DT setup see configs/repro/dmrst_rstdt.jsonnet.
 {
-    relation_map: null,
+    // Data
+    train_dir: 'data/gum_12.1.0_notok/train',
+    dev_dir: 'data/gum_12.1.0_notok/dev',
+    test_dir: 'data/gum_12.1.0_notok/test',
+    relation_types: null,                                  // inferred at train time
+    relation_map: null,                                    // GUM uses its native fine set
 
     // Model
-    model_name: "jhu-clsp/ettin-encoder-150m",
+    model_name: 'jhu-clsp/ettin-encoder-150m',
     stride: 100,
-    attention_type: "dot_product",
+    encoder_window_size: null,                             // null = shared striding (CLS/SEP per chunk)
+    attention_type: 'dot_product',                         // or 'biaffine'
     classifier_use_bias: true,
     num_rnn_layers: 1,
     encoder_dropout: 0.5,
     decoder_dropout: 0.5,
     labeler_dropout: 0.5,
     doc_gru_dropout: 0.2,
-    label_input_pooling: "mean",
-    // original DMRST: freeze embeddings and first 3 encoder layers
-    freeze_encoder_layers: 0,
+    label_input_pooling: 'mean',                           // or 'last_edu'
     freeze_embeddings: false,
+    freeze_encoder_layers: 0,
+    peft: null,                                            // LoRA. null = full fine-tuning
 
-    // LoRA encoder fine-tuning (see _PeftConfig). Null = full fine-tuning. To enable,
-    // keep freeze_encoder_layers: 0 / freeze_embeddings: false (peft rejects combining
-    // with them), then e.g. peft: { r: 16, alpha: 32, dropout: 0.05 } (and bump encoder_lr).
-    // peft: {
-    //     r: 16,
-    //     alpha: 32,
-    //     dropout: 0.05
-    // },
-    peft: null,
+    // Curriculum (Registrable). SimpleCurriculum = cold full-document training and
+    // owns the epoch budget. SubtreeSizeCurriculum warms up on small subtrees first.
+    curriculum: { epochs: 100 },
 
-    // Joint EDU segmentation. Set to `null` to disable.
+    // Joint EDU segmentation. Scheme-based segmenter (BIE/BO/EO) with crf or ce
+    // loss. null disables it (and `predict_from_text`).
     segmentation: {
         scheme: 'BIE',
         loss: 'crf',
         dropout: 0.3,
+        pos_weight: 10.0,                                  // 'ce' loss only, ignored under crf
+        start_loss: false,                                 // binary end-tagger only (scheme: null)
     },
-    // original DMRST: no CRF
-    // segmentation: {
-    //     pos_weight: 10.0,
-    //     start_loss: false,
-    // },
-
-    // Detokenize corpus EDU text to natural form so the segmenter trains on the
-    // same kind of text `predict_from_text` sees. Only applied with segmentation.
+    // Detokenize EDU text before segmentation training so it matches the raw text
+    // `predict_from_text` sees. null = feed corpus text as-is.
     detokenizer: null,
 
-    // Data
-    train_dir: "data/gum_12.1.0_notok/train",
-    dev_dir: "data/gum_12.1.0_notok/dev",
-    test_dir: "data/gum_12.1.0_notok/test",
+    // Dynamic loss weighting (paper §3.2). window: 2 = the paper's lagged
+    // L(t-1)/L(t-2) ratio, larger windows are smoother (better for whole-tree
+    // training). null = unweighted sum.
+    dlw: { temperature: 2.0, window: 30 },
 
     // Training
     lr: 2e-4,
-    encoder_lr: 2e-5,
-    curriculum: { epochs: 100 },
+    encoder_lr: 2e-5,                                      // null = use `lr` for the encoder too
     grad_accum: 3,
+    amp: true,                                             // bf16 autocast (CUDA), inference stays fp32
     patience: 10,
     max_grad_norm: 20.0,
     weight_decay: 0.01,
-    num_warmup_steps: 100,
+    num_warmup_steps: 100,                                 // null = 1-epoch warmup, 0 = none
     log_every: 1,
-    checkpoint_dir: "checkpoints",
+    begin_validation_epoch: 0,                             // skip dev eval until this epoch
+    edu_loss_weight_exponent: 0.0,                         // weight docs by #EDUs**exp, 0 = equal
+    checkpoint_dir: 'checkpoints',
     run_name: null,
     seed: 42,
-    val_metric_name: "e2e_full_f1",
-
-    // Dynamic loss weighting. `window: 2` reproduces the paper's lagged
-    // L(t-1)/L(t-2) ratio; larger windows give smoother ratios at the cost
-    // of slower adaptation (recommended for noisy whole-tree training).
-    // Set to `null` for unweighted sum.
-    dlw: { temperature: 2.0, window: 30 },
+    val_metric_name: 'e2e_full_f1',
 }

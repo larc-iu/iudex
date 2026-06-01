@@ -40,16 +40,9 @@ class _EMAConfig(FromParams):
         w_k ∝ exp((curr_loss_k / max(ema_loss_k, 1e-3)) / temperature)
         ema_loss_k = momentum * ema_loss_k + (1 - momentum) * curr_loss_k
 
-    Component losses are `split`, `label`, and (when joint segmentation is
-    on) `seg`. Set `ema: null` in jsonnet for an unweighted sum.
-
-    Why EMA instead of DMRST's window-based DLW: per-step loss under
-    whole-tree training is dominated by per-document variance, and a hard
-    2-step ratio amplifies that noise (and degenerates on small RST trees
-    where `split_loss` can be 0). EMA gives a smoothly-decaying baseline
-    (effective window ≈ `1 / (1 - momentum)` steps; default 0.95 ≈ 20
-    steps) — much more stable, and a single zero step only nudges the
-    baseline by `(1 - momentum)`.
+    Component losses are `split`, `label`, and (when joint segmentation is on)
+    `seg`. The effective averaging window is ≈ 1 / (1 - momentum) steps (0.95 ≈
+    20). Set `ema: null` in jsonnet for an unweighted sum.
     """
 
     momentum: float = 0.95

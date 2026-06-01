@@ -1,21 +1,22 @@
-// seq2seq_sexp trained on RST-DT with the 18 coarse Carlson & Marcu
-// classes. Canonical config: every field on `Seq2SeqSexpConfig` is set
-// explicitly, even if at the dataclass default, so the file is self-
-// documenting.
+// seq2seq_sexp on RST-DT (coarse). Encoder-decoder LM generates a nested
+// s-expression linearization of the tree.
 {
     // Data
     train_dir: 'data/rstdt/train',
     dev_dir: 'data/rstdt/dev',
     test_dir: 'data/rstdt/test',
-    relation_types: null,
+    relation_types: null,                                  // inferred at train time
     relation_map: import 'lib/rstdt_coarse_map.libsonnet',
 
     // Model
     model_name: 'google/t5gemma-2-1b-1b',
-    max_input_length: 3072,
-    max_output_length: 8192,
-    gradient_checkpointing: false,
+    max_input_length: 3072,                                // encoder subwords (no specials)
+    max_output_length: 8192,                               // decoder target (sexp is ~2x the SR action length)
+    gradient_checkpointing: false,                         // set true to trade compute for memory
 
+    // LoRA. null = full fine-tuning. Under use_copy (default) the lm_head is replaced
+    // with a small action-vocab head and only the new embedding rows train, so
+    // modules_to_save / train_only_new_embedding_rows are honored only when use_copy=false.
     peft: {
         r: 8,
         alpha: 16,
@@ -23,49 +24,48 @@
         target_modules: 'all-linear',
         bias: 'none',
         dora: false,
-        // No effect under the default use_copy=true (small action head, frozen
-        // base embedding + new-rows Parameter). Honored only under use_copy=false.
         modules_to_save: ['embed_tokens'],
         train_only_new_embedding_rows: true,
     },
 
+    // Curriculum (Registrable). SimpleCurriculum = cold full-document training and
+    // owns the epoch budget. SubtreeSizeCurriculum warms up on small subtrees first.
+    curriculum: { epochs: 200 },
+
     // Training
     lr: 3e-4,
     weight_decay: 0.05,
-    curriculum: { epochs: 200 },
     batch_size: 1,
     grad_accum: 8,
-    optimizer: 'adafactor',
-    num_warmup_steps: null,
+    optimizer: 'adafactor',                                // or 'adamw' (more memory)
+    num_warmup_steps: null,                                // null = 1-epoch warmup, 0 = none
     max_grad_norm: 1.0,
-    amp: true,
+    amp: true,                                             // bf16 autocast (CUDA), inference stays fp32
     patience: 5,
     log_every: 5,
+    begin_validation_epoch: 0,                             // skip slow dev decodes until this epoch
     checkpoint_dir: 'checkpoints',
     run_name: null,
     seed: 42,
     val_metric_name: 'e2e_full_f1',
-    action_loss_weight: 1.0,
-    // Applied uniformly at this value in both use_copy modes (no auto-scaling).
-    // Under use_copy=false this is a known confound across the ~100-class head
-    // and the full-vocab head.
+
+    // Loss
+    action_loss_weight: 1.0,                               // gradient multiplier on structural actions, 1.0 = no rebalance
+    edu_loss_weight_exponent: 0.0,                         // weight docs by #EDUs**exp, 0 = equal
     label_smoothing: 0.1,
 
     // Dev eval
-    dev_max_docs: null,
-    dev_batch_size: 1,
+    dev_max_docs: null,                                    // null = full dev set each epoch (final eval always full)
+    dev_batch_size: 1,                                     // bump to batch dev decodes
 
     // Decoding
     num_beams: 4,
     use_validity_constraints: true,
     eval_decode_greedy: true,
-    min_edu_length: 1,
+    min_edu_length: 1,                                     // require >=N content tokens before a leaf can close (1 = off)
 
     // Sexp-specific
-    traversal_order: 'postorder',
-    use_copy: true,
-    // Only meaningful when use_copy=false. true = hard-mask content
-    // positions to source_ids[cursor] (COPY-via-constraint). false =
-    // free content generation (Hu and Wan 2023's apparent setup).
-    constrain_content: true,
+    traversal_order: 'postorder',                          // or 'preorder'
+    use_copy: true,                                        // true: <copy> sentinel + small head. false: verbatim source + full head (Hu & Wan 2023)
+    constrain_content: true,                               // use_copy=false only: hard-mask content positions to the source cursor
 }
