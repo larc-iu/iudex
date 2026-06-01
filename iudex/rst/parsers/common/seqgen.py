@@ -11,6 +11,13 @@ pure, self-contained, and costly to keep in hand-sync across copies:
 - `reorder_past_key_values`: beam-search KV-cache reordering. Defensive
   HF-version-compat plumbing, where a future transformers bump otherwise needs
   the same fix applied in all four parsers or three of them silently rot.
+- `beam_topk_step` / `beam_reorder_needed` / `select_best_beam`: the
+  serialization-agnostic beam-search primitives (top-K expansion with the
+  dead-beam NaN guard, the reorder-is-a-no-op predicate, and GNMT
+  length-normalized candidate selection). Each parser's `_predict_one_beam`
+  still owns its loop top-to-bottom (mask, state transition, tree
+  reconstruction stay local), but these three subtle, must-stay-in-sync blocks
+  live here so a fix lands once.
 - `reconstruct_text` / `gold_edu_source_ranges` / `empty_tree` /
   `repair_actions` / `fallback_reduce`: the SR parsers' shared text-reconstruct,
   gold-range tiling, single-EDU fallback, and action-sequence repair logic.
@@ -23,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from iudex.common.log import warn
 from iudex.rst.data.tree import (
@@ -168,6 +176,57 @@ def reorder_past_key_values(past_key_values, beam_idx: torch.Tensor, model):
         tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
         for layer in past_key_values
     )
+
+
+def beam_topk_step(
+    beam_scores: torch.Tensor,
+    masked_logits: torch.Tensor,
+    k: int,
+) -> tuple[torch.Tensor, list[int], list[int]]:
+    """One beam-search expansion step, serialization-agnostic.
+
+    `masked_logits` is [K, V] with illegal continuations already set to -inf by
+    the caller's per-beam validity mask. `beam_scores` is [K] cumulative
+    log-prob (dead beams at -inf). Returns the top-K continuations as
+    (top_scores [K], parents list[int], actions list[int]), where the flat
+    top-k index `flat = parent * V + action` is decoded back into the parent
+    beam and the chosen action (a column of `masked_logits`).
+
+    The NaN guard is load-bearing: a fully-masked dead beam (-inf score, all-inf
+    row) yields -inf + NaN = NaN, and `topk` ranks NaN above any finite negative,
+    so without it a dead beam's children crowd out live beams. Shared verbatim
+    across the four generative parsers' beam loops (it must stay in sync, the
+    failure mode is silent)."""
+    v = masked_logits.size(-1)
+    log_probs = F.log_softmax(masked_logits.float(), dim=-1)
+    cum = beam_scores.unsqueeze(1) + log_probs
+    cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
+    top_scores, top_idx = cum.view(-1).topk(k)
+    parents = (top_idx // v).tolist()
+    actions = (top_idx % v).tolist()
+    return top_scores, parents, actions
+
+
+def beam_reorder_needed(step: int, parents: list[int], k: int, past_key_values) -> bool:
+    """Whether the KV cache + decoder inputs need reordering by `parents` this
+    step. Skips the no-op cases: step 0 expands K identical rows from the single
+    seed beam (all parents 0), and an identity permutation rearranges nothing.
+    `past_key_values is None` (pre-cache) also needs no reorder."""
+    if past_key_values is None:
+        return False
+    is_step0_uniform = step == 0 and all(p == 0 for p in parents)
+    is_identity = parents == list(range(k))
+    return not (is_step0_uniform or is_identity)
+
+
+def select_best_beam(candidates: list[dict], alpha: float = BEAM_LENGTH_PENALTY_ALPHA) -> dict:
+    """Pick the length-normalized best beam from a candidate pool. Each candidate
+    is a dict carrying at least `"score"` (cumulative sum log-prob) and
+    `"length"` (token count). Dividing by `length**alpha` mitigates the bias
+    toward shorter beams (every emitted token has log-prob <= 0, so raw
+    sum-log-prob monotonically favors fewer-token trajectories). `alpha=0.6` is
+    the GNMT default. Caller must ensure `candidates` is non-empty."""
+    return max(candidates, key=lambda c: c["score"] / max(c["length"], 1) ** alpha)
 
 
 @dataclass

@@ -32,11 +32,10 @@ from iudex.common.training import (
     write_run_config,
 )
 from iudex.rst import HASH_EXCLUDE
-from iudex.rst.data.metrics import compute_parseval_metrics, f1, metrics_table
+from iudex.rst.data.metrics import metrics_table
 from iudex.rst.data.reader import infer_relation_types, read_rst_dir
-from iudex.rst.data.seg_metrics import evaluate_seg_and_e2e
 from iudex.rst.data.tree import RstTree
-from iudex.rst.parsers.common.seqgen import align_edus_to_tokens, reconstruct_text
+from iudex.rst.parsers.common.generative_eval import evaluate_on_dev
 from iudex.rst.parsers.decoder_only_sr.configuration_decoder_only_sr import (
     DecoderOnlySRConfig,
 )
@@ -114,119 +113,6 @@ def _make_collator(pad_id: int, weight_table: dict[int, float] | None = None):
         return model_batch, {"weights": weights}
 
     return collate
-
-
-def _gold_edu_token_mapping(model: DecoderOnlySRParser, tree: RstTree) -> tuple[list[int], list[tuple[int, int]]]:
-    """EDU end-positions and per-EDU `(start, end_exclusive)` ranges in
-    the source tokenizer's whole-doc token space. Delegates to the shared
-    `align_edus_to_tokens` tiling helper so train and predict agree exactly."""
-    text = reconstruct_text(tree)
-    _, mapping = align_edus_to_tokens(model.tokenizer, text, tree.edus)
-    edu_ends = [end - 1 for _, end in mapping]
-    return edu_ends, mapping
-
-
-def _pred_edu_token_mapping(pred_tree: RstTree) -> tuple[list[int], list[tuple[int, int]]]:
-    ranges = getattr(pred_tree, "_pred_edu_source_ranges", None)
-    if ranges is None:
-        return [], []
-    edu_ends = [end - 1 for _, end in ranges]
-    return edu_ends, list(ranges)
-
-
-def _write_rs4(tree: RstTree, output_dir: str, basename: str) -> None:
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, basename)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(tree.to_rs4_string())
-
-
-@torch.no_grad()
-def _evaluate_gold_edu(
-    model: DecoderOnlySRParser,
-    dev_pairs: list[tuple[str, RstTree]],
-) -> dict[str, float]:
-    totals = {f"{m}_{x}_count": 0 for m in ("span", "nuc", "rel", "full") for x in ("p", "r")}
-    totals["num_spans"] = 0
-    skipped = 0
-    eval_t0 = time.monotonic()
-    for filepath, gold in dev_pairs:
-        pred = model.predict_with_gold_edus(gold)
-        if len(pred.edus) != len(gold.edus):
-            skipped += 1
-            continue
-        try:
-            per_tree = compute_parseval_metrics(gold, pred)
-        except ValueError:
-            skipped += 1
-            continue
-        for k in totals:
-            totals[k] += per_tree[k]
-    dim(
-        f"  gold-EDU eval: {time.monotonic() - eval_t0:.1f}s over {len(dev_pairs)} docs"
-        + (f" ({skipped} skipped for EDU-count drift)" if skipped else "")
-    )
-    num_spans = totals["num_spans"]
-    if num_spans == 0:
-        return {f"gold_edu_{m}_f1": 0.0 for m in ("span", "nuc", "rel", "full")}
-    return {
-        f"gold_edu_{m}_f1": f1(totals[f"{m}_p_count"] / num_spans, totals[f"{m}_r_count"] / num_spans)
-        for m in ("span", "nuc", "rel", "full")
-    }
-
-
-@torch.no_grad()
-def _evaluate_on_dev(
-    model: DecoderOnlySRParser,
-    dev_pairs: list[tuple[str, RstTree]],
-    *,
-    num_beams: int | None = None,
-    batch_size: int = 1,
-    output_dir: str | None = None,
-    eval_gold_edu: bool = False,
-) -> dict[str, float]:
-    """End-to-end Parseval + segmentation F1 over the dev/test pairs.
-    Mirrors `seq2seq_sr.train_seq2seq_sr._evaluate_on_dev` (same metric
-    contract, same per-batch logging)."""
-    model.eval()
-    gold_trees: list[RstTree] = []
-    seg_data: list[dict] = []
-    eval_t0 = time.monotonic()
-    for chunk_start in range(0, len(dev_pairs), batch_size):
-        chunk = dev_pairs[chunk_start : chunk_start + batch_size]
-        chunk_t0 = time.monotonic()
-        preds = model.predict_batch([gold for _, gold in chunk], num_beams=num_beams)
-        chunk_dt = time.monotonic() - chunk_t0
-        names = ",".join(os.path.basename(fp) for fp, _ in chunk)
-        gold_counts = [len(g.edus) for _, g in chunk]
-        pred_counts = [len(p.edus) for p in preds]
-        dim(
-            f"  dev {chunk_start + 1}-{chunk_start + len(chunk)}/{len(dev_pairs)} "
-            f"[{names}]: gold_edus={gold_counts} pred_edus={pred_counts} {chunk_dt:.1f}s"
-        )
-        for (filepath, gold), pred in zip(chunk, preds):
-            gold_trees.append(gold)
-            gold_ends, gold_map = _gold_edu_token_mapping(model, gold)
-            pred_ends, pred_map = _pred_edu_token_mapping(pred)
-            seg_data.append(
-                {
-                    "gold_edu_ends": gold_ends,
-                    "pred_edu_ends": pred_ends,
-                    "e2e_pred": pred,
-                    "gold_edu_mapping": gold_map,
-                    "pred_edu_mapping": pred_map,
-                }
-            )
-            if output_dir is not None:
-                basename = os.path.splitext(os.path.basename(filepath))[0] + ".rs4"
-                _write_rs4(pred, output_dir, basename)
-    dim(f"  dev eval total: {time.monotonic() - eval_t0:.1f}s over {len(dev_pairs)} documents")
-    if output_dir is not None:
-        console.print(f"[dim]Wrote {len(dev_pairs)} predictions under[/dim] [path]{os.path.abspath(output_dir)}[/path]")
-    metrics = evaluate_seg_and_e2e(gold_trees, seg_data)
-    if eval_gold_edu:
-        metrics.update(_evaluate_gold_edu(model, dev_pairs))
-    return metrics
 
 
 def train(cfg: DecoderOnlySRConfig) -> None:
@@ -361,7 +247,7 @@ def train(cfg: DecoderOnlySRConfig) -> None:
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         # Per-epoch validation deliberately skips the gold-EDU pass to save
         # time. Final dev/test eval below always runs it.
-        metrics = _evaluate_on_dev(
+        metrics = evaluate_on_dev(
             model,
             per_epoch_dev,
             num_beams=dev_beams,
@@ -511,7 +397,7 @@ def train(cfg: DecoderOnlySRConfig) -> None:
         # written. Evaluate the last-epoch model in memory rather than skipping eval.
         warn("No best_model.pt found (no validation ran). Evaluating the final-epoch model.")
     model.eval()
-    dev_m = _evaluate_on_dev(
+    dev_m = evaluate_on_dev(
         model,
         dev_pairs,
         num_beams=cfg.num_beams,
@@ -522,7 +408,7 @@ def train(cfg: DecoderOnlySRConfig) -> None:
     console.print(metrics_table(dev_m, title="Final Dev Results"))
     final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
     if test_pairs is not None:
-        test_m = _evaluate_on_dev(
+        test_m = evaluate_on_dev(
             model,
             test_pairs,
             num_beams=cfg.num_beams,

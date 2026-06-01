@@ -2,37 +2,8 @@ from dataclasses import dataclass, field
 
 from tonga import FromParams
 
-from iudex.rst.parsers.common.config import parse_config_dict
+from iudex.rst.parsers.common.config import PeftConfig, parse_config_dict
 from iudex.rst.parsers.common.curriculum import Curriculum, SimpleCurriculum
-
-
-@dataclass
-class _PeftConfig(FromParams):
-    """LoRA fine-tuning of the seq2seq stack. Mirrors `DMRSTConfig._PeftConfig`.
-
-    The lm_head is replaced at parser-init with a fresh, small Linear over
-    the action vocab. The input embedding is kept fully trainable with a
-    backward hook zeroing the pretrained rows' gradient, so only the new
-    action-token rows update (see
-    `iudex.rst.parsers.common.seqgen.mask_old_embedding_gradients`).
-    """
-
-    r: int = 16
-    alpha: int = 32
-    dropout: float = 0.05
-    target_modules: str | list[str] = "all-linear"
-    bias: str = "none"
-    dora: bool = False
-    # No-ops, kept so existing jsonnets load. The input embedding is not routed
-    # through PEFT modules_to_save: instead the full embedding is kept trainable
-    # with a backward hook zeroing pretrained-row gradients (see
-    # `_mask_old_embedding_gradients`), so neither field has any effect.
-    modules_to_save: list[str] = field(default_factory=lambda: ["embed_tokens"])
-    train_only_new_embedding_rows: bool = True
-
-    def __post_init__(self):
-        if self.r < 1:
-            raise ValueError(f"_PeftConfig.r must be >= 1 (got {self.r})")
 
 
 @dataclass
@@ -61,7 +32,7 @@ class Seq2SeqSRConfig(FromParams):
     # frozen and only LoRA adapters + the modules in `peft.modules_to_save`
     # train. For T5Gemma2 / mT5 at 1B+ scale this is the practical default
     # since full FT blows up optimizer memory.
-    peft: _PeftConfig | None = None
+    peft: PeftConfig | None = None
 
     # Curriculum strategy (Registrable). Default `SimpleCurriculum` reproduces
     # cold full-document training. `SubtreeSizeCurriculum` warms up on small

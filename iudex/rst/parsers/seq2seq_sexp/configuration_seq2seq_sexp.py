@@ -2,42 +2,8 @@ from dataclasses import dataclass, field
 
 from tonga import FromParams
 
-from iudex.rst.parsers.common.config import parse_config_dict
+from iudex.rst.parsers.common.config import PeftConfig, parse_config_dict
 from iudex.rst.parsers.common.curriculum import Curriculum, SimpleCurriculum
-
-
-@dataclass
-class _PeftConfig(FromParams):
-    """LoRA fine-tuning of the seq2seq stack. Mirrors `Seq2SeqSRConfig._PeftConfig`.
-
-    Under `use_copy=True` the lm_head is replaced with a small fresh Linear
-    over the action vocab and the input embedding stays fully trainable with
-    pretrained-row gradients zeroed (`seqgen.mask_old_embedding_gradients`).
-    `modules_to_save` / `train_only_new_embedding_rows` have no effect.
-
-    Under `use_copy=False` the full pretrained tied lm_head is kept (source
-    subwords predicted natively), so `modules_to_save=['embed_tokens']` is
-    honored to keep all embedding rows trainable, and
-    `train_only_new_embedding_rows` is auto-overridden to False (see
-    `Seq2SeqSexpConfig.__post_init__`).
-    """
-
-    r: int = 16
-    alpha: int = 32
-    dropout: float = 0.05
-    target_modules: str | list[str] = "all-linear"
-    bias: str = "none"
-    dora: bool = False
-    # Honored only under use_copy=False (keeps all embedding rows trainable so
-    # the full tied lm_head can score source ids). Ignored under use_copy=True.
-    modules_to_save: list[str] = field(default_factory=lambda: ["embed_tokens"])
-    # No-op under use_copy=True (the carve-out always trains only new rows).
-    # Auto-forced to False under use_copy=False by the config __post_init__.
-    train_only_new_embedding_rows: bool = True
-
-    def __post_init__(self):
-        if self.r < 1:
-            raise ValueError(f"_PeftConfig.r must be >= 1 (got {self.r})")
 
 
 @dataclass
@@ -68,7 +34,7 @@ class Seq2SeqSexpConfig(FromParams):
     # frozen and only LoRA adapters + the modules in `peft.modules_to_save`
     # train. For T5Gemma2 / mT5 at 1B+ scale this is the practical default
     # since full FT blows up optimizer memory.
-    peft: _PeftConfig | None = None
+    peft: PeftConfig | None = None
 
     # Curriculum strategy (Registrable). Default `SimpleCurriculum` reproduces
     # cold full-document training. `SubtreeSizeCurriculum` warms up on small

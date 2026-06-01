@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 
 from tonga import FromParams
 
-from iudex.rst.parsers.common.config import parse_config_dict
+from iudex.rst.parsers.common.config import PeftConfig, parse_config_dict
 from iudex.rst.parsers.common.curriculum import Curriculum, SimpleCurriculum
 from iudex.rst.parsers.common.detokenization import Detokenizer
 
@@ -20,32 +20,6 @@ class _SegmentationConfig(FromParams):
     scheme: str | None = None
     loss: str = "crf"
     dropout: float = 0.5
-
-
-@dataclass
-class _PeftConfig(FromParams):
-    """LoRA fine-tuning of the encoder. Null (default) = full fine-tuning.
-    When set, the base encoder is frozen and only the low-rank adapters train,
-    so a higher `encoder_lr` (~1e-4) is appropriate, and combining it with
-    `freeze_embeddings` / `freeze_encoder_layers` is rejected as contradictory.
-    """
-
-    r: int = 16
-    alpha: int = 32
-    dropout: float = 0.05
-    # Which encoder submodules get adapters. "all-linear" (attention + FFN) suits
-    # tasks far from the MLM pretraining objective, like discourse parsing; pass an
-    # explicit list (e.g. ["query", "value"]) for the classic attention-only LoRA.
-    target_modules: str | list[str] = "all-linear"
-    bias: str = "none"
-    # DoRA (Liu et al. 2024): decompose each adapted weight into magnitude +
-    # direction; only direction passes through the low-rank decomposition while
-    # magnitude is a separate per-output-dim trainable vector.
-    dora: bool = False
-
-    def __post_init__(self):
-        if self.r < 1:
-            raise ValueError(f"_PeftConfig.r must be >= 1 (got {self.r})")
 
 
 @dataclass
@@ -108,9 +82,9 @@ class DMRSTConfig(FromParams):
     freeze_embeddings: bool = True
     freeze_encoder_layers: int = 3
 
-    # LoRA encoder fine-tuning. See `_PeftConfig`. Mutually exclusive with the
+    # LoRA encoder fine-tuning. See `PeftConfig`. Mutually exclusive with the
     # freeze fields above (set both to off when enabling peft).
-    peft: _PeftConfig | None = None
+    peft: PeftConfig | None = None
 
     # Curriculum strategy (Registrable). Default `SimpleCurriculum` reproduces
     # cold full-document training. `SubtreeSizeCurriculum` warms up on small

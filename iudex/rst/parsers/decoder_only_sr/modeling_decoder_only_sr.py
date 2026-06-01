@@ -30,15 +30,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from iudex.common.log import warn
 from iudex.rst.parsers.common.seqgen import (
-    BEAM_LENGTH_PENALTY_ALPHA,
     ShiftReduceDecodeState,
     align_edus_to_tokens,
+    beam_reorder_needed,
+    beam_topk_step,
     empty_tree,
     gold_edu_source_ranges,
     mask_old_embedding_gradients,
     reconstruct_text,
     reorder_past_key_values,
     repair_actions,
+    select_best_beam,
 )
 from iudex.rst.data.tree import (
     Reduce,
@@ -668,7 +670,6 @@ class DecoderOnlySRParser(nn.Module):
         K = int(num_beams)
         eos_id = int(self.tokenizer.eos_token_id)
         pad_id = int(self.tokenizer.pad_token_id)
-        head_V = self.head_vocab_size
         min_edu_len = max(1, int(self.config.min_edu_length))
 
         source_ids = self._tokenize_source(text)
@@ -713,29 +714,10 @@ class DecoderOnlySRParser(nn.Module):
                         masked[j, self._reduce_head_ids_buf] = logits[j, self._reduce_head_ids_buf]
                     if st.eos_ok:
                         masked[j, self.eos_head_idx] = logits[j, self.eos_head_idx]
-                log_probs = F.log_softmax(masked.float(), dim=-1)
-                cum = beam_scores.unsqueeze(1) + log_probs
-                # Dead beams (score=-inf, all-masked row) produce -inf + NaN = NaN
-                # rows. topk ranks NaN above any finite negative, so without this
-                # the dead beam's children would crowd out live beams.
-                cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
-                # `cum` is [K, head_V]; flattening to [K*head_V] and decoding the
-                # flat index splits it back into (parent_beam, action) via
-                # flat = parent_beam * head_V + action.
-                top_scores, top_idx = cum.view(-1).topk(K)
-                parent_of_new = (top_idx // head_V).tolist()
-                action_of_new = (top_idx % head_V).tolist()
+                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, masked, K)
 
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
-                # Skip the reorder when it's provably a no-op: step 0
-                # has `parent_of_new == [0]*K` because only beam 0 was
-                # alive, and the prefix forward already replicated K
-                # identical cache rows. Later steps where parents form
-                # the identity permutation are also no-ops.
-                is_step0_uniform = step == 0 and all(p == 0 for p in parent_of_new)
-                is_identity = parent_of_new == list(range(K))
-                needs_reorder = past_key_values is not None and not (is_step0_uniform or is_identity)
-                if needs_reorder:
+                if beam_reorder_needed(step, parent_of_new, K, past_key_values):
                     past_key_values = reorder_past_key_values(past_key_values, parent_tensor, self._underlying_model())
 
                 # Carry per-beam state from parents. Each child gets its OWN
@@ -816,10 +798,7 @@ class DecoderOnlySRParser(nn.Module):
         if not candidates:
             return empty_tree(self.config.relation_types)
 
-        best = max(
-            candidates,
-            key=lambda c: c["score"] / max(c["length"], 1) ** BEAM_LENGTH_PENALTY_ALPHA,
-        )
+        best = select_best_beam(candidates)
         if not best.get("finished", False):
             warn(
                 f"Output truncated at inference (beam): generation hit "

@@ -28,15 +28,17 @@ from iudex.rst.data.tree import (
     Shift,
 )
 from iudex.rst.parsers.common.seqgen import (
-    BEAM_LENGTH_PENALTY_ALPHA,
     ShiftReduceDecodeState,
     align_edus_to_tokens,
+    beam_reorder_needed,
+    beam_topk_step,
     empty_tree,
     gold_edu_source_ranges,
     mask_old_embedding_gradients,
     reconstruct_text,
     reorder_past_key_values,
     repair_actions,
+    select_best_beam,
 )
 from iudex.rst.parsers.seq2seq_sr.configuration_seq2seq_sr import Seq2SeqSRConfig
 
@@ -826,7 +828,6 @@ class Seq2SeqSRParser(nn.Module):
         eos_id = self.tokenizer.eos_token_id
         bos_id = self.tokenizer.bos_token_id
         decoder_start = self.decoder_start_token_id
-        head_V = self.head_vocab_size
         min_edu_len = max(1, int(self.config.min_edu_length))
 
         # Encode the single doc.
@@ -917,30 +918,11 @@ class Seq2SeqSRParser(nn.Module):
                         masked[j, self._reduce_head_ids_buf] = logits[j, self._reduce_head_ids_buf]
                     if st.eos_ok:
                         masked[j, self.eos_head_idx] = logits[j, self.eos_head_idx]
-                log_probs = F.log_softmax(masked.float(), dim=-1)
-                # Add cumulative scores: [K, head_V]
-                cum = beam_scores.unsqueeze(1) + log_probs
-                # Dead beams (score=-inf, all-masked row) produce -inf + NaN = NaN
-                # rows. topk ranks NaN above any finite negative, so without this
-                # the dead beam's children would crowd out live beams.
-                cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
-                # Top-K continuations from K beams × head_V actions. `cum` is
-                # [K, head_V]; flattening to [K*head_V] and decoding the flat
-                # index splits it back into (parent_beam, action):
-                # flat = parent_beam * head_V + action.
-                top_scores, top_idx = cum.view(-1).topk(K)
-                parent_of_new = (top_idx // head_V).tolist()
-                action_of_new = (top_idx % head_V).tolist()
+                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, masked, K)
 
-                # Reorder KV cache by parent_of_new. HF model layouts vary:
-                # (a) `_reorder_cache` on the underlying model (T5/T5Gemma2),
-                # (b) a DynamicCache with `reorder_cache` method (newer HF),
-                # (c) tuple-of-tuple of Tensors with possible None entries
-                #     (cross-attn slots that aren't populated yet).
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
-                if past_key_values is not None:
+                if beam_reorder_needed(step, parent_of_new, K, past_key_values):
                     past_key_values = reorder_past_key_values(past_key_values, parent_tensor, self._underlying_model())
-                # Reorder decoder_input_ids by parent.
                 decoder_input_ids = decoder_input_ids[parent_tensor]
 
                 # Carry per-beam state from parents. Each child gets its OWN
@@ -1034,10 +1016,7 @@ class Seq2SeqSRParser(nn.Module):
         # monotonically favors fewer-token = fewer-EDU trajectories).
         # alpha=0.6 is the GNMT default (alpha=1.0 is mean log-prob, also
         # defensible, 0.6 is the standard mitigation).
-        best = max(
-            candidates,
-            key=lambda c: c["score"] / max(c["length"], 1) ** BEAM_LENGTH_PENALTY_ALPHA,
-        )
+        best = select_best_beam(candidates)
         if not best.get("finished", False):
             warn(
                 f"Output truncated at inference (beam): generation hit "

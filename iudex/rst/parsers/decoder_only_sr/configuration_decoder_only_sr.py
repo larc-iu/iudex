@@ -2,35 +2,8 @@ from dataclasses import dataclass, field
 
 from tonga import FromParams
 
-from iudex.rst.parsers.common.config import parse_config_dict
+from iudex.rst.parsers.common.config import PeftConfig, parse_config_dict
 from iudex.rst.parsers.common.curriculum import Curriculum, SimpleCurriculum
-
-
-@dataclass
-class _PeftConfig(FromParams):
-    """LoRA fine-tuning of the causal LM. Mirrors `Seq2SeqSRConfig._PeftConfig`.
-
-    The lm_head is replaced at parser-init with a fresh, small Linear over
-    the action vocab. The input embedding stays fully trainable, with
-    pretrained-row gradients zeroed so only the new action-token rows update
-    (see `seqgen.mask_old_embedding_gradients`).
-    """
-
-    r: int = 16
-    alpha: int = 32
-    dropout: float = 0.05
-    target_modules: str | list[str] = "all-linear"
-    bias: str = "none"
-    dora: bool = False
-    # No-ops, kept so existing jsonnets load. The input embedding is no longer
-    # routed through PEFT modules_to_save (the single matrix stays trainable
-    # with pretrained-row gradients zeroed instead), so neither field has any effect.
-    modules_to_save: list[str] = field(default_factory=lambda: ["embed_tokens"])
-    train_only_new_embedding_rows: bool = True
-
-    def __post_init__(self):
-        if self.r < 1:
-            raise ValueError(f"_PeftConfig.r must be >= 1 (got {self.r})")
 
 
 @dataclass
@@ -63,7 +36,7 @@ class DecoderOnlySRConfig(FromParams):
     # as belonging to decoder_only_sr.
     causal_mode: bool = True
 
-    peft: _PeftConfig | None = None
+    peft: PeftConfig | None = None
 
     # Curriculum strategy (Registrable). Default `SimpleCurriculum` reproduces
     # cold full-document training. `SubtreeSizeCurriculum` warms up on small
