@@ -28,8 +28,9 @@
         train_only_new_embedding_rows: true,
     },
 
-    // Curriculum (Registrable). SimpleCurriculum = cold full-document training and
-    // owns the epoch budget. SubtreeSizeCurriculum warms up on small subtrees first.
+    // Training schedule, and the total run length (there is no separate max_epochs):
+    // this trains on full documents for `epochs` epochs. To warm up on small subtrees
+    // first, use e.g. { type: 'subtree_size', size_schedule: [8, 20, 60, null], phase_epochs: 5 }.
     curriculum: { epochs: 200 },
 
     // Training

@@ -14,8 +14,9 @@
     stride: 100,                                           // context tokens per side for long-doc striding
     peft: null,                                            // LoRA. null = full fine-tuning (else e.g. {r:16, alpha:32, dropout:0.05})
 
-    // Curriculum (Registrable). SimpleCurriculum = cold full-document training and
-    // owns the epoch budget. SubtreeSizeCurriculum warms up on small subtrees first.
+    // Training schedule, and the total run length (there is no separate max_epochs):
+    // this trains on full documents for `epochs` epochs. To warm up on small subtrees
+    // first, use e.g. { type: 'subtree_size', size_schedule: [8, 20, 60, null], phase_epochs: 5 }.
     curriculum: { epochs: 50 },
 
     // Training

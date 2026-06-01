@@ -27,8 +27,9 @@
     freeze_encoder_layers: 3,                              // and the first 3 layers
     peft: null,                                            // LoRA. null = full fine-tuning
 
-    // Curriculum (Registrable). SimpleCurriculum = cold full-document training and
-    // owns the epoch budget. SubtreeSizeCurriculum warms up on small subtrees first.
+    // Training schedule, and the total run length (there is no separate max_epochs):
+    // this trains on full documents for `epochs` epochs. To warm up on small subtrees
+    // first, use e.g. { type: 'subtree_size', size_schedule: [8, 20, 60, null], phase_epochs: 5 }.
     curriculum: { epochs: 15 },
 
     // Joint EDU segmentation. Paper's binary per-token end-tagger (scheme: null).

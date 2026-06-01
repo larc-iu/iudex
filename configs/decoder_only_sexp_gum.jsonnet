@@ -13,7 +13,7 @@
     max_input_length: 3072,                                // source subwords (single-stream: source + tree share the budget)
     max_output_length: 5120,                               // tree stream
     gradient_checkpointing: false,                         // set true to trade compute for memory
-    causal_mode: true,                                     // parser-kind tag (identifies decoder_only_sexp configs)
+    causal_mode: true,                                     // marks this as a decoder-only (causal LM) parser config
 
     // LoRA. null = full fine-tuning. Under use_copy (default) the lm_head is replaced
     // with a small action-vocab head and only the new embedding rows train, so
@@ -29,8 +29,9 @@
         train_only_new_embedding_rows: true,
     },
 
-    // Curriculum (Registrable). SimpleCurriculum = cold full-document training and
-    // owns the epoch budget. SubtreeSizeCurriculum warms up on small subtrees first.
+    // Training schedule, and the total run length (there is no separate max_epochs):
+    // this trains on full documents for `epochs` epochs. To warm up on small subtrees
+    // first, use e.g. { type: 'subtree_size', size_schedule: [8, 20, 60, null], phase_epochs: 5 }.
     curriculum: { epochs: 200 },
 
     // Training

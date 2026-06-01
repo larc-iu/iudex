@@ -12,7 +12,7 @@
     // Model
     model_name: 'jhu-clsp/ettin-encoder-150m',
     stride: 100,
-    encoder_window_size: null,                             // null = shared striding (CLS/SEP per chunk)
+    encoder_window_size: null,                             // null = default striding over the whole doc; set an int for a fixed-size window (see configs/repro/dmrst_rstdt.jsonnet)
     attention_type: 'dot_product',                         // or 'biaffine'
     classifier_use_bias: true,
     num_rnn_layers: 1,
@@ -25,8 +25,9 @@
     freeze_encoder_layers: 0,
     peft: null,                                            // LoRA. null = full fine-tuning
 
-    // Curriculum (Registrable). SimpleCurriculum = cold full-document training and
-    // owns the epoch budget. SubtreeSizeCurriculum warms up on small subtrees first.
+    // Training schedule, and the total run length (there is no separate max_epochs):
+    // this trains on full documents for `epochs` epochs. To warm up on small subtrees
+    // first, use e.g. { type: 'subtree_size', size_schedule: [8, 20, 60, null], phase_epochs: 5 }.
     curriculum: { epochs: 100 },
 
     // Joint EDU segmentation. Scheme-based segmenter (BIE/BO/EO) with crf or ce

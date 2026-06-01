@@ -13,11 +13,12 @@
     max_input_length: 3072,                                // source subwords (single-stream: source + actions share the budget)
     max_output_length: 5120,                               // action stream
     gradient_checkpointing: false,                         // set true to trade compute for memory
-    causal_mode: true,                                     // parser-kind tag (identifies decoder_only_sr configs)
+    causal_mode: true,                                     // marks this as a decoder-only (causal LM) parser config
 
     // LoRA. null = full fine-tuning. The lm_head is replaced with a small action-vocab
     // head and only the new action-token embedding rows train, so modules_to_save /
-    // train_only_new_embedding_rows are no-ops here (kept for the strict parse).
+    // train_only_new_embedding_rows have no effect here (they belong to the LoRA
+    // config shared across parsers, which is a superset of every parser's knobs).
     peft: {
         r: 8,
         alpha: 16,
@@ -29,8 +30,9 @@
         train_only_new_embedding_rows: true,
     },
 
-    // Curriculum (Registrable). SimpleCurriculum = cold full-document training and
-    // owns the epoch budget. SubtreeSizeCurriculum warms up on small subtrees first.
+    // Training schedule, and the total run length (there is no separate max_epochs):
+    // this trains on full documents for `epochs` epochs. To warm up on small subtrees
+    // first, use e.g. { type: 'subtree_size', size_schedule: [8, 20, 60, null], phase_epochs: 5 }.
     curriculum: { epochs: 200 },
 
     // Training
