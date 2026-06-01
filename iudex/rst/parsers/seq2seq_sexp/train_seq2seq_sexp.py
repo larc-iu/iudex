@@ -341,6 +341,8 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
 
     def _validate(epoch: int) -> None:
         nonlocal best_val, stale
+        if epoch < cfg.begin_validation_epoch:
+            return
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         # Per-epoch validation deliberately skips the gold-EDU pass to save
         # time. Final dev/test eval below always runs it.

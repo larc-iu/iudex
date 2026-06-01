@@ -77,6 +77,11 @@ class DecoderOnlySRConfig(FromParams):
     patience: int = 5
     log_every: int = 5
     validate_every: int | None = None
+    # Skip dev validation until this epoch (0 = validate from the start).
+    # Generative parsers decode every dev doc to max_output_length while
+    # undertrained, so early evals cost hours for a ~0 score. In HASH_EXCLUDE,
+    # so changing it is resume-safe.
+    begin_validation_epoch: int = 0
     checkpoint_every: int | None = None
     checkpoint_dir: str = "checkpoints"
     run_name: str | None = None

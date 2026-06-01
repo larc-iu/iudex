@@ -50,6 +50,7 @@ DEFAULT_HASH_EXCLUDE: tuple[str, ...] = (
     "patience",
     "log_every",
     "validate_every",
+    "begin_validation_epoch",
     "checkpoint_every",
     "val_metric_name",
     "test_dir",
