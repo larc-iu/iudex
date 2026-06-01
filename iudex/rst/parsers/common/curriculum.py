@@ -16,6 +16,8 @@ after Hu & Wan 2023).
 `from_params`.
 """
 
+import math
+import random
 from dataclasses import dataclass, field
 
 from tonga import Registrable
@@ -85,16 +87,28 @@ class SubtreeSizeCurriculum(Curriculum):
 
     `phase_epochs` sets the run length (total = its sum). Each phase runs its full
     `phase_epochs[i]` (no early stop) until a validating phase is reached.
+
+    Small caps explode the example count (e.g. cap=8 yields ~11x the document
+    count on RST-DT), so without a cap the warmup phases dominate total gradient
+    steps. `max_epoch_expand_factor` bounds a subtree phase's example count at
+    that multiple of the full-document count (None = no cap).
     """
 
     # See SimpleCurriculum.type: a real field so asdict keeps the discriminator.
     type: str = "subtree_size"
     size_schedule: list[int | None] = field(default_factory=lambda: [8, 20, 60, None])
     phase_epochs: int | list[int] = 5
+    # Cap each subtree phase at this multiple of the full-document count (None =
+    # use every subtree). The subsample is deterministic (seeded by the phase
+    # cap) so the warmup set is reproducible across runs and resumes. No effect
+    # on the full-document (cap=None) phase.
+    max_epoch_expand_factor: float | None = None
 
     def __post_init__(self):
         if not self.size_schedule:
             raise ValueError("curriculum.size_schedule must be non-empty")
+        if self.max_epoch_expand_factor is not None and self.max_epoch_expand_factor <= 0:
+            raise ValueError("curriculum.max_epoch_expand_factor must be > 0 or null")
         if any(c is not None and c < 2 for c in self.size_schedule):
             raise ValueError("curriculum.size_schedule caps must be >= 2 or null (full documents)")
         caps = [float("inf") if c is None else c for c in self.size_schedule]
@@ -120,6 +134,10 @@ class SubtreeSizeCurriculum(Curriculum):
         out: list[RstTree] = []
         for tree in all_trees:
             out.extend(tree.subtrees_up_to(phase.cap))
+        if self.max_epoch_expand_factor is not None:
+            budget = math.ceil(self.max_epoch_expand_factor * len(all_trees))
+            if len(out) > budget:
+                out = random.Random(phase.cap).sample(out, budget)
         return out
 
     def dev_pairs(self, all_dev, phase):

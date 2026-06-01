@@ -213,11 +213,24 @@ def train(cfg: TopdownBiaffineConfig) -> None:
         rule("Training")
     training_start = time.monotonic()
 
+    prev_phase = None
     for epoch in range(start_epoch, total_epochs):
         if stale >= cfg.patience or aborted.value:
             break
         phase, phase_trees, wtab, spe = epoch_to_spec[epoch]
         dev_set = cfg.curriculum.dev_pairs(dev_pairs, phase)
+        if phase is not prev_phase:
+            phase_idx = next(i for i, p in enumerate(phases) if p is phase)
+            cap_desc = "full documents" if phase.cap is None else f"subtrees <= {phase.cap} EDUs"
+            rule(
+                f"Curriculum phase {phase_idx + 1}/{len(phases)}: {cap_desc} | "
+                f"{len(phase_trees)} trees | {'validating' if dev_set else 'no dev (warmup)'}"
+            )
+            # First epoch of a validating phase (not a mid-phase resume): reset
+            # best/patience so prior phases cannot block saves or trip early-stop.
+            if dev_set and (epoch == 0 or epoch_to_spec[epoch - 1][0] is not phase):
+                best_val, stale = -1.0, 0
+            prev_phase = phase
         trees = list(phase_trees)
         rng.shuffle(trees)
         epoch_start = time.monotonic()

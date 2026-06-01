@@ -313,7 +313,7 @@ def train(cfg: Seq2SeqSRConfig) -> None:
     training_start = time.monotonic()
 
     phase_start = 0
-    for phase, loader, spe in phase_loaders:
+    for phase_idx, (phase, loader, spe) in enumerate(phase_loaders):
         p_start, p_end = phase_start, phase_start + phase.epochs
         phase_start = p_end
         if stale >= cfg.patience or aborted.value:
@@ -321,6 +321,18 @@ def train(cfg: Seq2SeqSRConfig) -> None:
         if start_epoch >= p_end:  # phase already finished on a prior run
             continue
         dev_set = cfg.curriculum.dev_pairs(dev_pairs, phase)
+        cap_desc = "full documents" if phase.cap is None else f"subtrees <= {phase.cap} EDUs"
+        rule(
+            f"Curriculum phase {phase_idx + 1}/{len(phase_loaders)}: {cap_desc} | "
+            f"epochs {p_start + 1}-{p_end} | {len(loader.dataset)} examples | "
+            f"{'validating' if dev_set else 'no dev (warmup)'}"
+        )
+        # Entering a validating phase at its first epoch (not a mid-phase resume):
+        # reset best/patience so an earlier phase's dev best cannot block best-model
+        # saves or trip early-stopping here. No-op for the standard single-
+        # validating-phase schedule (best_val is still its init).
+        if dev_set and max(start_epoch, p_start) == p_start:
+            best_val, stale = -1.0, 0
         n_batches_total = len(loader)
 
         for epoch in range(max(start_epoch, p_start), p_end):
