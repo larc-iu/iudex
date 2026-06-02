@@ -267,6 +267,9 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
         # (e.g. subtree warmup phases). begin_validation_epoch is the in-phase gate.
         if epoch < cfg.begin_validation_epoch or not dev_set:
             return
+        # Cadence gate (validate_every); the final epoch always validates.
+        if epoch % cfg.validate_every != 0 and epoch != total_epochs:
+            return
         per_epoch_dev = dev_set if cfg.dev_max_docs is None else dev_set[: cfg.dev_max_docs]
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         # Per-epoch validation deliberately skips the gold-EDU pass to save

@@ -30,6 +30,7 @@
     num_warmup_steps: 1000,                                // null = 1-epoch warmup, 0 = none
     log_every: 1,
     begin_validation_epoch: 0,                             // skip dev eval until this epoch
+    validate_every: 1,                                     // run dev validation every N epochs (1 = every epoch, final always validates)
     edu_loss_weight_exponent: 0.0,                         // weight docs by #EDUs**exp, 0 = equal
     checkpoint_dir: 'checkpoints',
     run_name: null,

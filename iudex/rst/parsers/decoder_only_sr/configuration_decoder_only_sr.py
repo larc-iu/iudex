@@ -56,6 +56,9 @@ class DecoderOnlySRConfig(FromParams):
     # because decoding undertrained dev docs is slow for a ~0 score. Resume-safe
     # (in HASH_EXCLUDE). Non-final curriculum phases skip validation regardless.
     begin_validation_epoch: int = 0
+    # Run dev validation every N epochs (global epoch count shared with the
+    # curriculum phase loop). 1 = every epoch. The final epoch always validates.
+    validate_every: int = 1
     checkpoint_dir: str = "checkpoints"
     run_name: str | None = None
     seed: int = 42

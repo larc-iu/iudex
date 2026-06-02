@@ -185,6 +185,9 @@ def train(cfg: SRBiaffineConfig) -> None:
         # (e.g. subtree warmup phases). begin_validation_epoch is the in-phase gate.
         if epoch < cfg.begin_validation_epoch or not dev_set:
             return
+        # Cadence gate (validate_every); the final epoch always validates.
+        if epoch % cfg.validate_every != 0 and epoch != total_epochs:
+            return
         pred_dir = os.path.join(run_dir, "dev_predictions", f"epoch{epoch}_step{global_step}")
         model.eval()
         metrics = _evaluate_on_dev(model, dev_set, output_dir=pred_dir)

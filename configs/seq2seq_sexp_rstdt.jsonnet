@@ -45,6 +45,7 @@
     patience: 5,
     log_every: 5,
     begin_validation_epoch: 0,                             // skip slow dev decodes until this epoch
+    validate_every: 1,                                     // run dev validation every N epochs (1 = every epoch, final always validates)
     checkpoint_dir: 'checkpoints',
     run_name: null,
     seed: 42,

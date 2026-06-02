@@ -121,6 +121,9 @@ class DMRSTConfig(FromParams):
     # HASH_EXCLUDE, so changing it is resume-safe. Applies within a validating
     # phase. A curriculum's non-final phases skip validation regardless.
     begin_validation_epoch: int = 0
+    # Run dev validation every N epochs (global epoch count shared with the
+    # curriculum phase loop). 1 = every epoch. The final epoch always validates.
+    validate_every: int = 1
     # Per-document loss weight proportional to (#EDUs ** edu_loss_weight_exponent),
     # normalized to mean 1 over each phase's training set (Hu & Wan 2023 Eq. 2 uses
     # exponent 1). 0.0 disables it (all documents weighted equally). Recomputed per
