@@ -4,7 +4,8 @@ Segmentation and end-to-end Parseval (which require different EDU sets between
 gold and predicted trees) live in `iudex.rst.data.seg_metrics`.
 """
 
-from typing import Any, Dict, List
+import random
+from typing import Any, Dict, List, Sequence, Tuple
 
 from rich.table import Table
 
@@ -172,6 +173,72 @@ def evaluate_parseval(gold_trees: List[RstTree], gold_preds: List[RstTree]) -> D
         f"{m}_f1": f1(totals[f"{m}_p_count"] / num_spans, totals[f"{m}_r_count"] / num_spans)
         for m in ("span", "nuc", "rel", "full")
     }
+
+
+PerDocCounts = Sequence[Tuple[int, int, int, int]]
+
+
+def _corpus_f1_from_counts(counts: PerDocCounts) -> float:
+    p_num = sum(c[0] for c in counts)
+    r_num = sum(c[1] for c in counts)
+    n_pred = sum(c[2] for c in counts)
+    n_gold = sum(c[3] for c in counts)
+    p = p_num / n_pred if n_pred else 0.0
+    r = r_num / n_gold if n_gold else 0.0
+    return f1(p, r) or 0.0
+
+
+def paired_permutation_test(
+    counts_a: PerDocCounts,
+    counts_b: PerDocCounts,
+    n_permutations: int = 10_000,
+    n_bootstrap: int = 10_000,
+    seed: int = 13,
+) -> Dict[str, float]:
+    """Paired sign-flip permutation test for a corpus micro-F1 delta over docs.
+
+    `counts_a[i]` and `counts_b[i]` are the two systems' counts on the SAME
+    document i: `(p_count, r_count, num_pred_spans, num_gold_spans)` for one
+    metric (take them from `compute_parseval_metrics`, where
+    num_pred == num_gold == num_spans, or from `compute_e2e_parseval`).
+    Corpus F1 is recomputed from summed counts under each permutation, so the
+    test respects micro-aggregation (Yeh 2000 style), unlike permuting per-doc
+    F1s. With ~37 docs this is the difference between a usable test and noise.
+
+    Returns `f1_a`, `f1_b`, `delta` (A minus B), two-sided add-one `p_value`,
+    and a percentile bootstrap 95% CI on the delta (`ci_low`, `ci_high`).
+    """
+    if len(counts_a) != len(counts_b):
+        raise ValueError(f"paired counts length mismatch: {len(counts_a)} vs {len(counts_b)}")
+    f1_a = _corpus_f1_from_counts(counts_a)
+    f1_b = _corpus_f1_from_counts(counts_b)
+    observed = f1_a - f1_b
+    rng = random.Random(seed)
+
+    hits = 0
+    for _ in range(n_permutations):
+        perm_a, perm_b = [], []
+        for ca, cb in zip(counts_a, counts_b):
+            if rng.random() < 0.5:
+                ca, cb = cb, ca
+            perm_a.append(ca)
+            perm_b.append(cb)
+        if abs(_corpus_f1_from_counts(perm_a) - _corpus_f1_from_counts(perm_b)) >= abs(observed) - 1e-12:
+            hits += 1
+    p_value = (hits + 1) / (n_permutations + 1)
+
+    n_docs = len(counts_a)
+    deltas = []
+    for _ in range(n_bootstrap):
+        idx = [rng.randrange(n_docs) for _ in range(n_docs)]
+        deltas.append(
+            _corpus_f1_from_counts([counts_a[i] for i in idx]) - _corpus_f1_from_counts([counts_b[i] for i in idx])
+        )
+    deltas.sort()
+    ci_low = deltas[int(0.025 * n_bootstrap)]
+    ci_high = deltas[min(int(0.975 * n_bootstrap), n_bootstrap - 1)]
+
+    return {"f1_a": f1_a, "f1_b": f1_b, "delta": observed, "p_value": p_value, "ci_low": ci_low, "ci_high": ci_high}
 
 
 def metrics_table(metrics: Dict[str, float], title: str) -> Table:
