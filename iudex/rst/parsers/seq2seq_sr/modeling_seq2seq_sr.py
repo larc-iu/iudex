@@ -66,7 +66,10 @@ class Seq2SeqSRParser(nn.Module):
         # in iudex.rst.HASH_EXCLUDE, so flipping it keeps the same run hash. A
         # bf16 checkpoint resuming into an fp32 model (or vice versa) under an
         # existing run dir is unsupported. Start a fresh run dir if you change amp.
-        model_dtype = torch.bfloat16 if config.amp else torch.float32
+        # bf16 master weights are fine under LoRA (adapters train on top) but
+        # AdamW full-FT on bf16 weights degenerates (sub-resolution updates
+        # round away). Full FT loads fp32, the autocast in training stays bf16.
+        model_dtype = torch.bfloat16 if (config.amp and config.peft is not None) else torch.float32
         self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, dtype=model_dtype)
 
         # Built only after relation inference. Predict-time loads from a

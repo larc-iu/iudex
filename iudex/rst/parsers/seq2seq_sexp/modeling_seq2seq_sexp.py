@@ -68,7 +68,10 @@ class Seq2SeqSexpParser(nn.Module):
         del compile_encoder
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        model_dtype = torch.bfloat16 if config.amp else torch.float32
+        # bf16 master weights are fine under LoRA (adapters train on top) but
+        # AdamW full-FT on bf16 weights degenerates (sub-resolution updates
+        # round away). Full FT loads fp32, the autocast in training stays bf16.
+        model_dtype = torch.bfloat16 if (config.amp and config.peft is not None) else torch.float32
         self.model = AutoModelForSeq2SeqLM.from_pretrained(config.model_name, dtype=model_dtype)
 
         self.label_token_ids: dict[str, int] = {}

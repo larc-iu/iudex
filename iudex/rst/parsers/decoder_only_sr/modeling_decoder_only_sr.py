@@ -72,7 +72,10 @@ class DecoderOnlySRParser(nn.Module):
             # so generic causal-LM tokenizers (Llama, Qwen) work out of the box.
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        model_dtype = torch.bfloat16 if config.amp else torch.float32
+        # bf16 master weights are fine under LoRA (adapters train on top) but
+        # AdamW full-FT on bf16 weights degenerates (sub-resolution updates
+        # round away). Full FT loads fp32, the autocast in training stays bf16.
+        model_dtype = torch.bfloat16 if (config.amp and config.peft is not None) else torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(config.model_name, dtype=model_dtype)
 
         self.action_token_ids: dict[str, int] = {}
