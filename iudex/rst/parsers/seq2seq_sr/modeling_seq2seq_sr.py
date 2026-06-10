@@ -392,6 +392,12 @@ class Seq2SeqSRParser(nn.Module):
         contribution is upweighted in the loss used for backward (copy
         positions dominate the target by ~10:1, so the default token-uniform
         average buries the parsing signal in the trivially-easy copy task).
+
+        When `cfg.width_band_loss` is set, `batch` additionally carries
+        `loss_weights` (built in `encode_target`, padded with 1.0) and the
+        base CE becomes a weighted mean over positions. With the knob unset
+        the batch has no `loss_weights` key and this path is byte-identical
+        to before the knob existed.
         """
         out = self.model(
             input_ids=batch["input_ids"],
@@ -417,12 +423,27 @@ class Seq2SeqSRParser(nn.Module):
             torch.full_like(labels_flat, -100),
         )
 
-        base_loss = F.cross_entropy(
-            logits.reshape(-1, self.head_vocab_size).float(),
-            head_labels_flat,
-            ignore_index=-100,
-            label_smoothing=self.config.label_smoothing,
-        )
+        loss_weights = batch.get("loss_weights")
+        if loss_weights is None:
+            base_loss = F.cross_entropy(
+                logits.reshape(-1, self.head_vocab_size).float(),
+                head_labels_flat,
+                ignore_index=-100,
+                label_smoothing=self.config.label_smoothing,
+            )
+        else:
+            per_pos = F.cross_entropy(
+                logits.reshape(-1, self.head_vocab_size).float(),
+                head_labels_flat,
+                ignore_index=-100,
+                label_smoothing=self.config.label_smoothing,
+                reduction="none",
+            )
+            valid = head_labels_flat != -100
+            w = loss_weights.reshape(-1)
+            # Weighted mean keeps the loss scale comparable to the unweighted
+            # path (all-1.0 weights reduce to exactly the mean above).
+            base_loss = (per_pos * w)[valid].sum() / w[valid].sum()
         metrics: dict[str, torch.Tensor] = {"loss": base_loss}
 
         if self._structural_token_ids_buf.numel() == 0:
@@ -492,8 +513,8 @@ class Seq2SeqSRParser(nn.Module):
             )
         return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}
 
-    def encode_target(self, tree: RstTree) -> tuple[list[int], list[int]] | None:
-        """Build two aligned target streams:
+    def encode_target(self, tree: RstTree) -> tuple[list[int], list[int], list[float] | None] | None:
+        """Build aligned target streams (plus optional per-position weights):
 
           * `labels`: the prediction targets, `<copy>` at source-copy
             positions, `<shift>` and `<reduce_*>` at structural positions,
@@ -512,6 +533,12 @@ class Seq2SeqSRParser(nn.Module):
         The deterministic copy task no longer competes with structural
         decisions for gradient.
 
+        The third element is `loss_weights`, aligned with `labels`: None
+        when `cfg.width_band_loss` is unset, else 1.0 everywhere except
+        reduce positions whose merged constituent width the band covers
+        (those get `band.weight`). Widths come from replaying the oracle
+        with a width stack, so they are exact.
+
         Returns None when the target overflows `cfg.max_output_length`."""
         if self.shift_token_id is None:
             raise RuntimeError(
@@ -527,8 +554,11 @@ class Seq2SeqSRParser(nn.Module):
         full_input_ids, spans = align_edus_to_tokens(self.tokenizer, text, tree.edus)
         edu_subword_ids = [full_input_ids[s:e] for (s, e) in spans]
 
+        band = self.config.width_band_loss
         label_ids: list[int] = []
         seen_ids: list[int] = []  # what the decoder sees in its history (substituted)
+        loss_weights: list[float] | None = [] if band is not None else None
+        width_stack: list[int] = []  # EDU width of each open stack item
         edu_idx = 0
         for action in actions:
             if isinstance(action, Shift):
@@ -540,6 +570,9 @@ class Seq2SeqSRParser(nn.Module):
                 label_ids.append(self.shift_token_id)
                 seen_ids.append(self.shift_token_id)
                 edu_idx += 1
+                if band is not None:
+                    loss_weights.extend([1.0] * (len(label_ids) - len(loss_weights)))
+                    width_stack.append(1)
             elif isinstance(action, Reduce):
                 token_str = action.to_token()
                 if token_str not in self.action_token_ids:
@@ -551,8 +584,14 @@ class Seq2SeqSRParser(nn.Module):
                 tok = self.action_token_ids[token_str]
                 label_ids.append(tok)
                 seen_ids.append(tok)
+                if band is not None:
+                    merged = width_stack.pop() + width_stack.pop()
+                    width_stack.append(merged)
+                    loss_weights.append(band.weight if band.covers(merged) else 1.0)
         label_ids.append(self.tokenizer.eos_token_id)
         seen_ids.append(self.tokenizer.eos_token_id)
+        if band is not None:
+            loss_weights.append(1.0)
 
         # decoder_input_ids = shift_right(seen_ids): decoder_start at pos 0,
         # then seen_ids[:-1]. Same length as labels.
@@ -566,7 +605,7 @@ class Seq2SeqSRParser(nn.Module):
                 f"up to 32K for T5Gemma 2)."
             )
             return None
-        return label_ids, decoder_input_ids
+        return label_ids, decoder_input_ids, loss_weights
 
     # -----------------------------------------------------------------
     # Greedy decoding

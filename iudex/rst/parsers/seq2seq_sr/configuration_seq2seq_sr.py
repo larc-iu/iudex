@@ -7,6 +7,32 @@ from iudex.rst.parsers.common.curriculum import Curriculum, SimpleCurriculum
 
 
 @dataclass
+class WidthBandLoss(FromParams):
+    """Upweight the CE loss at reduce positions whose resulting constituent
+    spans [min_width, max_width] EDUs (max_width null = unbounded). Motivated
+    by the 2026-06-10 cascade probe: the generative parser's genuine decision
+    deficit sits at mid widths (5-16 EDUs) and cascades upward, so extra
+    gradient there is the targeted lever. Composes with `action_loss_weight`
+    (that knob rebalances all structural vs copy positions, this one
+    rebalances within the reduces by width)."""
+
+    min_width: int = 5
+    max_width: int | None = 16
+    weight: float = 2.0
+
+    def __post_init__(self):
+        if self.min_width < 2:
+            raise ValueError("width_band_loss.min_width must be >= 2 (a reduce spans at least 2 EDUs)")
+        if self.max_width is not None and self.max_width < self.min_width:
+            raise ValueError("width_band_loss.max_width must be >= min_width or null")
+        if self.weight <= 0:
+            raise ValueError("width_band_loss.weight must be > 0")
+
+    def covers(self, width: int) -> bool:
+        return width >= self.min_width and (self.max_width is None or width <= self.max_width)
+
+
+@dataclass
 class Seq2SeqSRConfig(FromParams):
     train_dir: str
     dev_dir: str
@@ -84,6 +110,10 @@ class Seq2SeqSRConfig(FromParams):
     # 1.0 = no rebalance (copy and structural CE share a scale under the small
     # action head). Bump only if action positions are demonstrably starved.
     action_loss_weight: float = 1.0
+
+    # Upweight reduces by the EDU width of the constituent they create.
+    # Null = off (loss identical to before this knob existed). See WidthBandLoss.
+    width_band_loss: WidthBandLoss | None = None
 
     # Per-document loss weight proportional to (#EDUs ** edu_loss_weight_exponent),
     # normalized to mean 1 over each phase's training set (Hu & Wan 2023 Eq. 2 uses

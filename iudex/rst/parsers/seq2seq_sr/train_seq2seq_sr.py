@@ -69,18 +69,19 @@ def _build_dataset(model: Seq2SeqSRParser, pairs: list[tuple[str, RstTree]]) -> 
         if encoded is None:
             dropped += 1
             continue
-        labels, decoder_input_ids = encoded
+        labels, decoder_input_ids, loss_weights = encoded
         text = reconstruct_text(tree)
         enc = model.encode_input(text)
-        items.append(
-            {
-                "input_ids": enc["input_ids"],
-                "attention_mask": enc["attention_mask"],
-                "labels": labels,
-                "decoder_input_ids": decoder_input_ids,
-                "n_edus": len(tree.edus),
-            }
-        )
+        item = {
+            "input_ids": enc["input_ids"],
+            "attention_mask": enc["attention_mask"],
+            "labels": labels,
+            "decoder_input_ids": decoder_input_ids,
+            "n_edus": len(tree.edus),
+        }
+        if loss_weights is not None:
+            item["loss_weights"] = loss_weights
+        items.append(item)
     return _Seq2SeqSRDataset(items), dropped
 
 
@@ -118,6 +119,8 @@ def _make_collator(pad_id: int, weight_table: dict[int, float] | None = None):
         attention_mask = torch.zeros((len(batch), max_in), dtype=torch.long)
         labels = torch.full((len(batch), max_lbl), -100, dtype=torch.long)
         decoder_input_ids = torch.full((len(batch), max_lbl), pad_id, dtype=torch.long)
+        has_loss_weights = "loss_weights" in batch[0]
+        loss_weights = torch.ones((len(batch), max_lbl), dtype=torch.float) if has_loss_weights else None
         for i, item in enumerate(batch):
             n = len(item["input_ids"])
             input_ids[i, :n] = torch.tensor(item["input_ids"], dtype=torch.long)
@@ -126,12 +129,16 @@ def _make_collator(pad_id: int, weight_table: dict[int, float] | None = None):
             labels[i, :m] = torch.tensor(item["labels"], dtype=torch.long)
             d = len(item["decoder_input_ids"])
             decoder_input_ids[i, :d] = torch.tensor(item["decoder_input_ids"], dtype=torch.long)
+            if has_loss_weights:
+                loss_weights[i, :m] = torch.tensor(item["loss_weights"], dtype=torch.float)
         model_batch = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
             "decoder_input_ids": decoder_input_ids,
         }
+        if has_loss_weights:
+            model_batch["loss_weights"] = loss_weights
         if weight_table is None:
             weights = torch.ones(len(batch), dtype=torch.float)
         else:
