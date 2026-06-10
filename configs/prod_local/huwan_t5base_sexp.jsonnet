@@ -8,7 +8,12 @@
 // ~3.4k subtrees vs their 7.3k sentences), 12+45 epochs vs their 50+100,
 // linear LR decay vs cosine, added-token relation labels vs natural words,
 // no last-5-epoch weight averaging, single seed. test_dir null: dev-only
-// policy tonight, test eval is a morning decision.
+// policy tonight, test eval is a morning decision. First attempt (run dir
+// 29a5b854a673) OOMed at the phase-2 boundary: fp32 full-FT activations on
+// long sexp targets need gradient checkpointing on 24 GB. Phase 2 trimmed
+// 45 -> 38 to fit the overnight window incl. the final beam-6 eval
+// (patience 4 x validate_every 5 could not have triggered before ep35
+// anyway). Run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
 local base = import '../seq2seq_sexp_rstdt.jsonnet';
 base + {
     run_name: 'huwan_t5base_sexp',
@@ -21,9 +26,9 @@ base + {
     num_warmup_steps: 2700,
     batch_size: 2,
     grad_accum: 1,
-    gradient_checkpointing: false,
+    gradient_checkpointing: true,
     max_input_length: 4096,
-    curriculum: { type: 'subtree_size', size_schedule: [8, null], phase_epochs: [12, 45], max_epoch_expand_factor: null },
+    curriculum: { type: 'subtree_size', size_schedule: [8, null], phase_epochs: [12, 38], max_epoch_expand_factor: null },
     edu_loss_weight_exponent: 1.0,
     validate_every: 5,
     dev_max_docs: 16,
