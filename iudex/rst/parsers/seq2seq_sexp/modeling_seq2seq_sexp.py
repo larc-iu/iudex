@@ -673,13 +673,13 @@ class Seq2SeqSexpParser(nn.Module):
         frozenset is a hard force handled by the caller before reaching here."""
         V = base_mask.shape[-1]
         if narrowed is FORCE_CONTENT:
-            mask = torch.ones(V, dtype=torch.bool)
+            mask = torch.ones(V, dtype=torch.bool, device=base_mask.device)
             for fid in state.structural_ids():
                 if 0 <= int(fid) < V:
                     mask[int(fid)] = False
             return mask
         if isinstance(narrowed, frozenset):
-            keep = torch.zeros(V, dtype=torch.bool)
+            keep = torch.zeros(V, dtype=torch.bool, device=base_mask.device)
             for fid in narrowed:
                 hi = self.head_idx_for_full_id.get(int(fid)) if self.config.use_copy else int(fid)
                 if hi is not None and 0 <= int(hi) < V:
