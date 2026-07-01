@@ -179,11 +179,14 @@ def train(cfg: SRBiaffineConfig) -> None:
             stale_validations=stale,
         )
 
-    def _validate(epoch: int, dev_set: list) -> None:
+    def _validate(epoch: int, epoch_in_phase: int, dev_set: list) -> None:
         nonlocal best_val, stale
         # Empty dev_set => the curriculum suppresses validation for this phase
-        # (e.g. subtree warmup phases). begin_validation_epoch is the in-phase gate.
-        if epoch < cfg.begin_validation_epoch or not dev_set:
+        # (e.g. subtree warmup phases). begin_validation_epoch counts epochs
+        # WITHIN the phase, so it skips the first N slow early evals of a
+        # validating phase even when the curriculum places that phase late in
+        # the global epoch sequence (a global-epoch gate would be inert there).
+        if epoch_in_phase < cfg.begin_validation_epoch or not dev_set:
             return
         # Cadence gate (validate_every); the final epoch always validates.
         if epoch % cfg.validate_every != 0 and epoch != total_epochs:
@@ -310,7 +313,10 @@ def train(cfg: SRBiaffineConfig) -> None:
                 f"[dim]({time.monotonic() - epoch_start:.1f}s)[/dim]  "
                 f"loss=[loss]{total_loss / num_trees:.4f}[/loss]"
             )
-            _validate(epoch + 1, dev_set)
+            # In-phase epoch: offset from the phase's first global epoch
+            # (phase objects are shared by identity across epoch_to_spec).
+            phase_first = next(i for i, s in enumerate(epoch_to_spec) if s[0] is phase)
+            _validate(epoch + 1, epoch + 1 - phase_first, dev_set)
             _save(os.path.join(run_dir, "last.pt"), epoch + 1)
             if stale >= cfg.patience or aborted.value:
                 warn(f"\nEarly stopping after {cfg.patience} validations without improvement")

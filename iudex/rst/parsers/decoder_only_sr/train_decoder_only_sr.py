@@ -163,10 +163,14 @@ def train(cfg: DecoderOnlySRConfig) -> None:
         phase_trees = cfg.curriculum.train_trees(train_trees, phase)
         ds, dropped = _build_dataset(model, [("", t) for t in phase_trees])
         if dropped > 0:
-            warn(
-                f"[phase cap={phase.cap}] Dropped {dropped}/{len(phase_trees)} training trees "
-                f"(source > max_input_length={cfg.max_input_length} or target > "
-                f"max_output_length={cfg.max_output_length}, see per-tree warnings above)."
+            raise ValueError(
+                f"[phase cap={phase.cap}] {dropped}/{len(phase_trees)} training trees do not fit "
+                f"(source > max_input_length={cfg.max_input_length}, target > "
+                f"max_output_length={cfg.max_output_length}, or the combined source+target "
+                f"stream over the single-stream cap; see per-tree warnings above). "
+                f"Silently dropping training data corrupts the run (it quietly excludes exactly "
+                f"the longest documents), so this is a hard error: raise max_input_length / "
+                f"max_output_length to fit them, or remove them from the data on purpose."
             )
         wtab = (
             edu_count_loss_weights([it["n_edus"] for it in ds.items], exponent=cfg.edu_loss_weight_exponent)
@@ -237,11 +241,14 @@ def train(cfg: DecoderOnlySRConfig) -> None:
 
     dev_beams = 1 if cfg.eval_decode_greedy else cfg.num_beams
 
-    def _validate(epoch: int, dev_set: list) -> None:
+    def _validate(epoch: int, epoch_in_phase: int, dev_set: list) -> None:
         nonlocal best_val, stale
         # Empty dev_set => the curriculum suppresses validation for this phase
-        # (e.g. subtree warmup phases). begin_validation_epoch is the in-phase gate.
-        if epoch < cfg.begin_validation_epoch or not dev_set:
+        # (e.g. subtree warmup phases). begin_validation_epoch counts epochs
+        # WITHIN the phase, so it skips the first N slow early evals of a
+        # validating phase even when the curriculum places that phase late in
+        # the global epoch sequence (a global-epoch gate would be inert there).
+        if epoch_in_phase < cfg.begin_validation_epoch or not dev_set:
             return
         # Cadence gate (validate_every); the final epoch always validates.
         if epoch % cfg.validate_every != 0 and epoch != total_epochs:
@@ -259,7 +266,12 @@ def train(cfg: DecoderOnlySRConfig) -> None:
         )
         tb.log_scalars("dev", metrics, global_step)
         console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
-        score = metrics.get(cfg.val_metric_name, 0.0)
+        if cfg.val_metric_name not in metrics:
+            raise KeyError(
+                f"val_metric_name={cfg.val_metric_name!r} not in dev metrics "
+                f"(have: {sorted(metrics)}). A typo here would otherwise score 0.0 forever."
+            )
+        score = metrics[cfg.val_metric_name]
         if score > best_val:
             best_val = score
             stale = 0
@@ -395,7 +407,7 @@ def train(cfg: DecoderOnlySRConfig) -> None:
                     f"[dim]({time.monotonic() - epoch_start:.1f}s)[/dim]  "
                     f"loss=[loss]{total_loss / num_batches:.4f}[/loss]"
                 )
-                _validate(epoch + 1, dev_set)
+                _validate(epoch + 1, epoch + 1 - p_start, dev_set)
                 _save(os.path.join(run_dir, "last.pt"), epoch + 1)
                 if stale >= cfg.patience or aborted.value:
                     warn(f"\nEarly stopping after {cfg.patience} validations without improvement")
@@ -434,6 +446,9 @@ def train(cfg: DecoderOnlySRConfig) -> None:
         console.print(metrics_table(test_m, title="Final Test Results"))
         final_metrics["test"] = test_m
         tb.log_scalars("test", test_m, global_step)
+    # Decode provenance, so archived numbers and prediction dirs are
+    # attributable to a decode mode after the fact.
+    final_metrics["decode"] = {"num_beams": cfg.num_beams}
     metrics_path = os.path.join(run_dir, "final_metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(final_metrics, f, indent=2)

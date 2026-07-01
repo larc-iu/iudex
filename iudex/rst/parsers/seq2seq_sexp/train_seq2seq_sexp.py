@@ -181,10 +181,13 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
         phase_trees = cfg.curriculum.train_trees(train_trees, phase)
         ds, dropped = _build_dataset(model, [("", t) for t in phase_trees])
         if dropped > 0:
-            warn(
-                f"[phase cap={phase.cap}] Dropped {dropped}/{len(phase_trees)} training trees "
+            raise ValueError(
+                f"[phase cap={phase.cap}] {dropped}/{len(phase_trees)} training trees do not fit "
                 f"(source > max_input_length={cfg.max_input_length} or target > "
-                f"max_output_length={cfg.max_output_length}, see per-tree warnings above)."
+                f"max_output_length={cfg.max_output_length}, see per-tree warnings above). "
+                f"Silently dropping training data corrupts the run (it quietly excludes exactly "
+                f"the longest documents), so this is a hard error: raise max_input_length / "
+                f"max_output_length to fit them, or remove them from the data on purpose."
             )
         wtab = (
             edu_count_loss_weights([it["n_edus"] for it in ds.items], exponent=cfg.edu_loss_weight_exponent)
@@ -261,11 +264,14 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
 
     dev_beams = 1 if cfg.eval_decode_greedy else cfg.num_beams
 
-    def _validate(epoch: int, dev_set: list) -> None:
+    def _validate(epoch: int, epoch_in_phase: int, dev_set: list) -> None:
         nonlocal best_val, stale
         # Empty dev_set => the curriculum suppresses validation for this phase
-        # (e.g. subtree warmup phases). begin_validation_epoch is the in-phase gate.
-        if epoch < cfg.begin_validation_epoch or not dev_set:
+        # (e.g. subtree warmup phases). begin_validation_epoch counts epochs
+        # WITHIN the phase, so it skips the first N slow early evals of a
+        # validating phase even when the curriculum places that phase late in
+        # the global epoch sequence (a global-epoch gate would be inert there).
+        if epoch_in_phase < cfg.begin_validation_epoch or not dev_set:
             return
         # Cadence gate (validate_every); the final epoch always validates.
         if epoch % cfg.validate_every != 0 and epoch != total_epochs:
@@ -283,7 +289,12 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
         )
         tb.log_scalars("dev", metrics, global_step)
         console.print(metrics_table(metrics, title=f"Dev @ step {global_step}"))
-        score = metrics.get(cfg.val_metric_name, 0.0)
+        if cfg.val_metric_name not in metrics:
+            raise KeyError(
+                f"val_metric_name={cfg.val_metric_name!r} not in dev metrics "
+                f"(have: {sorted(metrics)}). A typo here would otherwise score 0.0 forever."
+            )
+        score = metrics[cfg.val_metric_name]
         if score > best_val:
             best_val = score
             stale = 0
@@ -419,7 +430,7 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
                     f"[dim]({time.monotonic() - epoch_start:.1f}s)[/dim]  "
                     f"loss=[loss]{total_loss / num_batches:.4f}[/loss]"
                 )
-                _validate(epoch + 1, dev_set)
+                _validate(epoch + 1, epoch + 1 - p_start, dev_set)
                 _save(os.path.join(run_dir, "last.pt"), epoch + 1)
                 if stale >= cfg.patience or aborted.value:
                     warn(f"\nEarly stopping after {cfg.patience} validations without improvement")
@@ -430,35 +441,41 @@ def train(cfg: Seq2SeqSexpConfig) -> None:
     if os.path.exists(best_path):
         checkpoint = torch.load(best_path, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
-        model.eval()
-        dev_m = evaluate_on_dev(
+    else:
+        # No validation ran (begin_validation_epoch skipped every epoch, or the
+        # curriculum's phases all had empty dev), so best_model.pt was never
+        # written. Evaluate the last-epoch model in memory rather than skipping eval.
+        warn("No best_model.pt found (no validation ran). Evaluating the final-epoch model.")
+    model.eval()
+    dev_m = evaluate_on_dev(
+        model,
+        dev_pairs,
+        num_beams=cfg.num_beams,
+        batch_size=cfg.dev_batch_size,
+        output_dir=os.path.join(run_dir, "dev_predictions", "final"),
+        eval_gold_edu=True,
+    )
+    console.print(metrics_table(dev_m, title="Final Dev Results"))
+    final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
+    if test_pairs is not None:
+        test_m = evaluate_on_dev(
             model,
-            dev_pairs,
+            test_pairs,
             num_beams=cfg.num_beams,
             batch_size=cfg.dev_batch_size,
-            output_dir=os.path.join(run_dir, "dev_predictions", "final"),
+            output_dir=os.path.join(run_dir, "test_predictions", "final"),
             eval_gold_edu=True,
         )
-        console.print(metrics_table(dev_m, title="Final Dev Results"))
-        final_metrics: dict[str, dict[str, float]] = {"dev": dev_m}
-        if test_pairs is not None:
-            test_m = evaluate_on_dev(
-                model,
-                test_pairs,
-                num_beams=cfg.num_beams,
-                batch_size=cfg.dev_batch_size,
-                output_dir=os.path.join(run_dir, "test_predictions", "final"),
-                eval_gold_edu=True,
-            )
-            console.print(metrics_table(test_m, title="Final Test Results"))
-            final_metrics["test"] = test_m
-            tb.log_scalars("test", test_m, global_step)
-        metrics_path = os.path.join(run_dir, "final_metrics.json")
-        with open(metrics_path, "w", encoding="utf-8") as f:
-            json.dump(final_metrics, f, indent=2)
-        wrote(metrics_path)
-    else:
-        success(f"Training complete. Best {cfg.val_metric_name}: {best_val:.4f}")
+        console.print(metrics_table(test_m, title="Final Test Results"))
+        final_metrics["test"] = test_m
+        tb.log_scalars("test", test_m, global_step)
+    # Decode provenance, so archived numbers and prediction dirs are
+    # attributable to a decode mode after the fact.
+    final_metrics["decode"] = {"num_beams": cfg.num_beams}
+    metrics_path = os.path.join(run_dir, "final_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(final_metrics, f, indent=2)
+    wrote(metrics_path)
     tb.close()
 
 
