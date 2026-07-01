@@ -446,7 +446,7 @@ class DecoderOnlySRParser(nn.Module):
         if len(source_ids) > self.config.max_input_length:
             warn(
                 f"Source side overflowed: {len(source_ids)} > max_input_length={self.config.max_input_length} "
-                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED from this epoch."
+                f"for a {len(tree.edus)}-EDU tree. Tree cannot be encoded (training raises on this)."
             )
             return None
 
@@ -481,7 +481,7 @@ class DecoderOnlySRParser(nn.Module):
         if len(label_actions) > self.config.max_output_length:
             warn(
                 f"Target truncated: {len(label_actions)} > max_output_length={self.config.max_output_length} "
-                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED from this epoch."
+                f"for a {len(tree.edus)}-EDU tree. Tree cannot be encoded (training raises on this)."
             )
             return None
 
@@ -499,7 +499,7 @@ class DecoderOnlySRParser(nn.Module):
         if len(input_ids) > combined_cap:
             warn(
                 f"Combined stream overflowed: {len(input_ids)} > combined cap {combined_cap} "
-                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED from this epoch."
+                f"for a {len(tree.edus)}-EDU tree. Tree cannot be encoded (training raises on this)."
             )
             return None
         return input_ids, labels
@@ -677,6 +677,7 @@ class DecoderOnlySRParser(nn.Module):
             # the chosen parent before each beam's transition is applied.
             states = [ShiftReduceDecodeState(source_len=len(source_ids), min_edu_length=min_edu_len) for _ in range(K)]
             action_seqs: list[list[int]] = [[] for _ in range(K)]
+            errored = [False] * K  # done via a garbage action, not EOS
             finished_beams: list[dict] = []
 
             beam_scores = torch.full((K,), float("-inf"), device=device)
@@ -686,19 +687,19 @@ class DecoderOnlySRParser(nn.Module):
                 if all(st.done for st in states):
                     break
 
-                masked = torch.full_like(logits, float("-inf"))
+                legal = torch.zeros_like(logits, dtype=torch.bool)
                 for j, st in enumerate(states):
                     if st.done:
                         continue
                     if st.copy_ok:
-                        masked[j, self.copy_head_idx] = logits[j, self.copy_head_idx]
+                        legal[j, self.copy_head_idx] = True
                     if st.shift_ok:
-                        masked[j, self.shift_head_idx] = logits[j, self.shift_head_idx]
+                        legal[j, self.shift_head_idx] = True
                     if st.reduce_ok:
-                        masked[j, self._reduce_head_ids_buf] = logits[j, self._reduce_head_ids_buf]
+                        legal[j, self._reduce_head_ids_buf] = True
                     if st.eos_ok:
-                        masked[j, self.eos_head_idx] = logits[j, self.eos_head_idx]
-                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, masked, K)
+                        legal[j, self.eos_head_idx] = True
+                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, logits, legal, K)
 
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
                 if beam_reorder_needed(step, parent_of_new, K, past_key_values):
@@ -709,6 +710,7 @@ class DecoderOnlySRParser(nn.Module):
                 # don't share (and mutate) one object.
                 new_states = [states[p].clone() for p in parent_of_new]
                 new_action_seqs = [list(action_seqs[p]) for p in parent_of_new]
+                new_errored = [errored[p] for p in parent_of_new]
 
                 next_inputs = [pad_id] * K
                 for j in range(K):
@@ -723,7 +725,9 @@ class DecoderOnlySRParser(nn.Module):
                     elif full_id == self.copy_token_id:
                         if st.step_copy():
                             next_inputs[j] = source_ids[st.cursor - 1]
-                        # else st.done already set; next_inputs stays pad
+                        else:
+                            # st.done already set; next_inputs stays pad.
+                            new_errored[j] = True
                     elif full_id == self.shift_token_id:
                         st.step_shift()
                         next_inputs[j] = full_id
@@ -732,13 +736,28 @@ class DecoderOnlySRParser(nn.Module):
                         next_inputs[j] = full_id
                     else:
                         st.done = True
+                        new_errored[j] = True
 
                 states = new_states
                 action_seqs = new_action_seqs
+                errored = new_errored
                 beam_scores = top_scores
 
                 for j, st in enumerate(states):
                     if st.done and torch.isfinite(beam_scores[j]):
+                        if errored[j]:
+                            # A finite-score beam done via a garbage action
+                            # (unknown token / copy past end) means the
+                            # legality mask and the state machine disagree (a
+                            # bug, not normal dead-beam topk backfill, which is
+                            # always -inf). Drop the beam rather than record a
+                            # broken prefix as a finished candidate.
+                            warn(
+                                "Beam took a mask-legal but automaton-illegal "
+                                "action (mask/state mismatch). Dropping the beam."
+                            )
+                            beam_scores[j] = float("-inf")
+                            continue
                         finished_beams.append(
                             {
                                 "action_seq": list(action_seqs[j]),
@@ -978,9 +997,18 @@ class DecoderOnlySRParser(nn.Module):
 
         actions, malformed_reason = repair_actions(strings, self.reduce_token_map)
         if malformed_reason is not None:
-            warn(f"Malformed decoder output ({malformed_reason}). Falling back to single-EDU tree.")
-            full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
-            return empty_tree(self.config.relation_types, text=full_text)
+            # A non-None reason also covers SUCCESSFUL repairs (closing
+            # shift/reduces appended after a max_output_length cutoff). Use the
+            # repaired actions when there are any: a salvaged partial tree
+            # scores far better than the single-EDU fallback on exactly the
+            # long documents that hit truncation. Fall back only when the
+            # sequence was unrecoverable (empty actions), and let the
+            # try/except below catch repaired-but-unbuildable sequences.
+            if not actions:
+                warn(f"Unrecoverable decoder output ({malformed_reason}). Falling back to single-EDU tree.")
+                full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
+                return empty_tree(self.config.relation_types, text=full_text)
+            warn(f"Decoder output repaired ({malformed_reason}).")
         try:
             return RstTree.from_shift_reduce(actions, relation_types=self.config.relation_types)
         except Exception as e:

@@ -500,7 +500,7 @@ class Seq2SeqSexpParser(nn.Module):
             warn(
                 f"Source too long: {source_subword_count} > max_input_length="
                 f"{self.config.max_input_length} subwords for a {len(tree.edus)}-EDU tree. "
-                f"Tree DROPPED (would desync target from truncated encoder source)."
+                f"Tree cannot be encoded (would desync target from truncated encoder source; training raises on this)."
             )
             return None
 
@@ -574,7 +574,7 @@ class Seq2SeqSexpParser(nn.Module):
         if len(label_ids) > self.config.max_output_length:
             warn(
                 f"Target truncated: {len(label_ids)} > max_output_length={self.config.max_output_length} "
-                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED."
+                f"for a {len(tree.edus)}-EDU tree. Tree cannot be encoded (training raises on this)."
             )
             return None
         return label_ids, decoder_input_ids
@@ -843,6 +843,7 @@ class Seq2SeqSexpParser(nn.Module):
             states: list[SexpDecodingState] = [self._initial_state(source_ids) for _ in range(K)]
             action_seqs: list[list[int]] = [[] for _ in range(K)]
             done = [False] * K
+            errored = [False] * K  # done via a PDA-rejected action, not EOS
             beam_scores = torch.full((K,), float("-inf"), device=device)
             beam_scores[0] = 0.0
             decoder_input_ids = torch.full((K, 1), self.decoder_start_token_id, device=device, dtype=torch.long)
@@ -864,13 +865,12 @@ class Seq2SeqSexpParser(nn.Module):
                 past_key_values = out.past_key_values
                 logits = out.logits[:, -1, :]  # [K, head_V]
 
-                masked = torch.full_like(logits, float("-inf"))
+                legal = torch.zeros_like(logits, dtype=torch.bool)
                 for j in range(K):
                     if done[j]:
                         continue
-                    mask = self._mask_logits_for_state(states[j], head_V).to(device)
-                    masked[j] = torch.where(mask, logits[j], torch.full_like(logits[j], float("-inf")))
-                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, masked, K)
+                    legal[j] = self._mask_logits_for_state(states[j], head_V).to(device)
+                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, logits, legal, K)
 
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
                 if beam_reorder_needed(step, parent_of_new, K, past_key_values):
@@ -884,6 +884,7 @@ class Seq2SeqSexpParser(nn.Module):
                 new_states = [states[p] for p in parent_of_new]
                 new_action_seqs = [list(action_seqs[p]) for p in parent_of_new]
                 new_done = [done[p] for p in parent_of_new]
+                new_errored = [errored[p] for p in parent_of_new]
                 next_inputs = [self.tokenizer.pad_token_id] * K
                 for j in range(K):
                     if new_done[j]:
@@ -895,6 +896,7 @@ class Seq2SeqSexpParser(nn.Module):
                         new_states[j] = new_states[j].step(full_id)
                     except ValueError:
                         new_done[j] = True
+                        new_errored[j] = True
                         continue
                     if full_id == self.tokenizer.eos_token_id:
                         new_done[j] = True
@@ -911,10 +913,23 @@ class Seq2SeqSexpParser(nn.Module):
                 states = new_states
                 action_seqs = new_action_seqs
                 done = new_done
+                errored = new_errored
                 beam_scores = top_scores
 
                 for j in range(K):
                     if done[j] and torch.isfinite(beam_scores[j]):
+                        if errored[j]:
+                            # A finite-score beam whose action the PDA rejected
+                            # means the legality mask and the PDA disagree (a
+                            # bug, not normal dead-beam topk backfill, which is
+                            # always -inf). Drop the beam rather than record a
+                            # broken prefix as a finished candidate.
+                            warn(
+                                "Beam took a mask-legal but PDA-illegal action "
+                                "(mask/PDA mismatch). Dropping the beam."
+                            )
+                            beam_scores[j] = float("-inf")
+                            continue
                         finished.append(
                             {
                                 "action_seq": list(action_seqs[j]),

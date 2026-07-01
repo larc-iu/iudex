@@ -194,7 +194,7 @@ def test_predict_beam_runs_without_crash(parser):
 
 
 def test_evaluate_gold_edu_emits_expected_metric_keys(parser):
-    from iudex.rst.parsers.decoder_only_sr.train_decoder_only_sr import _evaluate_gold_edu
+    from iudex.rst.parsers.common.generative_eval import _evaluate_gold_edu
 
     tree = _toy_tree()
     metrics = _evaluate_gold_edu(parser, [("toy.rs4", tree)])

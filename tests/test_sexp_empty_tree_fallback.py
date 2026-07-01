@@ -51,18 +51,20 @@ def test_seq2seq_sexp_fallback_attaches_marker():
     fallback), so triggering the post-`from_sexp` fallback in isolation
     is awkward. We verify the source-level invariant: the exception
     handler sets `_from_sexp_failed = True` on the empty tree before
-    returning it, AND the three predict paths (`_predict_one_greedy`,
-    `_predict_one_beam`, `_predict_one_gold_edu`) check that flag and
-    null out `_pred_edu_source_ranges` accordingly."""
+    returning it, AND the marker handling is centralized in `_finalize_tree`
+    (which nulls out `_pred_edu_source_ranges` on a marked tree), AND the
+    three predict paths all funnel through `_finalize_tree`."""
     import inspect
 
     from iudex.rst.parsers.seq2seq_sexp.modeling_seq2seq_sexp import Seq2SeqSexpParser
 
     src_make = inspect.getsource(Seq2SeqSexpParser._tree_from_emitted)
     assert "_from_sexp_failed = True" in src_make
+    src_finalize = inspect.getsource(Seq2SeqSexpParser._finalize_tree)
+    assert "_from_sexp_failed" in src_finalize, "_finalize_tree doesn't honor _from_sexp_failed"
     for name in ("_predict_one_greedy", "_predict_one_beam", "_predict_one_gold_edu"):
         src = inspect.getsource(getattr(Seq2SeqSexpParser, name))
-        assert "_from_sexp_failed" in src, f"{name} doesn't honor _from_sexp_failed"
+        assert "_finalize_tree" in src, f"{name} doesn't funnel through _finalize_tree"
 
 
 def test_decoder_only_sexp_predict_paths_honor_marker():
@@ -73,9 +75,11 @@ def test_decoder_only_sexp_predict_paths_honor_marker():
 
     src_make = inspect.getsource(DecoderOnlySexpParser._tree_from_emitted)
     assert "_from_sexp_failed = True" in src_make
+    src_finalize = inspect.getsource(DecoderOnlySexpParser._finalize_tree)
+    assert "_from_sexp_failed" in src_finalize, "_finalize_tree doesn't honor _from_sexp_failed"
     for name in ("_predict_one_greedy", "_predict_one_beam", "_predict_one_gold_edu"):
         src = inspect.getsource(getattr(DecoderOnlySexpParser, name))
-        assert "_from_sexp_failed" in src, f"{name} doesn't honor _from_sexp_failed"
+        assert "_finalize_tree" in src, f"{name} doesn't funnel through _finalize_tree"
 
 
 def test_use_copy_false_is_constructible():

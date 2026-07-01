@@ -403,6 +403,16 @@ class SexpDecodingState:
         """True iff this is a content-emit position whose legal content is the
         wildcard (any non-structural vocab id). See the `FORCE_CONTENT`
         constant. Only possible under use_copy=False and constrain_content=False.
+
+        Must mirror `legal_actions`' content gating exactly: under cc=False
+        `_content_legal()` returns [] so the obligation gates there are
+        invisible in the returned legal set, and this predicate is the only
+        place the caller's mask learns whether content is admissible. In
+        particular the leaf budget gate (`remaining_content > obl_rest`)
+        applies here too; without it the wildcard mask let the model eat into
+        positions reserved for future leaf starts, breaking the
+        `remaining_content >= _pending_leaf_obligation()` invariant and
+        deadlocking the decode later (empty legal set).
         """
         if self.use_copy or self.constrain_content:
             return False
@@ -412,9 +422,13 @@ class SexpDecodingState:
             return False
         top = self.stack[-1]
         if top.kind == "leaf":
-            return True
+            # Same gate as the leaf branch of `legal_actions`: eating must not
+            # consume a position reserved for a distinct future leaf start.
+            return self.remaining_content > self._pending_leaf_obligation()
         if top.kind is None:
-            # Fresh frame: content is one of the legal first actions.
+            # Fresh frame: content is one of the legal first actions (starting
+            # this frame as a leaf spends the frame's own 1-leaf obligation, so
+            # it is always affordable while content remains).
             return True
         return False
 

@@ -276,7 +276,7 @@ def test_predict_with_gold_edus_aligns_to_gold_ranges(parser):
 
 
 def test_evaluate_gold_edu_emits_expected_metric_keys(parser):
-    from iudex.rst.parsers.seq2seq_sexp.train_seq2seq_sexp import _evaluate_gold_edu
+    from iudex.rst.parsers.common.generative_eval import _evaluate_gold_edu
 
     tree = _toy_tree()
     metrics = _evaluate_gold_edu(parser, [("toy.rs4", tree)])

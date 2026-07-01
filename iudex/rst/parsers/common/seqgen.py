@@ -223,6 +223,14 @@ def reorder_past_key_values(past_key_values, beam_idx: torch.Tensor, model):
     if hasattr(past_key_values, "reorder_cache"):
         result = past_key_values.reorder_cache(beam_idx)
         return result if result is not None else past_key_values
+    # Path 2b: newer transformers Cache classes renamed the beam reorder to
+    # `batch_select_indices` (mutates in place, returns None). Without this
+    # path a future HF bump would fall through to the tuple walk below, which
+    # iterates a Cache object with version-dependent layout and could silently
+    # mis-reorder every beam decode.
+    if hasattr(past_key_values, "batch_select_indices"):
+        result = past_key_values.batch_select_indices(beam_idx)
+        return result if result is not None else past_key_values
     # Path 3: manual tuple walk, handling Nones gracefully.
     return tuple(
         tuple(t.index_select(0, beam_idx) if isinstance(t, torch.Tensor) else t for t in layer)
@@ -232,25 +240,36 @@ def reorder_past_key_values(past_key_values, beam_idx: torch.Tensor, model):
 
 def beam_topk_step(
     beam_scores: torch.Tensor,
-    masked_logits: torch.Tensor,
+    logits: torch.Tensor,
+    legal_mask: torch.Tensor,
     k: int,
 ) -> tuple[torch.Tensor, list[int], list[int]]:
     """One beam-search expansion step, serialization-agnostic.
 
-    `masked_logits` is [K, V] with illegal continuations already set to -inf by
-    the caller's per-beam validity mask. `beam_scores` is [K] cumulative
-    log-prob (dead beams at -inf). Returns the top-K continuations as
-    (top_scores [K], parents list[int], actions list[int]), where the flat
-    top-k index `flat = parent * V + action` is decoded back into the parent
-    beam and the chosen action (a column of `masked_logits`).
+    `logits` is the [K, V] RAW (unmasked) model output; `legal_mask` is a
+    [K, V] bool tensor, True where the caller's validity constraints admit the
+    continuation (a done/dead beam's row should be all False). `beam_scores`
+    is [K] cumulative log-prob (dead beams at -inf). Returns the top-K
+    continuations as (top_scores [K], parents list[int], actions list[int]),
+    where the flat top-k index `flat = parent * V + action` is decoded back
+    into the parent beam and the chosen action (a column of `logits`).
 
-    The NaN guard is load-bearing: a fully-masked dead beam (-inf score, all-inf
-    row) yields -inf + NaN = NaN, and `topk` ranks NaN above any finite negative,
-    so without it a dead beam's children crowd out live beams. Shared verbatim
-    across the four generative parsers' beam loops (it must stay in sync, the
-    failure mode is silent)."""
-    v = masked_logits.size(-1)
-    log_probs = F.log_softmax(masked_logits.float(), dim=-1)
+    Scoring is deliberately UNrenormalized: log_softmax runs over the full raw
+    vocab FIRST, and illegal entries are then dropped to -inf. Renormalizing
+    over the legal set (log_softmax of pre-masked logits, the previous
+    behavior) made heavily-constrained steps nearly free. Under the sexp
+    constraints the in-leaf legal set is ~2 ids, so a full-vocab distribution
+    renormalized to a binary choice priced skipping an EDU boundary at ~0 and
+    beam search collapsed unconfident documents to a handful of giant EDUs (a
+    legal, "high-scoring" parse the raw model distribution hates, e.g.
+    wsj_1118: renormalized -2.5 vs raw -974 for the 3-EDU parse). Raw scoring
+    matches the HF generate() default (renormalize_logits is opt-in there) and
+    greedy argmax is unaffected either way. The NaN guard stays as a backstop
+    for -inf raw logits. Shared verbatim across the four generative parsers'
+    beam loops (it must stay in sync, the failure mode is silent)."""
+    v = logits.size(-1)
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+    log_probs = torch.where(legal_mask, log_probs, torch.full_like(log_probs, float("-inf")))
     cum = beam_scores.unsqueeze(1) + log_probs
     cum = torch.where(torch.isnan(cum), torch.full_like(cum, float("-inf")), cum)
     top_scores, top_idx = cum.view(-1).topk(k)
@@ -274,11 +293,19 @@ def beam_reorder_needed(step: int, parents: list[int], k: int, past_key_values) 
 def select_best_beam(candidates: list[dict], alpha: float = BEAM_LENGTH_PENALTY_ALPHA) -> dict:
     """Pick the length-normalized best beam from a candidate pool. Each candidate
     is a dict carrying at least `"score"` (cumulative sum log-prob) and
-    `"length"` (token count). Dividing by `length**alpha` mitigates the bias
-    toward shorter beams (every emitted token has log-prob <= 0, so raw
-    sum-log-prob monotonically favors fewer-token trajectories). `alpha=0.6` is
-    the GNMT default. Caller must ensure `candidates` is non-empty."""
-    return max(candidates, key=lambda c: c["score"] / max(c["length"], 1) ** alpha)
+    `"length"` (token count); `"finished"` (bool) marks hypotheses that
+    legitimately reached EOS. Finished candidates are preferred outright: an
+    unfinished hypothesis is a truncated prefix (max_output_length hit), has
+    paid for fewer tokens, and under length normalization can spuriously
+    outrank a complete parse, so it is only eligible when NO hypothesis
+    finished (the fallback that keeps truncated documents recoverable).
+    Dividing by `length**alpha` mitigates the bias toward shorter beams (every
+    emitted token has log-prob <= 0, so raw sum-log-prob monotonically favors
+    fewer-token trajectories). `alpha=0.6` is the GNMT default. Caller must
+    ensure `candidates` is non-empty."""
+    finished = [c for c in candidates if c.get("finished", False)]
+    pool = finished if finished else candidates
+    return max(pool, key=lambda c: c["score"] / max(c["length"], 1) ** alpha)
 
 
 # -----------------------------------------------------------------
@@ -436,6 +463,8 @@ def repair_actions(strings: list[str], reduce_token_map) -> tuple[list[ShiftRedu
         n_shifts = sum(1 for a in actions if isinstance(a, Shift))
         n_reduces = sum(1 for a in actions if isinstance(a, Reduce))
         needed = (n_shifts - 1) - n_reduces
+        if needed < 0:
+            return actions, f"too many reduces ({n_reduces}) for {n_shifts} shifts"
         if needed > 0:
             fallback = fallback_reduce(reduce_token_map)
             if fallback is None:

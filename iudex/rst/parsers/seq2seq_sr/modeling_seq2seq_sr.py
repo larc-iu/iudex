@@ -601,7 +601,7 @@ class Seq2SeqSRParser(nn.Module):
             warn(
                 f"Target truncated: {len(label_ids)} > max_output_length="
                 f"{self.config.max_output_length} for a {len(tree.edus)}-EDU tree. "
-                f"Tree DROPPED from this epoch. Bump max_output_length (model supports "
+                f"Tree cannot be encoded (training raises on this). Bump max_output_length (model supports "
                 f"up to 32K for T5Gemma 2)."
             )
             return None
@@ -890,6 +890,7 @@ class Seq2SeqSRParser(nn.Module):
             # the chosen parent before each beam's transition is applied.
             states = [ShiftReduceDecodeState(source_len=len(source_ids), min_edu_length=min_edu_len) for _ in range(K)]
             action_seqs: list[list[int]] = [[] for _ in range(K)]
+            errored = [False] * K  # done via a garbage action, not EOS
             # Finished beams (EOS-terminated) are pulled out of the active
             # set so they don't crowd the top-K. Each entry is a snapshot at
             # the moment EOS fired.
@@ -919,22 +920,22 @@ class Seq2SeqSRParser(nn.Module):
                 logits = out.logits[:, -1, :]  # [K, head_V]
 
                 # Per-beam validity mask.
-                masked = torch.full_like(logits, float("-inf"))
+                legal = torch.zeros_like(logits, dtype=torch.bool)
                 for j, st in enumerate(states):
                     if st.done:
                         # Done beams are frozen in `finished_beams`. Their
-                        # row stays all -inf so they can never re-enter the
+                        # row stays all False so they can never re-enter the
                         # top-K and crowd out active beams.
                         continue
                     if st.copy_ok:
-                        masked[j, self.copy_head_idx] = logits[j, self.copy_head_idx]
+                        legal[j, self.copy_head_idx] = True
                     if st.shift_ok:
-                        masked[j, self.shift_head_idx] = logits[j, self.shift_head_idx]
+                        legal[j, self.shift_head_idx] = True
                     if st.reduce_ok:
-                        masked[j, self._reduce_head_ids_buf] = logits[j, self._reduce_head_ids_buf]
+                        legal[j, self._reduce_head_ids_buf] = True
                     if st.eos_ok:
-                        masked[j, self.eos_head_idx] = logits[j, self.eos_head_idx]
-                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, masked, K)
+                        legal[j, self.eos_head_idx] = True
+                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, logits, legal, K)
 
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
                 if beam_reorder_needed(step, parent_of_new, K, past_key_values):
@@ -946,6 +947,7 @@ class Seq2SeqSRParser(nn.Module):
                 # don't share (and mutate) one object.
                 new_states = [states[p].clone() for p in parent_of_new]
                 new_action_seqs = [list(action_seqs[p]) for p in parent_of_new]
+                new_errored = [errored[p] for p in parent_of_new]
 
                 # Apply each beam's chosen action.
                 next_inputs = [pad_id] * K
@@ -961,7 +963,9 @@ class Seq2SeqSRParser(nn.Module):
                     elif full_id == self.copy_token_id:
                         if st.step_copy():
                             next_inputs[j] = source_ids[st.cursor - 1]
-                        # else st.done already set; next_inputs stays pad
+                        else:
+                            # st.done already set; next_inputs stays pad.
+                            new_errored[j] = True
                     elif full_id == self.shift_token_id:
                         st.step_shift()
                         next_inputs[j] = full_id
@@ -970,9 +974,11 @@ class Seq2SeqSRParser(nn.Module):
                         next_inputs[j] = full_id
                     else:
                         st.done = True
+                        new_errored[j] = True
 
                 states = new_states
                 action_seqs = new_action_seqs
+                errored = new_errored
                 beam_scores = top_scores
 
                 # Snapshot any newly-finished beams into `finished_beams`,
@@ -980,6 +986,19 @@ class Seq2SeqSRParser(nn.Module):
                 # top-K again. Active beams keep their score and state.
                 for j, st in enumerate(states):
                     if st.done and torch.isfinite(beam_scores[j]):
+                        if errored[j]:
+                            # A finite-score beam done via a garbage action
+                            # (unknown token / copy past end) means the
+                            # legality mask and the state machine disagree (a
+                            # bug, not normal dead-beam topk backfill, which is
+                            # always -inf). Drop the beam rather than record a
+                            # broken prefix as a finished candidate.
+                            warn(
+                                "Beam took a mask-legal but automaton-illegal "
+                                "action (mask/state mismatch). Dropping the beam."
+                            )
+                            beam_scores[j] = float("-inf")
+                            continue
                         finished_beams.append(
                             {
                                 "action_seq": list(action_seqs[j]),
@@ -1026,12 +1045,6 @@ class Seq2SeqSRParser(nn.Module):
         if not candidates:
             return empty_tree(self.config.relation_types)
 
-        # Length-normalized scoring: dividing cumulative sum log-prob by
-        # length**alpha mitigates the systematic bias toward shorter
-        # beams (every emitted token has log-prob <= 0, so sum-log-prob
-        # monotonically favors fewer-token = fewer-EDU trajectories).
-        # alpha=0.6 is the GNMT default (alpha=1.0 is mean log-prob, also
-        # defensible, 0.6 is the standard mitigation).
         best = select_best_beam(candidates)
         if not best.get("finished", False):
             warn(
@@ -1275,12 +1288,21 @@ class Seq2SeqSRParser(nn.Module):
 
         actions, malformed_reason = repair_actions(strings, self.reduce_token_map)
         if malformed_reason is not None:
-            warn(
-                f"Malformed decoder output ({malformed_reason}), falling back to "
-                f"single-EDU tree. Likely an undertrained model or max_output_length too low."
-            )
-            full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
-            return empty_tree(self.config.relation_types, text=full_text)
+            # A non-None reason also covers SUCCESSFUL repairs (closing
+            # shift/reduces appended after a max_output_length cutoff). Use the
+            # repaired actions when there are any: a salvaged partial tree
+            # scores far better than the single-EDU fallback on exactly the
+            # long documents that hit truncation. Fall back only when the
+            # sequence was unrecoverable (empty actions), and let the
+            # try/except below catch repaired-but-unbuildable sequences.
+            if not actions:
+                warn(
+                    f"Unrecoverable decoder output ({malformed_reason}), falling back to "
+                    f"single-EDU tree. Likely an undertrained model or max_output_length too low."
+                )
+                full_text = " ".join(s for s in strings if not (s == "<shift>" or s in self.reduce_token_map))
+                return empty_tree(self.config.relation_types, text=full_text)
+            warn(f"Decoder output repaired ({malformed_reason}).")
         try:
             return RstTree.from_shift_reduce(actions, relation_types=self.config.relation_types)
         except Exception as e:

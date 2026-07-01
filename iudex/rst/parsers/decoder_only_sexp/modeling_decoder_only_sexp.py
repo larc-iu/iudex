@@ -560,7 +560,7 @@ class DecoderOnlySexpParser(nn.Module):
         if len(source_ids) > self.config.max_input_length:
             warn(
                 f"Source side overflowed: {len(source_ids)} > max_input_length={self.config.max_input_length} "
-                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED from this epoch."
+                f"for a {len(tree.edus)}-EDU tree. Tree cannot be encoded (training raises on this)."
             )
             return None
 
@@ -572,7 +572,7 @@ class DecoderOnlySexpParser(nn.Module):
         if len(label_sexp) > self.config.max_output_length:
             warn(
                 f"Target truncated: {len(label_sexp)} > max_output_length={self.config.max_output_length} "
-                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED from this epoch."
+                f"for a {len(tree.edus)}-EDU tree. Tree cannot be encoded (training raises on this)."
             )
             return None
 
@@ -593,7 +593,7 @@ class DecoderOnlySexpParser(nn.Module):
         if len(input_ids) > combined_cap:
             warn(
                 f"Combined stream overflowed: {len(input_ids)} > combined cap {combined_cap} "
-                f"for a {len(tree.edus)}-EDU tree. Tree DROPPED from this epoch."
+                f"for a {len(tree.edus)}-EDU tree. Tree cannot be encoded (training raises on this)."
             )
             return None
         return input_ids, labels
@@ -860,6 +860,7 @@ class DecoderOnlySexpParser(nn.Module):
 
             states: list[SexpDecodingState] = [self._initial_state(source_ids) for _ in range(K)]
             done = [False] * K
+            errored = [False] * K  # done via a PDA-rejected action, not EOS
             emitted_seqs: list[list[int]] = [[] for _ in range(K)]
             pred_edu_ranges: list[list[tuple[int, int]]] = [[] for _ in range(K)]
             leaf_starts: list[int | None] = [None] * K
@@ -872,14 +873,13 @@ class DecoderOnlySexpParser(nn.Module):
                 if all(done):
                     break
 
-                masked = torch.full_like(logits, float("-inf"))
+                legal = torch.zeros_like(logits, dtype=torch.bool)
                 for j in range(K):
                     if done[j]:
                         continue
-                    mask = self._mask_logits_for_state(states[j], logits.size(-1)).to(device)
-                    masked[j] = torch.where(mask, logits[j], torch.full_like(logits[j], float("-inf")))
+                    legal[j] = self._mask_logits_for_state(states[j], logits.size(-1)).to(device)
 
-                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, masked, K)
+                top_scores, parent_of_new, action_of_new = beam_topk_step(beam_scores, logits, legal, K)
 
                 parent_tensor = torch.tensor(parent_of_new, device=device, dtype=torch.long)
                 if beam_reorder_needed(step, parent_of_new, K, past_key_values):
@@ -891,6 +891,7 @@ class DecoderOnlySexpParser(nn.Module):
                 # path, which clones because it mutates in place).
                 new_states = [states[p] for p in parent_of_new]
                 new_done = [done[p] for p in parent_of_new]
+                new_errored = [errored[p] for p in parent_of_new]
                 new_emitted = [list(emitted_seqs[p]) for p in parent_of_new]
                 new_pred_edu_ranges = [list(pred_edu_ranges[p]) for p in parent_of_new]
                 new_leaf_starts: list[int | None] = [leaf_starts[p] for p in parent_of_new]
@@ -911,6 +912,7 @@ class DecoderOnlySexpParser(nn.Module):
                         new_states[j] = new_states[j].step(full_id)
                     except ValueError:
                         new_done[j] = True
+                        new_errored[j] = True
                         continue
                     new_emitted[j].append(full_id)
                     if full_id == eos_id:
@@ -934,6 +936,7 @@ class DecoderOnlySexpParser(nn.Module):
 
                 states = new_states
                 done = new_done
+                errored = new_errored
                 emitted_seqs = new_emitted
                 pred_edu_ranges = new_pred_edu_ranges
                 leaf_starts = new_leaf_starts
@@ -941,6 +944,18 @@ class DecoderOnlySexpParser(nn.Module):
 
                 for j in range(K):
                     if done[j] and torch.isfinite(beam_scores[j]):
+                        if errored[j]:
+                            # A finite-score beam whose action the PDA rejected
+                            # means the legality mask and the PDA disagree (a
+                            # bug, not normal dead-beam topk backfill, which is
+                            # always -inf). Drop the beam rather than record a
+                            # broken prefix as a finished candidate.
+                            warn(
+                                "Beam took a mask-legal but PDA-illegal action "
+                                "(mask/PDA mismatch). Dropping the beam."
+                            )
+                            beam_scores[j] = float("-inf")
+                            continue
                         clean = _dedup_ranges(pred_edu_ranges[j])
                         finished_beams.append(
                             {

@@ -127,9 +127,12 @@ def evaluate_on_dev(
     `num_beams` overrides the parser's configured beam width. Per-epoch dev
     eval passes 1 (greedy) when `cfg.eval_decode_greedy`; final test eval
     passes the full `cfg.num_beams`. `batch_size > 1` groups dev documents
-    into batched `generate()` calls. `output_dir`, when set, writes each
-    pred tree as `{basename}.rs4` for later inspection. `eval_gold_edu` adds
-    the gold-EDU-forced Parseval (`gold_edu_*` keys).
+    into one `predict_batch` call per chunk; whether that actually batches
+    the decode is up to the parser (the SR parsers batch their greedy path,
+    the sexp parsers decode per-document, so for them it only chunks the
+    progress logging). `output_dir`, when set, writes each pred tree as
+    `{basename}.rs4` for later inspection. `eval_gold_edu` adds the
+    gold-EDU-forced Parseval (`gold_edu_*` keys).
 
     Per-batch wall-time + EDU counts are printed via `dim()` so a slow or
     pathological prediction is visible in real time.

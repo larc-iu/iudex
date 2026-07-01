@@ -129,7 +129,9 @@ def _make_batch(parser):
     for decoder-only)."""
     enc = parser.encode_target(_toy_tree())
     assert enc is not None
-    a, b = enc
+    # seq2seq_sr appends an optional third element (width-band loss weights);
+    # the first two are the (labels, decoder_input_ids) pair everywhere.
+    a, b = enc[0], enc[1]
     # seq2seq parsers return (labels, decoder_input_ids); decoder-only return
     # (input_ids, labels). Disambiguate by class.
     is_seq2seq = parser.__class__.__name__.startswith("Seq2Seq")

@@ -720,3 +720,48 @@ def test_min_edu_length_default_does_not_change_behavior():
     ]
     final = _replay(s, seq)
     assert final.is_terminal()
+
+
+# ---------------------------------------------------------------------------
+# constrain_content=False wildcard obligation gate
+# ---------------------------------------------------------------------------
+
+
+def _make_cc_false(source_len: int) -> SexpDecodingState:
+    return make_initial_state(
+        source_len=source_len,
+        traversal_order="postorder",
+        use_copy=False,
+        open_id=OPEN_ID,
+        close_id=CLOSE_ID,
+        eos_id=EOS_ID,
+        label_ids=LABEL_IDS,
+        source_ids=[10 + i for i in range(source_len)],
+        constrain_content=False,
+    )
+
+
+def test_cc_false_wildcard_respects_leaf_budget_gate():
+    """Under constrain_content=False, `content_is_wildcard()` must honor the
+    same leaf budget gate as `legal_actions` (content illegal once every
+    remaining position is reserved for a future leaf start). Regression: the
+    wildcard predicate skipped the gate, the mask admitted content into
+    reserved positions, and the decode later deadlocked on an empty legal set
+    (an internal node owed a child with the source exhausted)."""
+    # OPEN root, OPEN first child, eat one content token into that child.
+    # The parent is now internal with its 2nd child still owed (obl_rest=1).
+    state = _make_cc_false(2).step(OPEN_ID).step(OPEN_ID).step(10)
+    assert state.in_edu_leaf
+    # remaining_content == 1 == obl_rest: the last position is reserved for
+    # the sibling leaf, so content must NOT be offered. CLOSE must be.
+    assert state.remaining_content == 1
+    assert not state.content_is_wildcard()
+    assert CLOSE_ID in state.legal_actions()
+
+
+def test_cc_false_wildcard_open_when_budget_allows():
+    """Same prefix with one spare position: content is still wildcarded."""
+    state = _make_cc_false(3).step(OPEN_ID).step(OPEN_ID).step(10)
+    assert state.in_edu_leaf
+    assert state.remaining_content == 2  # 1 reserved for the sibling, 1 spare
+    assert state.content_is_wildcard()

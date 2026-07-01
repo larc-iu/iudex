@@ -52,9 +52,10 @@ class DecoderOnlySRConfig(FromParams):
     amp: bool = True
     patience: int = 5
     log_every: int = 5
-    # Skip dev validation until this epoch (0 = from the start). Useful here
-    # because decoding undertrained dev docs is slow for a ~0 score. Resume-safe
-    # (in HASH_EXCLUDE). Non-final curriculum phases skip validation regardless.
+    # Skip dev validation until this epoch OF THE VALIDATING PHASE (0 =
+    # validate from the phase start). Useful here because decoding undertrained
+    # dev docs is slow for a ~0 score. Resume-safe (in HASH_EXCLUDE). Non-final
+    # curriculum phases skip validation regardless.
     begin_validation_epoch: int = 0
     # Run dev validation every N epochs (global epoch count shared with the
     # curriculum phase loop). 1 = every epoch. The final epoch always validates.

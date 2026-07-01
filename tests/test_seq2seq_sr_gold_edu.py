@@ -98,7 +98,7 @@ def test_predict_with_gold_edus_emits_one_shift_per_gold_edu(parser):
 def test_evaluate_gold_edu_emits_expected_metric_keys(parser):
     """Smoke-check that the trainer-side aggregator returns the four
     `gold_edu_*_f1` keys, all finite and in [0, 1]."""
-    from iudex.rst.parsers.seq2seq_sr.train_seq2seq_sr import _evaluate_gold_edu
+    from iudex.rst.parsers.common.generative_eval import _evaluate_gold_edu
 
     tree = _toy_tree()
     metrics = _evaluate_gold_edu(parser, [("toy.rs4", tree)])
